@@ -1,0 +1,27 @@
+[telegram]
+bot_token = "123456:replace-me"
+poll_timeout_secs = 30
+
+[llm]
+base_url = "https://api.openai.com/v1"
+api_key = "replace-me"
+model = "gpt-4.1-mini"
+static_fallback_response = "LLM backend not configured."
+
+[storage]
+sqlite_path = "./data/hajimi-claw.sqlite3"
+
+[execution]
+mode = "auto"
+
+[policy]
+admin_user_id = 123456789
+admin_chat_id = 123456789
+allowed_workdirs = ["./", "./data", "C:/temp"]
+writable_workdirs = ["./data", "C:/temp"]
+windows_safe_allowlist = ["cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe", "docker", "docker.exe", "systemctl"]
+guarded_patterns = ["\\b(systemctl|docker)\\s+(restart|stop|rm)\\b", "\\b(chmod|chown|mv|cp)\\b"]
+dangerous_patterns = ["\\b(rm|del)\\s+(-rf|/s|/q|/f)\\b", "\\b(sudo|su|passwd|shutdown|reboot)\\b", ">\\s*/", "format\\s+"]
+max_timeout_secs = 120
+max_output_bytes = 32768
+session_idle_timeout_secs = 1800

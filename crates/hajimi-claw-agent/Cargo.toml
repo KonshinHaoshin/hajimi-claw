@@ -1,0 +1,25 @@
+[package]
+name = "hajimi-claw-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+futures.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+hajimi-claw-llm = { path = "../hajimi-claw-llm" }
+hajimi-claw-policy = { path = "../hajimi-claw-policy" }
+hajimi-claw-store = { path = "../hajimi-claw-store" }
+hajimi-claw-tools = { path = "../hajimi-claw-tools" }
+hajimi-claw-types = { path = "../hajimi-claw-types" }
+uuid.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+hajimi-claw-exec = { path = "../hajimi-claw-exec" }
+tempfile.workspace = true

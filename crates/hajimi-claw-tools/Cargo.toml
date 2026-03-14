@@ -1,0 +1,21 @@
+[package]
+name = "hajimi-claw-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+hajimi-claw-exec = { path = "../hajimi-claw-exec" }
+hajimi-claw-policy = { path = "../hajimi-claw-policy" }
+hajimi-claw-types = { path = "../hajimi-claw-types" }
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

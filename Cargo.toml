@@ -1,0 +1,53 @@
+[workspace]
+members = [
+    ".",
+    "crates/hajimi-claw-agent",
+    "crates/hajimi-claw-bot",
+    "crates/hajimi-claw-daemon",
+    "crates/hajimi-claw-exec",
+    "crates/hajimi-claw-llm",
+    "crates/hajimi-claw-policy",
+    "crates/hajimi-claw-store",
+    "crates/hajimi-claw-tools",
+    "crates/hajimi-claw-types",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["OpenAI Codex"]
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-stream = "0.3"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+regex = "1.11"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.13"
+thiserror = "2.0"
+tokio = { version = "1.39", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = "0.1"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1.10", features = ["serde", "v4"] }
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
+[package]
+name = "hajimi-claw"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+hajimi-claw-daemon = { path = "crates/hajimi-claw-daemon" }
+tokio.workspace = true
