@@ -100,6 +100,9 @@ pub async fn entry_from_env() -> Result<()> {
         Some("launch") => cli_launch(),
         Some("stop") => cli_stop(),
         Some("status") => cli_status(),
+        Some("providers") => cli_providers().await,
+        Some("provider") => cli_provider_command(&args[1..]).await,
+        Some("model") => cli_model_command(&args[1..]).await,
         Some("onboard") => {
             let path = resolve_or_default_config_path()?;
             interactive_onboard(path).await
@@ -695,6 +698,140 @@ async fn cli_models(provider_id: Option<String>) -> Result<()> {
     Ok(())
 }
 
+async fn cli_providers() -> Result<()> {
+    let loaded = load_config_from_env_or_default()?;
+    let store = open_store(&loaded.config)?;
+    bootstrap_provider_if_configured(&store, &loaded.config)?;
+    let providers = store.list_providers()?;
+    if providers.is_empty() {
+        println!("no providers configured");
+        return Ok(());
+    }
+    for provider in providers {
+        println!(
+            "{}\t{}\tmodel={}\tdefault={}",
+            provider.config.id, provider.config.label, provider.config.model, provider.is_default
+        );
+    }
+    Ok(())
+}
+
+async fn cli_provider_command(args: &[String]) -> Result<()> {
+    match args.first().map(String::as_str) {
+        Some("current") => cli_provider_current().await,
+        Some("use") => {
+            let provider_id = args
+                .get(1)
+                .context("usage: hajimi provider use <provider-id>")?;
+            cli_provider_use(provider_id).await
+        }
+        Some("set-model") => {
+            let provider_id = args
+                .get(1)
+                .context("usage: hajimi provider set-model <provider-id> <model>")?;
+            let model = args
+                .get(2)
+                .context("usage: hajimi provider set-model <provider-id> <model>")?;
+            cli_provider_set_model(provider_id, model).await
+        }
+        Some("models") => {
+            let provider_id = args.get(1).cloned();
+            cli_models(provider_id).await
+        }
+        _ => {
+            println!("usage:");
+            println!("  hajimi providers");
+            println!("  hajimi provider current");
+            println!("  hajimi provider use <provider-id>");
+            println!("  hajimi provider models [provider-id]");
+            println!("  hajimi provider set-model <provider-id> <model>");
+            Ok(())
+        }
+    }
+}
+
+async fn cli_model_command(args: &[String]) -> Result<()> {
+    match args.first().map(String::as_str) {
+        Some("current") => cli_model_current().await,
+        Some("use") => {
+            let model = args.get(1).context("usage: hajimi model use <model>")?;
+            cli_model_use(model).await
+        }
+        _ => {
+            println!("usage:");
+            println!("  hajimi model current");
+            println!("  hajimi model use <model>");
+            Ok(())
+        }
+    }
+}
+
+async fn cli_provider_current() -> Result<()> {
+    let loaded = load_config_from_env_or_default()?;
+    let store = open_store(&loaded.config)?;
+    bootstrap_provider_if_configured(&store, &loaded.config)?;
+    match store.get_default_provider()? {
+        Some(provider) => {
+            println!(
+                "provider={}\nlabel={}\nmodel={}",
+                provider.config.id, provider.config.label, provider.config.model
+            );
+        }
+        None => println!("no default provider configured"),
+    }
+    Ok(())
+}
+
+async fn cli_provider_use(provider_id: &str) -> Result<()> {
+    let loaded = load_config_from_env_or_default()?;
+    let store = open_store(&loaded.config)?;
+    bootstrap_provider_if_configured(&store, &loaded.config)?;
+    if store.get_provider(provider_id)?.is_none() {
+        anyhow::bail!("provider not found: {provider_id}");
+    }
+    store.set_default_provider(provider_id)?;
+    println!("default provider set to `{provider_id}`");
+    Ok(())
+}
+
+async fn cli_provider_set_model(provider_id: &str, model: &str) -> Result<()> {
+    let loaded = load_config_from_env_or_default()?;
+    let store = open_store(&loaded.config)?;
+    bootstrap_provider_if_configured(&store, &loaded.config)?;
+    if store.get_provider(provider_id)?.is_none() {
+        anyhow::bail!("provider not found: {provider_id}");
+    }
+    store.update_provider_model(provider_id, model)?;
+    println!("provider `{provider_id}` model set to `{model}`");
+    Ok(())
+}
+
+async fn cli_model_current() -> Result<()> {
+    let loaded = load_config_from_env_or_default()?;
+    let store = open_store(&loaded.config)?;
+    bootstrap_provider_if_configured(&store, &loaded.config)?;
+    match store.get_default_provider()? {
+        Some(provider) => println!("{}", provider.config.model),
+        None => println!("no default provider configured"),
+    }
+    Ok(())
+}
+
+async fn cli_model_use(model: &str) -> Result<()> {
+    let loaded = load_config_from_env_or_default()?;
+    let store = open_store(&loaded.config)?;
+    bootstrap_provider_if_configured(&store, &loaded.config)?;
+    let provider = store
+        .get_default_provider()?
+        .context("no default provider configured")?;
+    store.update_provider_model(&provider.config.id, model)?;
+    println!(
+        "provider `{}` now uses model `{}`",
+        provider.config.id, model
+    );
+    Ok(())
+}
+
 fn cli_launch() -> Result<()> {
     let loaded = load_config_from_env_or_default()?;
     let pid_path = pid_file_path(&loaded.path);
@@ -1238,6 +1375,9 @@ fn help_text() -> &'static str {
   hajimi stop            Stop the background daemon
   hajimi status          Show background daemon status
   hajimi onboard         Interactive local onboarding
+  hajimi providers       List configured providers
+  hajimi provider ...    Manage providers
+  hajimi model ...       Manage the active model
   hajimi models [id]     List models for the default or named provider
   hajimi restart         Restart the installed service
   hajimi help            Show this help"

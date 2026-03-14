@@ -32,6 +32,10 @@ pub enum GatewayCommand {
     ProviderCurrent,
     ProviderTest(Option<String>),
     ProviderModels(Option<String>),
+    ProviderAdd,
+    ProviderSetModel { provider_id: String, model: String },
+    ModelCurrent,
+    ModelUse(String),
     PersonaList,
     PersonaRead(String),
     PersonaWrite { file: String, content: String },
@@ -182,6 +186,7 @@ impl Gateway for InProcessGateway {
                 "cancel is not implemented yet for task {task_id}"
             ))),
             GatewayCommand::Onboard => self.start_onboarding(request).await,
+            GatewayCommand::ProviderAdd => self.start_onboarding(request).await,
             GatewayCommand::ProviderList => self.provider_list().await,
             GatewayCommand::ProviderUse(provider_id) => self.provider_use(&provider_id).await,
             GatewayCommand::ProviderBind(provider_id) => {
@@ -189,6 +194,9 @@ impl Gateway for InProcessGateway {
                     .await
             }
             GatewayCommand::ProviderCurrent => self.provider_current(request.actor_chat_id).await,
+            GatewayCommand::ProviderSetModel { provider_id, model } => {
+                self.provider_set_model(&provider_id, &model).await
+            }
             GatewayCommand::ProviderTest(provider_id) => {
                 self.provider_test(request.actor_chat_id, provider_id.as_deref())
                     .await
@@ -197,6 +205,8 @@ impl Gateway for InProcessGateway {
                 self.provider_models(request.actor_chat_id, provider_id.as_deref())
                     .await
             }
+            GatewayCommand::ModelCurrent => self.model_current(request.actor_chat_id).await,
+            GatewayCommand::ModelUse(model) => self.model_use(request.actor_chat_id, &model).await,
             GatewayCommand::PersonaList => Ok(text_response(&self.runtime.persona_list().await?)),
             GatewayCommand::PersonaRead(file) => {
                 Ok(text_response(&self.runtime.persona_read(&file).await?))
@@ -377,7 +387,7 @@ impl InProcessGateway {
             .map_err(store_error)?;
         match resolved {
             Some(provider) => Ok(text_response(&format!(
-                "current provider for chat `{chat_id}`: `{}` ({}){}\ndefault={}",
+                "current provider for chat `{chat_id}`: `{}` ({}){}\nmodel={}\ndefault={}",
                 provider.config.id,
                 provider.config.label,
                 if bound.is_some() {
@@ -385,10 +395,26 @@ impl InProcessGateway {
                 } else {
                     " bound=no"
                 },
+                provider.config.model,
                 provider.is_default
             ))),
             None => Ok(text_response("no provider configured")),
         }
+    }
+
+    async fn provider_set_model(
+        &self,
+        provider_id: &str,
+        model: &str,
+    ) -> ClawResult<GatewayResponse> {
+        ensure_provider_exists(&self.store, provider_id)?;
+        self.store
+            .update_provider_model(provider_id, model)
+            .map_err(store_error)?;
+        Ok(text_response(&format!(
+            "provider `{}` model set to `{}`",
+            provider_id, model
+        )))
     }
 
     async fn provider_test(
@@ -448,6 +474,33 @@ impl InProcessGateway {
             models.join("\n")
         )))
     }
+
+    async fn model_current(&self, chat_id: i64) -> ClawResult<GatewayResponse> {
+        let provider = self
+            .store
+            .resolve_provider_for_chat(chat_id)
+            .map_err(store_error)?
+            .ok_or_else(|| ClawError::NotFound("no provider configured".into()))?;
+        Ok(text_response(&format!(
+            "current provider=`{}`\ncurrent model=`{}`",
+            provider.config.id, provider.config.model
+        )))
+    }
+
+    async fn model_use(&self, chat_id: i64, model: &str) -> ClawResult<GatewayResponse> {
+        let provider = self
+            .store
+            .resolve_provider_for_chat(chat_id)
+            .map_err(store_error)?
+            .ok_or_else(|| ClawError::NotFound("no provider configured".into()))?;
+        self.store
+            .update_provider_model(&provider.config.id, model)
+            .map_err(store_error)?;
+        Ok(text_response(&format!(
+            "provider `{}` now uses model `{}`",
+            provider.config.id, model
+        )))
+    }
 }
 
 pub fn parse_gateway_command(text: &str) -> GatewayCommand {
@@ -470,8 +523,17 @@ pub fn parse_gateway_command(text: &str) -> GatewayCommand {
     if trimmed == "/provider list" {
         return GatewayCommand::ProviderList;
     }
+    if trimmed == "/provider add" {
+        return GatewayCommand::ProviderAdd;
+    }
     if trimmed == "/provider current" {
         return GatewayCommand::ProviderCurrent;
+    }
+    if trimmed == "/model current" {
+        return GatewayCommand::ModelCurrent;
+    }
+    if let Some(rest) = trimmed.strip_prefix("/model use ") {
+        return GatewayCommand::ModelUse(rest.trim().into());
     }
     if trimmed == "/persona list" {
         return GatewayCommand::PersonaList;
@@ -492,6 +554,11 @@ pub fn parse_gateway_command(text: &str) -> GatewayCommand {
     if let Some(rest) = trimmed.strip_prefix("/provider models") {
         let value = rest.trim();
         return GatewayCommand::ProviderModels((!value.is_empty()).then(|| value.to_string()));
+    }
+    if let Some(rest) = trimmed.strip_prefix("/provider set-model ") {
+        if let Some((provider_id, model)) = split_file_and_content(rest.trim()) {
+            return GatewayCommand::ProviderSetModel { provider_id, model };
+        }
     }
     if let Some(rest) = trimmed.strip_prefix("/provider use ") {
         return GatewayCommand::ProviderUse(rest.trim().into());
@@ -546,11 +613,15 @@ pub fn help_text() -> String {
         "/onboard",
         "/onboard cancel",
         "/provider list",
+        "/provider add",
         "/provider current",
         "/provider use <id>",
         "/provider bind <id>",
         "/provider test [id]",
         "/provider models [id]",
+        "/provider set-model <provider-id> <model>",
+        "/model current",
+        "/model use <model>",
         "/persona list",
         "/persona read <soul|agents|tools|skills>",
         "/persona write <file> <content>",
@@ -724,6 +795,14 @@ mod tests {
         assert_eq!(
             parse_gateway_command("/provider test moonshot"),
             GatewayCommand::ProviderTest(Some("moonshot".into()))
+        );
+    }
+
+    #[test]
+    fn parses_model_use_command() {
+        assert_eq!(
+            parse_gateway_command("/model use gpt-5.1"),
+            GatewayCommand::ModelUse("gpt-5.1".into())
         );
     }
 

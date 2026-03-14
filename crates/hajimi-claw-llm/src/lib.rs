@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_stream::try_stream;
 use hajimi_claw_store::Store;
@@ -21,7 +22,7 @@ pub struct OpenAiCompatibleBackend {
 impl OpenAiCompatibleBackend {
     pub fn new(base_url: String, api_key: String, model: String) -> Self {
         Self {
-            client: Client::new(),
+            client: default_http_client(),
             base_url,
             api_key,
             model,
@@ -31,7 +32,7 @@ impl OpenAiCompatibleBackend {
 
     pub fn from_provider(provider: &ProviderConfig) -> Self {
         Self {
-            client: Client::new(),
+            client: default_http_client(),
             base_url: provider.base_url.clone(),
             api_key: provider.api_key.clone(),
             model: provider.model.clone(),
@@ -225,6 +226,14 @@ fn resolve_provider(
         return store.get_provider(provider_id);
     }
     store.get_default_provider()
+}
+
+fn default_http_client() -> Client {
+    Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(60))
+        .build()
+        .expect("build reqwest client")
 }
 
 #[derive(Debug, Serialize)]

@@ -456,6 +456,15 @@ impl Store {
         Ok(())
     }
 
+    pub fn update_provider_model(&self, provider_id: &str, model: &str) -> Result<()> {
+        let connection = self.connection.lock().expect("store lock poisoned");
+        connection.execute(
+            "UPDATE providers SET model = ? WHERE id = ?",
+            params![model, provider_id],
+        )?;
+        Ok(())
+    }
+
     pub fn bind_provider_to_chat(&self, chat_id: i64, provider_id: &str) -> Result<()> {
         let connection = self.connection.lock().expect("store lock poisoned");
         connection.execute(

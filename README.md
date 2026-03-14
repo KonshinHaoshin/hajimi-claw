@@ -67,6 +67,13 @@ The npm package exposes both `hajimi` and `hajimi-claw`, and builds the Rust bin
 - `hajimi stop`
 - `hajimi status`
 - `hajimi onboard`
+- `hajimi providers`
+- `hajimi provider current`
+- `hajimi provider use <provider-id>`
+- `hajimi provider models [provider-id]`
+- `hajimi provider set-model <provider-id> <model>`
+- `hajimi model current`
+- `hajimi model use <model>`
 - `hajimi models [provider-id]`
 - `hajimi restart`
 - `hajimi help`
@@ -98,11 +105,15 @@ Use these files for:
 - `/onboard`
 - `/onboard cancel`
 - `/provider list`
+- `/provider add`
 - `/provider current`
 - `/provider use <id>`
 - `/provider bind <id>`
 - `/provider test [id]`
 - `/provider models [id]`
+- `/provider set-model <provider-id> <model>`
+- `/model current`
+- `/model use <model>`
 - `/persona list`
 - `/persona read <soul|agents|tools|skills>`
 - `/persona write <file> <content>`
@@ -114,3 +125,12 @@ Use these files for:
 - `/status`
 
 Plain Telegram text now defaults to a natural-language task, so `/ask` is optional for normal requests.
+
+## Provider And Model Switching
+
+- Add a new provider: `hajimi onboard` or Telegram `/provider add`
+- List configured providers: `hajimi providers` or Telegram `/provider list`
+- Switch the default provider: `hajimi provider use <provider-id>` or Telegram `/provider use <id>`
+- See the current model: `hajimi model current` or Telegram `/model current`
+- Switch the current model on the active provider: `hajimi model use <model>` or Telegram `/model use <model>`
+- Switch a specific provider to a specific model: `hajimi provider set-model <provider-id> <model>` or Telegram `/provider set-model <provider-id> <model>`
