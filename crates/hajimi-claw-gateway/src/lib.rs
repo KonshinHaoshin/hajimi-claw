@@ -452,6 +452,9 @@ impl InProcessGateway {
 
 pub fn parse_gateway_command(text: &str) -> GatewayCommand {
     let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return GatewayCommand::Help;
+    }
     if let Some(rest) = trimmed.strip_prefix("/ask ") {
         return GatewayCommand::Ask(rest.trim().into());
     }
@@ -531,6 +534,9 @@ pub fn parse_gateway_command(text: &str) -> GatewayCommand {
     if trimmed == "/help" || trimmed == "/start" {
         return GatewayCommand::Help;
     }
+    if !trimmed.starts_with('/') {
+        return GatewayCommand::Ask(trimmed.into());
+    }
     GatewayCommand::Unknown(trimmed.into())
 }
 
@@ -557,6 +563,7 @@ pub fn help_text() -> String {
         "/elevated start <minutes> <reason>",
         "/elevated stop",
         "/cancel <task-id>",
+        "plain text = natural-language task",
     ]
     .join("\n")
 }
@@ -717,6 +724,14 @@ mod tests {
         assert_eq!(
             parse_gateway_command("/provider test moonshot"),
             GatewayCommand::ProviderTest(Some("moonshot".into()))
+        );
+    }
+
+    #[test]
+    fn parses_plain_text_as_ask() {
+        assert_eq!(
+            parse_gateway_command("帮我检查 docker 日志"),
+            GatewayCommand::Ask("帮我检查 docker 日志".into())
         );
     }
 

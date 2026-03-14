@@ -1,7 +1,8 @@
 use std::fs;
+use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -96,6 +97,9 @@ pub async fn entry_from_env() -> Result<()> {
     match args.first().map(String::as_str) {
         None => run_from_env().await,
         Some("daemon" | "run" | "start") => run_from_env().await,
+        Some("launch") => cli_launch(),
+        Some("stop") => cli_stop(),
+        Some("status") => cli_status(),
         Some("onboard") => {
             let path = resolve_or_default_config_path()?;
             interactive_onboard(path).await
@@ -691,6 +695,108 @@ async fn cli_models(provider_id: Option<String>) -> Result<()> {
     Ok(())
 }
 
+fn cli_launch() -> Result<()> {
+    let loaded = load_config_from_env_or_default()?;
+    let pid_path = pid_file_path(&loaded.path);
+    if let Some(pid) = read_pid_file(&pid_path)? {
+        if is_process_running(pid) {
+            anyhow::bail!("hajimi is already running in background with pid {}", pid);
+        }
+        let _ = fs::remove_file(&pid_path);
+    }
+
+    let log_path = log_file_path(&loaded.path);
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let stdout = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("open log file {}", log_path.display()))?;
+    let stderr = stdout
+        .try_clone()
+        .with_context(|| format!("clone log handle for {}", log_path.display()))?;
+
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .arg("daemon")
+        .env("HAJIMI_CLAW_CONFIG", &loaded.path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+
+    let child = command.spawn().context("spawn background daemon")?;
+    write_pid_file(&pid_path, child.id())?;
+    println!(
+        "hajimi launched in background.\npid={}\nlog={}",
+        child.id(),
+        log_path.display()
+    );
+    Ok(())
+}
+
+fn cli_stop() -> Result<()> {
+    let config_path = resolve_or_default_config_path()?;
+    let pid_path = pid_file_path(&config_path);
+    let Some(pid) = read_pid_file(&pid_path)? else {
+        println!("hajimi is not running in background");
+        return Ok(());
+    };
+
+    if !is_process_running(pid) {
+        let _ = fs::remove_file(&pid_path);
+        println!("removed stale pid file");
+        return Ok(());
+    }
+
+    stop_process(pid)?;
+    let _ = fs::remove_file(&pid_path);
+    println!("stopped hajimi background process pid={pid}");
+    Ok(())
+}
+
+fn cli_status() -> Result<()> {
+    let config_path = resolve_or_default_config_path()?;
+    let pid_path = pid_file_path(&config_path);
+    let log_path = log_file_path(&config_path);
+    match read_pid_file(&pid_path)? {
+        Some(pid) if is_process_running(pid) => {
+            println!(
+                "background_status=running\npid={}\nlog={}",
+                pid,
+                log_path.display()
+            );
+        }
+        Some(pid) => {
+            println!(
+                "background_status=stale\npid={}\nlog={}\nRemove with `hajimi stop`.",
+                pid,
+                log_path.display()
+            );
+        }
+        None => {
+            println!("background_status=stopped\nlog={}", log_path.display());
+        }
+    }
+    Ok(())
+}
+
 fn cli_restart() -> Result<()> {
     #[cfg(windows)]
     {
@@ -723,6 +829,89 @@ fn cli_restart() -> Result<()> {
     }
 
     println!("hajimi-claw restarted");
+    Ok(())
+}
+
+fn pid_file_path(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("hajimi.pid")
+}
+
+fn log_file_path(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("hajimi.log")
+}
+
+fn read_pid_file(path: &Path) -> Result<Option<u32>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("read pid file {}", path.display()))?;
+    let pid = raw
+        .trim()
+        .parse::<u32>()
+        .with_context(|| format!("parse pid from {}", path.display()))?;
+    Ok(Some(pid))
+}
+
+fn write_pid_file(path: &Path, pid: u32) -> Result<()> {
+    fs::write(path, format!("{pid}\n"))
+        .with_context(|| format!("write pid file {}", path.display()))
+}
+
+fn is_process_running(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+            .map(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout)
+                        .to_ascii_lowercase()
+                        .contains(&format!("\"{pid}\""))
+            })
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(windows))]
+    {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+}
+
+fn stop_process(pid: u32) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let status = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .status()
+            .context("invoke taskkill")?;
+        if !status.success() {
+            anyhow::bail!("failed to stop process {}", pid);
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let status = Command::new("kill")
+            .arg(pid.to_string())
+            .status()
+            .context("invoke kill")?;
+        if !status.success() {
+            anyhow::bail!("failed to stop process {}", pid);
+        }
+    }
+
     Ok(())
 }
 
@@ -1045,6 +1234,9 @@ fn help_text() -> &'static str {
     "Usage:
   hajimi                 Run the daemon
   hajimi daemon          Run the daemon
+  hajimi launch          Launch the daemon in background
+  hajimi stop            Stop the background daemon
+  hajimi status          Show background daemon status
   hajimi onboard         Interactive local onboarding
   hajimi models [id]     List models for the default or named provider
   hajimi restart         Restart the installed service
@@ -1088,9 +1280,9 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        PersonaSection, default_config_path, ensure_persona_files, expand_home, open_store,
-        pairing_text_matches, resolve_model_choice, resolve_persona_paths, select_platform_mode,
-        slugify,
+        PersonaSection, default_config_path, ensure_persona_files, expand_home, log_file_path,
+        open_store, pairing_text_matches, pid_file_path, resolve_model_choice,
+        resolve_persona_paths, select_platform_mode, slugify,
     };
     use hajimi_claw_exec::PlatformMode;
     use tempfile::tempdir;
@@ -1204,5 +1396,13 @@ mod tests {
             Some("custom-model")
         );
         assert!(resolve_model_choice("0", &models).is_none());
+    }
+
+    #[test]
+    fn background_paths_use_config_dir() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        assert_eq!(pid_file_path(&config_path), dir.path().join("hajimi.pid"));
+        assert_eq!(log_file_path(&config_path), dir.path().join("hajimi.log"));
     }
 }

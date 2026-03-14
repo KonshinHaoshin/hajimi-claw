@@ -22,6 +22,12 @@ Single-user Telegram-first ops agent in Rust.
 
 Set `HAJIMI_CLAW_CONFIG` if you want to load a different config path.
 
+For background use without keeping a terminal open:
+
+- `hajimi launch`
+- `hajimi status`
+- `hajimi stop`
+
 ## Install
 
 ### Windows
@@ -57,6 +63,9 @@ The npm package exposes both `hajimi` and `hajimi-claw`, and builds the Rust bin
 
 - `hajimi`
 - `hajimi daemon`
+- `hajimi launch`
+- `hajimi stop`
+- `hajimi status`
 - `hajimi onboard`
 - `hajimi models [provider-id]`
 - `hajimi restart`
@@ -103,3 +112,5 @@ Use these files for:
 - `/shell exec <cmd>`
 - `/shell close`
 - `/status`
+
+Plain Telegram text now defaults to a natural-language task, so `/ask` is optional for normal requests.
