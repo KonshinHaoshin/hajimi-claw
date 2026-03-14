@@ -15,4 +15,5 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+hajimi-claw-store = { path = "../hajimi-claw-store" }
 hajimi-claw-types = { path = "../hajimi-claw-types" }

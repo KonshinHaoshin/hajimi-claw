@@ -56,6 +56,75 @@ id_type!(SessionId);
 id_type!(ApprovalId);
 id_type!(ConversationId);
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProviderKind {
+    OpenAiCompatible,
+    CustomChatCompletions,
+}
+
+impl ProviderKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::OpenAiCompatible => "openai-compatible",
+            Self::CustomChatCompletions => "custom-chat-completions",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderConfig {
+    pub id: String,
+    pub label: String,
+    pub kind: ProviderKind,
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    pub enabled: bool,
+    pub extra_headers: Vec<(String, String)>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderRecord {
+    pub config: ProviderConfig,
+    pub is_default: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OnboardingStep {
+    ProviderLabel,
+    ProviderKind,
+    ProviderBaseUrl,
+    ProviderApiKey,
+    ProviderModel,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ProviderDraft {
+    pub label: Option<String>,
+    pub kind: Option<ProviderKind>,
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnboardingSession {
+    pub user_id: i64,
+    pub chat_id: i64,
+    pub step: OnboardingStep,
+    pub draft: ProviderDraft,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderHealth {
+    pub ok: bool,
+    pub message: String,
+    pub suggested_models: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PolicyMode {
     Normal,
@@ -179,6 +248,7 @@ pub struct ConversationMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRequest {
     pub conversation_id: ConversationId,
+    pub provider_id: Option<String>,
     pub system_prompt: String,
     pub messages: Vec<ConversationMessage>,
     pub tool_specs: Vec<ToolSpec>,

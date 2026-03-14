@@ -22,6 +22,12 @@ pub struct AgentRuntime {
     task_gate: Arc<Semaphore>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ShellOpenReply {
+    pub session_id: String,
+    pub message: String,
+}
+
 impl AgentRuntime {
     pub fn new(
         llm: Arc<dyn LlmBackend>,
@@ -52,6 +58,15 @@ impl AgentRuntime {
     }
 
     pub async fn ask(&self, prompt: &str, cwd: Option<PathBuf>) -> ClawResult<String> {
+        self.ask_with_provider(prompt, cwd, None).await
+    }
+
+    pub async fn ask_with_provider(
+        &self,
+        prompt: &str,
+        cwd: Option<PathBuf>,
+        provider_id: Option<String>,
+    ) -> ClawResult<String> {
         let _permit = self
             .task_gate
             .acquire()
@@ -96,7 +111,7 @@ impl AgentRuntime {
                 .await
                 .map(|output| output.content)
         } else {
-            self.run_llm(conversation_id, prompt).await
+            self.run_llm(conversation_id, prompt, provider_id).await
         };
 
         status.running = false;
@@ -123,8 +138,9 @@ impl AgentRuntime {
         &self,
         name: Option<String>,
         cwd: Option<PathBuf>,
-    ) -> ClawResult<String> {
-        self.tools
+    ) -> ClawResult<ShellOpenReply> {
+        let output = self
+            .tools
             .call(
                 "session_open",
                 ToolContext {
@@ -134,8 +150,17 @@ impl AgentRuntime {
                 },
                 json!({ "name": name }),
             )
-            .await
-            .map(|output| output.content)
+            .await?;
+        let session_id = output
+            .structured
+            .as_ref()
+            .and_then(|value| value.get("session_id"))
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| ClawError::Backend("session_open did not return session_id".into()))?;
+        Ok(ShellOpenReply {
+            session_id: session_id.to_string(),
+            message: output.content,
+        })
     }
 
     pub async fn shell_exec(&self, session_id: &str, command: &str) -> ClawResult<String> {
@@ -223,11 +248,17 @@ impl AgentRuntime {
         Ok(format!("policy_mode={mode}\n{task_lines}"))
     }
 
-    async fn run_llm(&self, conversation_id: ConversationId, prompt: &str) -> ClawResult<String> {
+    async fn run_llm(
+        &self,
+        conversation_id: ConversationId,
+        prompt: &str,
+        provider_id: Option<String>,
+    ) -> ClawResult<String> {
         let stream = self
             .llm
             .respond(AgentRequest {
                 conversation_id,
+                provider_id,
                 system_prompt: "You are hajimi-claw, a narrow single-user operations agent. Prefer concise, actionable answers. Use tools when possible.".into(),
                 messages: vec![ConversationMessage {
                     role: MessageRole::User,

@@ -3,6 +3,7 @@ bot_token = "123456:replace-me"
 poll_timeout_secs = 30
 
 [llm]
+# Optional bootstrap provider written into SQLite on first start.
 base_url = "https://api.openai.com/v1"
 api_key = "replace-me"
 model = "gpt-4.1-mini"
@@ -10,6 +11,9 @@ static_fallback_response = "LLM backend not configured."
 
 [storage]
 sqlite_path = "./data/hajimi-claw.sqlite3"
+
+[security]
+master_key_env = "HAJIMI_CLAW_MASTER_KEY"
 
 [execution]
 mode = "auto"

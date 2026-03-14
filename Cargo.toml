@@ -5,6 +5,7 @@ members = [
     "crates/hajimi-claw-bot",
     "crates/hajimi-claw-daemon",
     "crates/hajimi-claw-exec",
+    "crates/hajimi-claw-gateway",
     "crates/hajimi-claw-llm",
     "crates/hajimi-claw-policy",
     "crates/hajimi-claw-store",
@@ -20,9 +21,11 @@ license = "MIT"
 authors = ["OpenAI Codex"]
 
 [workspace.dependencies]
+aes-gcm = "0.10"
 anyhow = "1.0"
 async-stream = "0.3"
 async-trait = "0.1"
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
 regex = "1.11"
@@ -30,6 +33,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 tempfile = "3.13"
 thiserror = "2.0"
 tokio = { version = "1.39", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }

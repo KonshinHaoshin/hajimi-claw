@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use hajimi_claw_agent::AgentRuntime;
+use hajimi_claw_gateway::{
+    Gateway, GatewayRequest, InlineKeyboard, SessionDirective, parse_gateway_command,
+};
 use serde::Deserialize;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
@@ -17,16 +19,16 @@ pub struct TelegramConfig {
 pub struct TelegramBot {
     client: reqwest::Client,
     config: TelegramConfig,
-    runtime: Arc<AgentRuntime>,
+    gateway: Arc<dyn Gateway>,
     current_session: Mutex<Option<String>>,
 }
 
 impl TelegramBot {
-    pub fn new(config: TelegramConfig, runtime: Arc<AgentRuntime>) -> Self {
+    pub fn new(config: TelegramConfig, gateway: Arc<dyn Gateway>) -> Self {
         Self {
             client: reqwest::Client::new(),
             config,
-            runtime,
+            gateway,
             current_session: Mutex::new(None),
         }
     }
@@ -52,86 +54,82 @@ impl TelegramBot {
     }
 
     async fn handle_update(&self, update: Update) -> Result<()> {
-        let Some(message) = update.message else {
-            return Ok(());
-        };
-        if message.chat.id != self.config.admin_chat_id
-            || message
-                .from
-                .as_ref()
-                .map(|user| user.id)
-                .unwrap_or_default()
-                != self.config.admin_user_id
-        {
-            warn!("ignored telegram message from unauthorized actor");
+        if let Some(message) = update.message {
+            if !self.is_authorized(
+                message.chat.id,
+                message
+                    .from
+                    .as_ref()
+                    .map(|user| user.id)
+                    .unwrap_or_default(),
+            ) {
+                warn!("ignored telegram message from unauthorized actor");
+                return Ok(());
+            }
+
+            let Some(text) = message.text else {
+                return Ok(());
+            };
+            let reply = self.dispatch_command(&text).await;
+            self.send_message(message.chat.id, &reply.text, reply.keyboard)
+                .await?;
             return Ok(());
         }
 
-        let Some(text) = message.text else {
-            return Ok(());
-        };
-        let reply = self.dispatch_command(&text).await;
-        self.send_message(message.chat.id, &reply).await?;
+        if let Some(callback_query) = update.callback_query {
+            let chat_id = callback_query
+                .message
+                .as_ref()
+                .map(|message| message.chat.id)
+                .unwrap_or(self.config.admin_chat_id);
+            if !self.is_authorized(chat_id, callback_query.from.id) {
+                warn!("ignored telegram callback from unauthorized actor");
+                return Ok(());
+            }
+
+            if let Some(data) = callback_query.data {
+                let reply = self.dispatch_command(&data).await;
+                self.send_message(chat_id, &reply.text, reply.keyboard)
+                    .await?;
+            }
+            self.answer_callback_query(&callback_query.id).await?;
+        }
+
         Ok(())
     }
 
-    async fn dispatch_command(&self, text: &str) -> String {
-        match Command::parse(text) {
-            Command::Ask(prompt) => self
-                .runtime
-                .ask(&prompt, None)
-                .await
-                .unwrap_or_else(|err| format!("error: {err}")),
-            Command::ShellOpen(name) => match self.runtime.shell_open(name, None).await {
-                Ok(reply) => {
-                    if let Some(session_id) = reply.split_whitespace().nth(2) {
-                        *self.current_session.lock().await = Some(session_id.to_string());
+    async fn dispatch_command(&self, text: &str) -> BotReply {
+        let current_session_id = self.current_session.lock().await.clone();
+        match self
+            .gateway
+            .handle(GatewayRequest {
+                actor_user_id: self.config.admin_user_id,
+                actor_chat_id: self.config.admin_chat_id,
+                raw_text: text.to_string(),
+                command: parse_gateway_command(text),
+                current_session_id,
+            })
+            .await
+        {
+            Ok(response) => {
+                match response.session {
+                    SessionDirective::Keep => {}
+                    SessionDirective::Set(session_id) => {
+                        *self.current_session.lock().await = Some(session_id);
                     }
-                    reply
-                }
-                Err(err) => format!("error: {err}"),
-            },
-            Command::ShellExec(command) => {
-                let session_id = self.current_session.lock().await.clone();
-                match session_id {
-                    Some(session_id) => self
-                        .runtime
-                        .shell_exec(&session_id, &command)
-                        .await
-                        .unwrap_or_else(|err| format!("error: {err}")),
-                    None => "error: no active session, use /shell open first".into(),
-                }
-            }
-            Command::ShellClose => {
-                let session_id = self.current_session.lock().await.clone();
-                match session_id {
-                    Some(session_id) => {
-                        let reply = self
-                            .runtime
-                            .shell_close(&session_id)
-                            .await
-                            .unwrap_or_else(|err| format!("error: {err}"));
+                    SessionDirective::Clear => {
                         *self.current_session.lock().await = None;
-                        reply
                     }
-                    None => "no active session".into(),
+                }
+                BotReply {
+                    text: response.text,
+                    keyboard: response.keyboard,
                 }
             }
-            Command::Status => self
-                .runtime
-                .status()
-                .unwrap_or_else(|err| format!("error: {err}")),
-            Command::Approve(request_id) => self
-                .runtime
-                .approve(&request_id)
-                .unwrap_or_else(|err| format!("error: {err}")),
-            Command::ElevatedStart { minutes, reason } => {
-                self.runtime.request_elevated(minutes, reason)
-            }
-            Command::ElevatedStop => self.runtime.stop_elevated(),
-            Command::Cancel(task_id) => format!("cancel is not implemented yet for task {task_id}"),
-            Command::Help => help_text(),
-            Command::Unknown(raw) => format!("unrecognized command: {raw}\n\n{}", help_text()),
+            Err(err) => BotReply {
+                text: format!("error: {err}"),
+                keyboard: None,
+            },
         }
     }
 
@@ -155,14 +153,28 @@ impl TelegramBot {
         Ok(payload.result)
     }
 
-    async fn send_message(&self, chat_id: i64, text: &str) -> Result<()> {
+    async fn send_message(
+        &self,
+        chat_id: i64,
+        text: &str,
+        keyboard: Option<InlineKeyboard>,
+    ) -> Result<()> {
+        let payload = if let Some(keyboard) = keyboard {
+            serde_json::json!({
+                "chat_id": chat_id,
+                "text": clamp_text(text),
+                "reply_markup": to_reply_markup(keyboard),
+            })
+        } else {
+            serde_json::json!({
+                "chat_id": chat_id,
+                "text": clamp_text(text),
+            })
+        };
         let response = self
             .client
             .post(self.api_url("sendMessage"))
-            .json(&serde_json::json!({
-                "chat_id": chat_id,
-                "text": clamp_text(text),
-            }))
+            .json(&payload)
             .send()
             .await
             .context("sendMessage request")?;
@@ -175,70 +187,35 @@ impl TelegramBot {
         Ok(())
     }
 
+    async fn answer_callback_query(&self, callback_query_id: &str) -> Result<()> {
+        let response = self
+            .client
+            .post(self.api_url("answerCallbackQuery"))
+            .json(&serde_json::json!({
+                "callback_query_id": callback_query_id,
+            }))
+            .send()
+            .await
+            .context("answerCallbackQuery request")?;
+        let payload: TelegramEnvelope<serde_json::Value> = response
+            .json()
+            .await
+            .context("decode answerCallbackQuery")?;
+        if !payload.ok {
+            anyhow::bail!("telegram answerCallbackQuery returned ok=false");
+        }
+        Ok(())
+    }
+
     fn api_url(&self, method: &str) -> String {
         format!(
             "https://api.telegram.org/bot{}/{}",
             self.config.token, method
         )
     }
-}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Command {
-    Ask(String),
-    ShellOpen(Option<String>),
-    ShellExec(String),
-    ShellClose,
-    Status,
-    Approve(String),
-    ElevatedStart { minutes: i64, reason: String },
-    ElevatedStop,
-    Cancel(String),
-    Help,
-    Unknown(String),
-}
-
-impl Command {
-    fn parse(text: &str) -> Self {
-        let trimmed = text.trim();
-        if let Some(rest) = trimmed.strip_prefix("/ask ") {
-            return Self::Ask(rest.trim().into());
-        }
-        if trimmed == "/status" {
-            return Self::Status;
-        }
-        if let Some(rest) = trimmed.strip_prefix("/approve ") {
-            return Self::Approve(rest.trim().into());
-        }
-        if trimmed == "/elevated stop" {
-            return Self::ElevatedStop;
-        }
-        if let Some(rest) = trimmed.strip_prefix("/elevated start ") {
-            let mut parts = rest.trim().splitn(2, ' ');
-            let minutes = parts
-                .next()
-                .and_then(|value| value.parse::<i64>().ok())
-                .unwrap_or(10);
-            let reason = parts.next().unwrap_or("manual request").trim().to_string();
-            return Self::ElevatedStart { minutes, reason };
-        }
-        if trimmed == "/shell close" {
-            return Self::ShellClose;
-        }
-        if let Some(rest) = trimmed.strip_prefix("/shell open") {
-            let name = rest.trim();
-            return Self::ShellOpen((!name.is_empty()).then(|| name.to_string()));
-        }
-        if let Some(rest) = trimmed.strip_prefix("/shell exec ") {
-            return Self::ShellExec(rest.trim().into());
-        }
-        if let Some(rest) = trimmed.strip_prefix("/cancel ") {
-            return Self::Cancel(rest.trim().into());
-        }
-        if trimmed == "/help" || trimmed == "/start" {
-            return Self::Help;
-        }
-        Self::Unknown(trimmed.into())
+    fn is_authorized(&self, chat_id: i64, user_id: i64) -> bool {
+        chat_id == self.config.admin_chat_id && user_id == self.config.admin_user_id
     }
 }
 
@@ -252,6 +229,7 @@ struct TelegramEnvelope<T> {
 struct Update {
     update_id: i64,
     message: Option<Message>,
+    callback_query: Option<CallbackQuery>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -271,6 +249,19 @@ struct User {
     id: i64,
 }
 
+#[derive(Debug, Deserialize)]
+struct CallbackQuery {
+    id: String,
+    from: User,
+    data: Option<String>,
+    message: Option<Message>,
+}
+
+struct BotReply {
+    text: String,
+    keyboard: Option<InlineKeyboard>,
+}
+
 fn clamp_text(text: &str) -> String {
     const MAX: usize = 3500;
     if text.len() <= MAX {
@@ -279,30 +270,33 @@ fn clamp_text(text: &str) -> String {
     format!("{}...\n[truncated]", &text[..MAX])
 }
 
-fn help_text() -> String {
-    [
-        "/ask <text>",
-        "/shell open [name]",
-        "/shell exec <cmd>",
-        "/shell close",
-        "/status",
-        "/approve <request-id>",
-        "/elevated start <minutes> <reason>",
-        "/elevated stop",
-        "/cancel <task-id>",
-    ]
-    .join("\n")
+fn to_reply_markup(keyboard: InlineKeyboard) -> serde_json::Value {
+    let rows = keyboard
+        .rows
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|button| {
+                    serde_json::json!({
+                        "text": button.text,
+                        "callback_data": button.data,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({ "inline_keyboard": rows })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Command;
+    use hajimi_claw_gateway::{GatewayCommand, parse_gateway_command};
 
     #[test]
     fn parses_elevated_start() {
         assert_eq!(
-            Command::parse("/elevated start 15 maintenance"),
-            Command::ElevatedStart {
+            parse_gateway_command("/elevated start 15 maintenance"),
+            GatewayCommand::ElevatedStart {
                 minutes: 15,
                 reason: "maintenance".into(),
             }

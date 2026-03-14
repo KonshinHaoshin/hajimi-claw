@@ -1,5 +1,5 @@
 [package]
-name = "hajimi-claw-daemon"
+name = "hajimi-claw-gateway"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,17 +8,20 @@ authors.workspace = true
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
-serde.workspace = true
-tokio.workspace = true
-toml.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
+async-trait.workspace = true
 hajimi-claw-agent = { path = "../hajimi-claw-agent" }
-hajimi-claw-bot = { path = "../hajimi-claw-bot" }
-hajimi-claw-exec = { path = "../hajimi-claw-exec" }
-hajimi-claw-gateway = { path = "../hajimi-claw-gateway" }
 hajimi-claw-llm = { path = "../hajimi-claw-llm" }
 hajimi-claw-policy = { path = "../hajimi-claw-policy" }
 hajimi-claw-store = { path = "../hajimi-claw-store" }
-hajimi-claw-tools = { path = "../hajimi-claw-tools" }
 hajimi-claw-types = { path = "../hajimi-claw-types" }
+reqwest.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+hajimi-claw-exec = { path = "../hajimi-claw-exec" }
+hajimi-claw-store = { path = "../hajimi-claw-store" }
+hajimi-claw-tools = { path = "../hajimi-claw-tools" }
+tempfile.workspace = true
+tokio.workspace = true

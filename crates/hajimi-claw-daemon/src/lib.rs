@@ -5,9 +5,10 @@ use anyhow::{Context, Result};
 use hajimi_claw_agent::AgentRuntime;
 use hajimi_claw_bot::{TelegramBot, TelegramConfig};
 use hajimi_claw_exec::{LocalExecutor, PlatformMode};
-use hajimi_claw_llm::{OpenAiCompatibleBackend, StaticBackend};
+use hajimi_claw_gateway::InProcessGateway;
+use hajimi_claw_llm::{StaticBackend, StoreBackedBackend};
 use hajimi_claw_policy::{PolicyConfig, PolicyEngine};
-use hajimi_claw_store::Store;
+use hajimi_claw_store::{SecretCipher, Store};
 use hajimi_claw_tools::ToolRegistry;
 use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
@@ -17,6 +18,7 @@ pub struct AppConfig {
     pub telegram: TelegramSection,
     pub llm: LlmSection,
     pub storage: StorageSection,
+    pub security: SecuritySection,
     pub policy: PolicyConfig,
     pub execution: ExecutionSection,
 }
@@ -41,6 +43,11 @@ pub struct StorageSection {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct SecuritySection {
+    pub master_key_env: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct ExecutionSection {
     pub mode: Option<String>,
 }
@@ -58,29 +65,63 @@ pub async fn run(config: AppConfig) -> Result<()> {
             .with_context(|| format!("create storage directory {}", parent.display()))?;
     }
     let policy = Arc::new(PolicyEngine::new(config.policy.clone()));
-    let store = Arc::new(Store::open(&config.storage.sqlite_path)?);
+    let master_key_env = config
+        .security
+        .master_key_env
+        .clone()
+        .unwrap_or_else(|| "HAJIMI_CLAW_MASTER_KEY".into());
+    let master_key = std::env::var(&master_key_env).with_context(|| {
+        format!(
+            "missing provider encryption key env `{master_key_env}`; set it before starting hajimi-claw"
+        )
+    })?;
+    let cipher = Arc::new(SecretCipher::from_passphrase(&master_key)?);
+    let store = Arc::new(Store::open_with_cipher(
+        &config.storage.sqlite_path,
+        Some(cipher),
+    )?);
     let executor = Arc::new(LocalExecutor::new(
         policy.clone(),
         select_platform_mode(config.execution.mode.as_deref()),
     ));
     let tools = Arc::new(ToolRegistry::default(executor, policy.clone()));
-    let llm: Arc<dyn hajimi_claw_types::LlmBackend> =
-        if let (Some(base_url), Some(api_key), Some(model)) = (
-            config.llm.base_url.clone(),
-            config.llm.api_key.clone(),
-            config.llm.model.clone(),
-        ) {
-            Arc::new(OpenAiCompatibleBackend::new(base_url, api_key, model))
-        } else {
-            Arc::new(StaticBackend::new(
-                config
-                    .llm
-                    .static_fallback_response
-                    .unwrap_or_else(|| "LLM backend not configured.".into()),
-            ))
+    let fallback = Arc::new(StaticBackend::new(
+        config
+            .llm
+            .static_fallback_response
+            .clone()
+            .unwrap_or_else(|| "LLM backend not configured.".into()),
+    ));
+    if let (Some(base_url), Some(api_key), Some(model)) = (
+        config.llm.base_url.clone(),
+        config.llm.api_key.clone(),
+        config.llm.model.clone(),
+    ) {
+        let bootstrap_record = hajimi_claw_types::ProviderRecord {
+            config: hajimi_claw_types::ProviderConfig {
+                id: "bootstrap".into(),
+                label: "Bootstrap".into(),
+                kind: hajimi_claw_types::ProviderKind::OpenAiCompatible,
+                base_url,
+                api_key,
+                model,
+                enabled: true,
+                extra_headers: vec![],
+                created_at: chrono::Utc::now(),
+            },
+            is_default: store.get_default_provider()?.is_none(),
         };
+        store.upsert_provider(&bootstrap_record)?;
+    }
+    let llm: Arc<dyn hajimi_claw_types::LlmBackend> =
+        Arc::new(StoreBackedBackend::new(store.clone(), Some(fallback)));
 
-    let runtime = Arc::new(AgentRuntime::new(llm, tools, store, policy.clone()));
+    let runtime = Arc::new(AgentRuntime::new(llm, tools, store.clone(), policy.clone()));
+    let gateway = Arc::new(InProcessGateway::new(
+        runtime,
+        policy.clone(),
+        store.clone(),
+    ));
     let bot = TelegramBot::new(
         TelegramConfig {
             token: config.telegram.bot_token,
@@ -88,7 +129,7 @@ pub async fn run(config: AppConfig) -> Result<()> {
             admin_user_id: config.policy.admin_user_id,
             admin_chat_id: config.policy.admin_chat_id,
         },
-        runtime,
+        gateway,
     );
 
     bot.run().await
