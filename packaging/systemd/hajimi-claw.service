@@ -1,0 +1,16 @@
+[Unit]
+Description=hajimi-claw Telegram operations agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@WORKDIR@
+ExecStart=@BINARY@
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=-/etc/default/hajimi-claw
+EnvironmentFile=-/etc/sysconfig/hajimi-claw
+
+[Install]
+WantedBy=multi-user.target

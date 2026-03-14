@@ -1,0 +1,27 @@
+{
+  "name": "hajimi-claw",
+  "version": "0.1.0",
+  "description": "Single-user Telegram-first ops agent in Rust",
+  "bin": {
+    "hajimi": "bin/hajimi-claw.js",
+    "hajimi-claw": "bin/hajimi-claw.js"
+  },
+  "files": [
+    "Cargo.toml",
+    "Cargo.lock",
+    "src",
+    "crates",
+    "bin",
+    "scripts/npm-install.js",
+    "config.example.toml",
+    "README.md"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/npm-install.js"
+  },
+  "preferGlobal": true,
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -516,11 +516,13 @@ dependencies = [
  "hajimi-claw-store",
  "hajimi-claw-tools",
  "hajimi-claw-types",
+ "reqwest",
  "serde",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

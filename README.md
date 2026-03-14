@@ -15,15 +15,52 @@ Single-user Telegram-first ops agent in Rust.
 
 ## Running
 
-1. Copy `config.example.toml` to `config.toml`.
-2. Fill in the Telegram bot token and admin ids.
-3. Set the provider secret key env var before starting:
-   `set HAJIMI_CLAW_MASTER_KEY=replace-me-with-a-long-random-string`
-4. Optional: fill in the `llm` section to bootstrap a default provider on first start.
-5. Run `cargo run`.
-6. In Telegram, use `/onboard` to add or switch providers interactively.
+1. Run `cargo run -- onboard` or `hajimi onboard`.
+2. Fill in the Telegram bot token, admin ids, and provider details.
+3. Start the daemon with `cargo run` or `hajimi`.
+4. In Telegram, use `/onboard` to add or switch providers interactively.
 
 Set `HAJIMI_CLAW_CONFIG` if you want to load a different config path.
+
+## Install
+
+### Windows
+
+- Build and install to a user directory in `PATH`:
+  `powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1`
+- System-wide install:
+  `powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -System`
+
+The installer copies `hajimi-claw.exe`, creates the `hajimi.exe` alias, copies `config.example.toml`, and updates `PATH`.
+
+### Linux
+
+- User install:
+  `sh ./scripts/install.sh`
+- System-wide install:
+  `sudo sh ./scripts/install.sh --system`
+- System-wide install with systemd unit:
+  `sudo sh ./scripts/install.sh --system --install-service`
+
+The Linux installer copies the binary to `PREFIX/bin/hajimi-claw`, creates the `PREFIX/bin/hajimi` alias, and copies `config.example.toml` to `PREFIX/share/hajimi-claw`.
+
+### npm
+
+- Global install from the package:
+  `npm install -g hajimi-claw`
+- Global install from the repo:
+  `npm install -g .`
+
+The npm package exposes both `hajimi` and `hajimi-claw`, and builds the Rust binary locally during `postinstall`, so `cargo` must already be installed on the target machine.
+
+## CLI
+
+- `hajimi`
+- `hajimi daemon`
+- `hajimi onboard`
+- `hajimi models [provider-id]`
+- `hajimi restart`
+- `hajimi help`
 
 ## Telegram commands
 

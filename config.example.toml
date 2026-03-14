@@ -13,6 +13,7 @@ static_fallback_response = "LLM backend not configured."
 sqlite_path = "./data/hajimi-claw.sqlite3"
 
 [security]
+# Required at runtime. Set the environment variable before starting hajimi-claw.
 master_key_env = "HAJIMI_CLAW_MASTER_KEY"
 
 [execution]

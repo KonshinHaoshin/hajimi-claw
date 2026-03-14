@@ -8,11 +8,13 @@ authors.workspace = true
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+uuid.workspace = true
 hajimi-claw-agent = { path = "../hajimi-claw-agent" }
 hajimi-claw-bot = { path = "../hajimi-claw-bot" }
 hajimi-claw-exec = { path = "../hajimi-claw-exec" }
