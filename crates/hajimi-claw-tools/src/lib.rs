@@ -32,6 +32,8 @@ impl ToolRegistry {
             Arc::new(TailFileTool::new(policy.clone())),
             Arc::new(ListDirTool::new(policy.clone())),
             Arc::new(GrepTextTool::new(policy.clone())),
+            Arc::new(WriteFileTool::new(policy.clone())),
+            Arc::new(AppendFileTool::new(policy.clone())),
             Arc::new(SystemdStatusTool::new(executor.clone())),
             Arc::new(SystemdRestartTool::new(executor.clone())),
             Arc::new(DockerPsTool::new(executor.clone())),
@@ -208,6 +210,103 @@ struct GrepTextTool {
 impl GrepTextTool {
     fn new(policy: Arc<PolicyEngine>) -> Self {
         Self { policy }
+    }
+}
+
+struct WriteFileTool {
+    policy: Arc<PolicyEngine>,
+}
+
+impl WriteFileTool {
+    fn new(policy: Arc<PolicyEngine>) -> Self {
+        Self { policy }
+    }
+}
+
+#[async_trait]
+impl Tool for WriteFileTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "write_file".into(),
+            description:
+                "Write text to a file in a writable allowed directory, replacing existing content."
+                    .into(),
+            requires_approval: false,
+        }
+    }
+
+    async fn call(&self, _ctx: ToolContext, input: Value) -> ClawResult<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Input {
+            path: PathBuf,
+            content: String,
+        }
+        let input: Input = serde_json::from_value(input)
+            .map_err(|err| ClawError::InvalidRequest(err.to_string()))?;
+        guard_write_path(&self.policy, &input.path)?;
+        if let Some(parent) = input.path.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|err| ClawError::Backend(err.to_string()))?;
+        }
+        fs::write(&input.path, input.content.as_bytes())
+            .await
+            .map_err(|err| ClawError::Backend(err.to_string()))?;
+        Ok(ToolOutput {
+            content: format!("wrote {}", input.path.display()),
+            structured: None,
+        })
+    }
+}
+
+struct AppendFileTool {
+    policy: Arc<PolicyEngine>,
+}
+
+impl AppendFileTool {
+    fn new(policy: Arc<PolicyEngine>) -> Self {
+        Self { policy }
+    }
+}
+
+#[async_trait]
+impl Tool for AppendFileTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "append_file".into(),
+            description: "Append text to a file in a writable allowed directory.".into(),
+            requires_approval: false,
+        }
+    }
+
+    async fn call(&self, _ctx: ToolContext, input: Value) -> ClawResult<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Input {
+            path: PathBuf,
+            content: String,
+        }
+        let input: Input = serde_json::from_value(input)
+            .map_err(|err| ClawError::InvalidRequest(err.to_string()))?;
+        guard_write_path(&self.policy, &input.path)?;
+        if let Some(parent) = input.path.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|err| ClawError::Backend(err.to_string()))?;
+        }
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&input.path)
+            .await
+            .map_err(|err| ClawError::Backend(err.to_string()))?;
+        use tokio::io::AsyncWriteExt;
+        file.write_all(input.content.as_bytes())
+            .await
+            .map_err(|err| ClawError::Backend(err.to_string()))?;
+        Ok(ToolOutput {
+            content: format!("appended {}", input.path.display()),
+            structured: None,
+        })
     }
 }
 
@@ -700,6 +799,18 @@ fn guard_dir(policy: &PolicyEngine, path: &Path) -> ClawResult<()> {
         return Err(ClawError::AccessDenied(format!(
             "path is outside allowed directories: {}",
             path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn guard_write_path(policy: &PolicyEngine, path: &Path) -> ClawResult<()> {
+    let candidate = path.parent().unwrap_or(path);
+    guard_dir(policy, candidate)?;
+    if !policy.is_writable_workdir(candidate) {
+        return Err(ClawError::AccessDenied(format!(
+            "path is outside writable directories: {}",
+            candidate.display()
         )));
     }
     Ok(())

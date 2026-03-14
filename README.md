@@ -16,7 +16,7 @@ Single-user Telegram-first ops agent in Rust.
 ## Running
 
 1. Run `cargo run -- onboard` or `hajimi onboard`.
-2. Fill in the Telegram bot token, admin ids, and provider details.
+2. `hajimi onboard` verifies the Telegram bot token, can pair the admin user/chat automatically with a one-time pairing code sent to the bot, and interactively guides provider model selection.
 3. Start the daemon with `cargo run` or `hajimi`.
 4. In Telegram, use `/onboard` to add or switch providers interactively.
 
@@ -62,6 +62,28 @@ The npm package exposes both `hajimi` and `hajimi-claw`, and builds the Rust bin
 - `hajimi restart`
 - `hajimi help`
 
+## Persona Files
+
+`hajimi onboard` now creates empty persona files in `~/.hajimi/`:
+
+- `soul.md`
+- `agents.md`
+- `tools.md`
+- `skills.md`
+
+`hajimi` reloads these files on each request, so Telegram edits take effect on the next `/ask`.
+
+- Auto-discovered files: `soul.md`, `agents.md`, `AGENTS.md`, `tools.md`, `skills.md`
+- Search roots: the current working directory, the config directory, and `~/.hajimi`
+- Optional explicit list: set `[persona].prompt_files` in `config.toml`
+
+Use these files for:
+
+- `soul.md`: tone, temperament, and high-level persona
+- `agents.md` or `AGENTS.md`: repo or operator instructions
+- `tools.md`: tool-use policy and operational preferences
+- `skills.md`: extra habits, playbooks, and skill-selection hints
+
 ## Telegram commands
 
 - `/onboard`
@@ -72,6 +94,10 @@ The npm package exposes both `hajimi` and `hajimi-claw`, and builds the Rust bin
 - `/provider bind <id>`
 - `/provider test [id]`
 - `/provider models [id]`
+- `/persona list`
+- `/persona read <soul|agents|tools|skills>`
+- `/persona write <file> <content>`
+- `/persona append <file> <content>`
 - `/ask <text>`
 - `/shell open [name]`
 - `/shell exec <cmd>`

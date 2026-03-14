@@ -32,6 +32,10 @@ pub enum GatewayCommand {
     ProviderCurrent,
     ProviderTest(Option<String>),
     ProviderModels(Option<String>),
+    PersonaList,
+    PersonaRead(String),
+    PersonaWrite { file: String, content: String },
+    PersonaAppend { file: String, content: String },
     Help,
     Unknown(String),
 }
@@ -193,6 +197,16 @@ impl Gateway for InProcessGateway {
                 self.provider_models(request.actor_chat_id, provider_id.as_deref())
                     .await
             }
+            GatewayCommand::PersonaList => Ok(text_response(&self.runtime.persona_list().await?)),
+            GatewayCommand::PersonaRead(file) => {
+                Ok(text_response(&self.runtime.persona_read(&file).await?))
+            }
+            GatewayCommand::PersonaWrite { file, content } => Ok(text_response(
+                &self.runtime.persona_write(&file, &content).await?,
+            )),
+            GatewayCommand::PersonaAppend { file, content } => Ok(text_response(
+                &self.runtime.persona_append(&file, &content).await?,
+            )),
             GatewayCommand::Help => Ok(text_response(&help_text())),
             GatewayCommand::Unknown(raw) => Ok(text_response(&format!(
                 "unrecognized command: {raw}\n\n{}",
@@ -456,6 +470,22 @@ pub fn parse_gateway_command(text: &str) -> GatewayCommand {
     if trimmed == "/provider current" {
         return GatewayCommand::ProviderCurrent;
     }
+    if trimmed == "/persona list" {
+        return GatewayCommand::PersonaList;
+    }
+    if let Some(rest) = trimmed.strip_prefix("/persona read ") {
+        return GatewayCommand::PersonaRead(rest.trim().into());
+    }
+    if let Some(rest) = trimmed.strip_prefix("/persona write ") {
+        if let Some((file, content)) = split_file_and_content(rest.trim()) {
+            return GatewayCommand::PersonaWrite { file, content };
+        }
+    }
+    if let Some(rest) = trimmed.strip_prefix("/persona append ") {
+        if let Some((file, content)) = split_file_and_content(rest.trim()) {
+            return GatewayCommand::PersonaAppend { file, content };
+        }
+    }
     if let Some(rest) = trimmed.strip_prefix("/provider models") {
         let value = rest.trim();
         return GatewayCommand::ProviderModels((!value.is_empty()).then(|| value.to_string()));
@@ -515,6 +545,10 @@ pub fn help_text() -> String {
         "/provider bind <id>",
         "/provider test [id]",
         "/provider models [id]",
+        "/persona list",
+        "/persona read <soul|agents|tools|skills>",
+        "/persona write <file> <content>",
+        "/persona append <file> <content>",
         "/shell open [name]",
         "/shell exec <cmd>",
         "/shell close",
@@ -582,6 +616,16 @@ fn parse_provider_kind(raw: &str) -> ClawResult<ProviderKind> {
 
 fn normalize_base_url(raw: &str) -> String {
     raw.trim().trim_end_matches('/').to_string()
+}
+
+fn split_file_and_content(raw: &str) -> Option<(String, String)> {
+    let mut parts = raw.splitn(2, ' ');
+    let file = parts.next()?.trim();
+    let content = parts.next()?.trim();
+    if file.is_empty() || content.is_empty() {
+        return None;
+    }
+    Some((file.to_string(), content.to_string()))
 }
 
 fn slugify(value: &str) -> String {
@@ -673,6 +717,17 @@ mod tests {
         assert_eq!(
             parse_gateway_command("/provider test moonshot"),
             GatewayCommand::ProviderTest(Some("moonshot".into()))
+        );
+    }
+
+    #[test]
+    fn parses_persona_append_command() {
+        assert_eq!(
+            parse_gateway_command("/persona append soul Be terse."),
+            GatewayCommand::PersonaAppend {
+                file: "soul".into(),
+                content: "Be terse.".into(),
+            }
         );
     }
 

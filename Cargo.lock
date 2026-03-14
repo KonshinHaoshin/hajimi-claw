@@ -518,6 +518,8 @@ dependencies = [
  "hajimi-claw-types",
  "reqwest",
  "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
  "toml",
  "tracing",

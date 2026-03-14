@@ -3,10 +3,11 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use hajimi_claw_agent::AgentRuntime;
+use hajimi_claw_agent::{AgentRuntime, MarkdownPromptSource, default_system_prompt};
 use hajimi_claw_bot::{TelegramBot, TelegramConfig};
 use hajimi_claw_exec::{LocalExecutor, PlatformMode};
 use hajimi_claw_gateway::InProcessGateway;
@@ -29,6 +30,8 @@ pub struct AppConfig {
     pub security: SecuritySection,
     pub policy: PolicyConfig,
     pub execution: ExecutionSection,
+    #[serde(default)]
+    pub persona: PersonaSection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,10 +64,30 @@ pub struct ExecutionSection {
     pub mode: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PersonaSection {
+    pub directory: Option<PathBuf>,
+    #[serde(default)]
+    pub prompt_files: Vec<PathBuf>,
+}
+
 #[derive(Debug, Clone)]
 pub struct LoadedConfig {
     pub path: PathBuf,
     pub config: AppConfig,
+}
+
+#[derive(Debug, Clone)]
+struct TelegramBotIdentity {
+    id: i64,
+    username: Option<String>,
+    first_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TelegramPairing {
+    user_id: i64,
+    chat_id: i64,
 }
 
 pub async fn entry_from_env() -> Result<()> {
@@ -94,10 +117,18 @@ pub async fn entry_from_env() -> Result<()> {
 
 pub async fn run_from_env() -> Result<()> {
     let loaded = load_config_from_env_or_default()?;
-    run(loaded.config).await
+    run_loaded(loaded).await
 }
 
 pub async fn run(config: AppConfig) -> Result<()> {
+    run_with_context(config, None).await
+}
+
+async fn run_loaded(loaded: LoadedConfig) -> Result<()> {
+    run_with_context(loaded.config, Some(loaded.path)).await
+}
+
+async fn run_with_context(config: AppConfig, config_path: Option<PathBuf>) -> Result<()> {
     if let Some(parent) = config.storage.sqlite_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("create storage directory {}", parent.display()))?;
@@ -119,8 +150,22 @@ pub async fn run(config: AppConfig) -> Result<()> {
     bootstrap_provider_if_configured(&store, &config)?;
     let llm: Arc<dyn hajimi_claw_types::LlmBackend> =
         Arc::new(StoreBackedBackend::new(store.clone(), Some(fallback)));
+    let persona_dir = resolve_persona_directory(&config);
+    ensure_persona_files(&persona_dir)?;
+    let prompt_files = resolve_persona_paths(config_path.as_deref(), &config.persona)?;
+    let prompt_source = Arc::new(MarkdownPromptSource::new(
+        default_system_prompt(),
+        prompt_files,
+    ));
 
-    let runtime = Arc::new(AgentRuntime::new(llm, tools, store.clone(), policy.clone()));
+    let runtime = Arc::new(AgentRuntime::new(
+        llm,
+        tools,
+        store.clone(),
+        policy.clone(),
+        prompt_source,
+        persona_dir,
+    ));
     let gateway = Arc::new(InProcessGateway::new(
         runtime,
         policy.clone(),
@@ -194,23 +239,45 @@ fn select_platform_mode(mode: Option<&str>) -> PlatformMode {
 
 fn relativize_config(config: &mut AppConfig, config_path: &Path) {
     let base = config_path.parent().unwrap_or_else(|| Path::new("."));
+    config.storage.sqlite_path = expand_home(&config.storage.sqlite_path);
     if config.storage.sqlite_path.is_relative() {
         config.storage.sqlite_path = base.join(&config.storage.sqlite_path);
     }
     if let Some(path) = config.security.master_key_file.as_mut() {
+        *path = expand_home(path);
         if path.is_relative() {
             *path = base.join(&*path);
         }
     }
+    if let Some(path) = config.persona.directory.as_mut() {
+        *path = expand_home(path);
+        if path.is_relative() {
+            *path = base.join(&*path);
+        }
+    }
+    config.persona.prompt_files = config
+        .persona
+        .prompt_files
+        .iter()
+        .map(|path| {
+            let path = expand_home(path);
+            if path.is_relative() {
+                base.join(path)
+            } else {
+                path
+            }
+        })
+        .collect();
     config.policy.allowed_workdirs = config
         .policy
         .allowed_workdirs
         .iter()
         .map(|path| {
+            let path = expand_home(path);
             if path.is_relative() {
                 base.join(path)
             } else {
-                path.clone()
+                path
             }
         })
         .collect();
@@ -219,16 +286,21 @@ fn relativize_config(config: &mut AppConfig, config_path: &Path) {
         .writable_workdirs
         .iter()
         .map(|path| {
+            let path = expand_home(path);
             if path.is_relative() {
                 base.join(path)
             } else {
-                path.clone()
+                path
             }
         })
         .collect();
 }
 
 fn open_store(config: &AppConfig) -> Result<Arc<Store>> {
+    if let Some(parent) = config.storage.sqlite_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create storage directory {}", parent.display()))?;
+    }
     let secret = load_master_key(config)?;
     let cipher = Arc::new(SecretCipher::from_passphrase(&secret)?);
     Ok(Arc::new(Store::open_with_cipher(
@@ -331,6 +403,33 @@ fn default_config_path() -> Result<PathBuf> {
     Ok(base.join("hajimi-claw").join("config.toml"))
 }
 
+fn default_hajimi_home() -> Result<PathBuf> {
+    Ok(home_dir()?.join(".hajimi"))
+}
+
+fn home_dir() -> Result<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+        .context("HOME or USERPROFILE is not set")
+}
+
+fn expand_home(path: &Path) -> PathBuf {
+    let rendered = path.to_string_lossy();
+    if rendered == "~" {
+        return home_dir().unwrap_or_else(|_| path.to_path_buf());
+    }
+    if let Some(rest) = rendered
+        .strip_prefix("~/")
+        .or_else(|| rendered.strip_prefix("~\\"))
+    {
+        return home_dir()
+            .map(|home| home.join(rest))
+            .unwrap_or_else(|_| path.to_path_buf());
+    }
+    path.to_path_buf()
+}
+
 fn default_storage_path(config_path: &Path) -> PathBuf {
     config_path
         .parent()
@@ -346,6 +445,10 @@ fn default_master_key_file(config_path: &Path) -> PathBuf {
         .join("master.key")
 }
 
+fn default_persona_dir() -> PathBuf {
+    default_hajimi_home().unwrap_or_else(|_| PathBuf::from(".hajimi"))
+}
+
 fn default_workdirs(config_path: &Path) -> Vec<PathBuf> {
     let mut paths = vec![std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))];
     let data_dir = config_path
@@ -353,8 +456,77 @@ fn default_workdirs(config_path: &Path) -> Vec<PathBuf> {
         .unwrap_or_else(|| Path::new("."))
         .join("data");
     paths.push(data_dir);
+    paths.push(default_persona_dir());
     paths.push(std::env::temp_dir());
     paths
+}
+
+fn resolve_persona_paths(
+    config_path: Option<&Path>,
+    persona: &PersonaSection,
+) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    if !persona.prompt_files.is_empty() {
+        for path in &persona.prompt_files {
+            let resolved = if path.is_relative() {
+                config_path
+                    .and_then(Path::parent)
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(path)
+            } else {
+                path.clone()
+            };
+            if !paths.iter().any(|item| item == &resolved) {
+                paths.push(resolved);
+            }
+        }
+        return Ok(paths);
+    }
+
+    let mut roots = vec![std::env::current_dir()?];
+    if let Some(config_dir) = config_path.and_then(Path::parent) {
+        if roots.iter().all(|root| root != config_dir) {
+            roots.push(config_dir.to_path_buf());
+        }
+    }
+    let persona_dir = resolve_persona_directory_from_section(persona);
+    if roots.iter().all(|root| root != &persona_dir) {
+        roots.push(persona_dir);
+    }
+
+    for root in roots {
+        for name in ["soul.md", "agents.md", "AGENTS.md", "tools.md", "skills.md"] {
+            let candidate = root.join(name);
+            if !paths.iter().any(|path| path == &candidate) {
+                paths.push(candidate);
+            }
+        }
+    }
+    Ok(paths)
+}
+
+fn resolve_persona_directory(config: &AppConfig) -> PathBuf {
+    resolve_persona_directory_from_section(&config.persona)
+}
+
+fn resolve_persona_directory_from_section(persona: &PersonaSection) -> PathBuf {
+    persona
+        .directory
+        .clone()
+        .unwrap_or_else(default_persona_dir)
+}
+
+fn ensure_persona_files(persona_dir: &Path) -> Result<()> {
+    fs::create_dir_all(persona_dir)
+        .with_context(|| format!("create persona directory {}", persona_dir.display()))?;
+    for name in ["soul.md", "agents.md", "tools.md", "skills.md"] {
+        let path = persona_dir.join(name);
+        if !path.exists() {
+            fs::write(&path, "")
+                .with_context(|| format!("create persona file {}", path.display()))?;
+        }
+    }
+    Ok(())
 }
 
 async fn interactive_onboard(config_path: PathBuf) -> Result<()> {
@@ -367,20 +539,52 @@ async fn interactive_onboard(config_path: PathBuf) -> Result<()> {
     } else {
         default_app_config(&config_path)
     };
+    let persona_dir = resolve_persona_directory(&config);
+    ensure_persona_files(&persona_dir)?;
+    ensure_path_list_contains(&mut config.policy.allowed_workdirs, &persona_dir);
+    ensure_path_list_contains(&mut config.policy.writable_workdirs, &persona_dir);
+    config.persona.directory = Some(persona_dir.clone());
 
     println!("hajimi onboard");
     println!("config path: {}", config_path.display());
+    println!("persona dir: {}", persona_dir.display());
 
+    println!();
+    println!("Telegram bot channel");
     if config.telegram.bot_token.trim().is_empty()
         || config.telegram.bot_token.contains("replace-me")
     {
         config.telegram.bot_token = prompt("Telegram bot token")?;
     }
-    if config.policy.admin_user_id == 0 {
-        config.policy.admin_user_id = prompt("Telegram admin user id")?.parse()?;
-    }
-    if config.policy.admin_chat_id == 0 {
-        config.policy.admin_chat_id = prompt("Telegram admin chat id")?.parse()?;
+    let bot_identity = verify_telegram_bot_token(&config.telegram.bot_token).await?;
+    println!(
+        "verified Telegram bot: {} ({})",
+        bot_identity
+            .username
+            .as_deref()
+            .map(|username| format!("@{username}"))
+            .unwrap_or_else(|| bot_identity.first_name.clone()),
+        bot_identity.id
+    );
+
+    let needs_pairing = config.policy.admin_user_id == 0 || config.policy.admin_chat_id == 0;
+    if prompt_yes_no("Pair Telegram admin automatically now", needs_pairing)? {
+        let pairing =
+            pair_telegram_admin(&config.telegram.bot_token, bot_identity.username.as_deref())
+                .await?;
+        config.policy.admin_user_id = pairing.user_id;
+        config.policy.admin_chat_id = pairing.chat_id;
+        println!(
+            "paired Telegram admin: user_id={} chat_id={}",
+            pairing.user_id, pairing.chat_id
+        );
+    } else {
+        if config.policy.admin_user_id == 0 {
+            config.policy.admin_user_id = prompt("Telegram admin user id")?.parse()?;
+        }
+        if config.policy.admin_chat_id == 0 {
+            config.policy.admin_chat_id = prompt("Telegram admin chat id")?.parse()?;
+        }
     }
 
     let master_key_file = config
@@ -421,7 +625,18 @@ async fn interactive_onboard(config_path: PathBuf) -> Result<()> {
     )?)?;
     let base_url = prompt_default("Provider base URL", "https://api.openai.com/v1")?;
     let api_key = prompt("Provider API key")?;
-    let model = prompt_default("Default model", "gpt-4.1-mini")?;
+    let model = prompt_provider_model(&ProviderConfig {
+        id: slugify(&label),
+        label: label.clone(),
+        kind: kind.clone(),
+        base_url: base_url.clone(),
+        api_key: api_key.clone(),
+        model: String::new(),
+        enabled: true,
+        extra_headers: vec![],
+        created_at: Utc::now(),
+    })
+    .await?;
 
     let record = ProviderRecord {
         config: ProviderConfig {
@@ -448,6 +663,7 @@ async fn interactive_onboard(config_path: PathBuf) -> Result<()> {
     println!("Health: {}", health.message);
     println!("Config saved to {}", config_path.display());
     println!("Master key file: {}", master_key_file.display());
+    println!("Persona files ready in {}", persona_dir.display());
     Ok(())
 }
 
@@ -535,11 +751,19 @@ fn default_app_config(config_path: &Path) -> AppConfig {
             admin_user_id: 0,
             admin_chat_id: 0,
             allowed_workdirs: workdirs.clone(),
-            writable_workdirs: vec![workdirs[1].clone(), workdirs[2].clone()],
+            writable_workdirs: vec![
+                workdirs[1].clone(),
+                workdirs[2].clone(),
+                workdirs[3].clone(),
+            ],
             ..PolicyConfig::default()
         },
         execution: ExecutionSection {
             mode: Some("auto".into()),
+        },
+        persona: PersonaSection {
+            directory: Some(default_persona_dir()),
+            prompt_files: vec![],
         },
     }
 }
@@ -558,6 +782,15 @@ fn make_config_relative(config: &mut AppConfig, config_path: &Path) {
     if let Some(path) = config.security.master_key_file.as_mut() {
         *path = make_relative(path, base);
     }
+    if let Some(path) = config.persona.directory.as_mut() {
+        *path = make_relative(path, base);
+    }
+    config.persona.prompt_files = config
+        .persona
+        .prompt_files
+        .iter()
+        .map(|path| make_relative(path, base))
+        .collect();
     config.policy.allowed_workdirs = config
         .policy
         .allowed_workdirs
@@ -574,6 +807,12 @@ fn make_config_relative(config: &mut AppConfig, config_path: &Path) {
 
 fn make_relative(path: &Path, base: &Path) -> PathBuf {
     path.strip_prefix(base).unwrap_or(path).to_path_buf()
+}
+
+fn ensure_path_list_contains(paths: &mut Vec<PathBuf>, target: &Path) {
+    if paths.iter().all(|path| path != target) {
+        paths.push(target.to_path_buf());
+    }
 }
 
 fn prompt(label: &str) -> Result<String> {
@@ -599,6 +838,171 @@ fn prompt_default(label: &str, default: &str) -> Result<String> {
     } else {
         Ok(trimmed.to_string())
     }
+}
+
+async fn prompt_provider_model(provider: &ProviderConfig) -> Result<String> {
+    let client = reqwest::Client::new();
+    match list_models(&client, provider).await {
+        Ok(models) if !models.is_empty() => {
+            println!("Discovered models:");
+            for (index, model) in models.iter().enumerate() {
+                println!("  {}. {}", index + 1, model);
+            }
+            let default = "1";
+            let choice =
+                prompt_default("Choose a model number or type a custom model id", default)?;
+            if let Some(model) = resolve_model_choice(&choice, &models) {
+                println!("selected model: {model}");
+                Ok(model)
+            } else {
+                anyhow::bail!("invalid model selection")
+            }
+        }
+        Ok(_) => prompt_default("Default model", "gpt-4.1-mini"),
+        Err(err) => {
+            println!("Model discovery failed: {err}");
+            prompt_default("Default model", "gpt-4.1-mini")
+        }
+    }
+}
+
+fn resolve_model_choice(choice: &str, models: &[String]) -> Option<String> {
+    let trimmed = choice.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(index) = trimmed.parse::<usize>() {
+        return models.get(index.checked_sub(1)?).cloned();
+    }
+    Some(trimmed.to_string())
+}
+
+fn prompt_yes_no(label: &str, default: bool) -> Result<bool> {
+    let suffix = if default { "[Y/n]" } else { "[y/N]" };
+    print!("{label} {suffix}: ");
+    io::stdout().flush()?;
+    let mut buffer = String::new();
+    io::stdin().read_line(&mut buffer)?;
+    let trimmed = buffer.trim().to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return Ok(default);
+    }
+    match trimmed.as_str() {
+        "y" | "yes" => Ok(true),
+        "n" | "no" => Ok(false),
+        _ => anyhow::bail!("please answer yes or no"),
+    }
+}
+
+async fn verify_telegram_bot_token(token: &str) -> Result<TelegramBotIdentity> {
+    let client = reqwest::Client::new();
+    let response = client
+        .post(telegram_api_url(token, "getMe"))
+        .send()
+        .await
+        .context("telegram getMe request")?;
+    if !response.status().is_success() {
+        anyhow::bail!("telegram getMe returned {}", response.status());
+    }
+    let payload: TelegramEnvelope<TelegramUser> = response
+        .json()
+        .await
+        .context("decode telegram getMe response")?;
+    if !payload.ok {
+        anyhow::bail!("telegram getMe returned ok=false");
+    }
+    Ok(TelegramBotIdentity {
+        id: payload.result.id,
+        username: payload.result.username,
+        first_name: payload.result.first_name,
+    })
+}
+
+async fn pair_telegram_admin(token: &str, username: Option<&str>) -> Result<TelegramPairing> {
+    let client = reqwest::Client::new();
+    let mut offset = latest_update_offset(&client, token).await?;
+    let raw_code = Uuid::new_v4().simple().to_string();
+    let code = format!("hajimi-{}", &raw_code[..8]);
+    let target = username
+        .map(|value| format!("@{value}"))
+        .unwrap_or_else(|| "your bot".into());
+    println!(
+        "pairing code generated. Send `/start {code}` or `/pair {code}` to {target} within 90 seconds."
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while Instant::now() < deadline {
+        let updates = telegram_get_updates(&client, token, offset, 10).await?;
+        for update in updates {
+            offset = offset.max(update.update_id + 1);
+            if let Some(pairing) = match_pairing_update(&update, &code) {
+                return Ok(pairing);
+            }
+        }
+    }
+
+    anyhow::bail!("telegram pairing timed out after 90 seconds")
+}
+
+async fn latest_update_offset(client: &reqwest::Client, token: &str) -> Result<i64> {
+    let updates = telegram_get_updates(client, token, 0, 0).await?;
+    Ok(updates
+        .into_iter()
+        .map(|update| update.update_id + 1)
+        .max()
+        .unwrap_or(0))
+}
+
+async fn telegram_get_updates(
+    client: &reqwest::Client,
+    token: &str,
+    offset: i64,
+    timeout_secs: u64,
+) -> Result<Vec<TelegramUpdate>> {
+    let response = client
+        .post(telegram_api_url(token, "getUpdates"))
+        .json(&serde_json::json!({
+            "offset": offset,
+            "timeout": timeout_secs,
+        }))
+        .send()
+        .await
+        .context("telegram getUpdates request")?;
+    if !response.status().is_success() {
+        anyhow::bail!("telegram getUpdates returned {}", response.status());
+    }
+    let payload: TelegramEnvelope<Vec<TelegramUpdate>> = response
+        .json()
+        .await
+        .context("decode telegram getUpdates response")?;
+    if !payload.ok {
+        anyhow::bail!("telegram getUpdates returned ok=false");
+    }
+    Ok(payload.result)
+}
+
+fn match_pairing_update(update: &TelegramUpdate, code: &str) -> Option<TelegramPairing> {
+    let message = update.message.as_ref()?;
+    let text = message.text.as_deref()?.trim();
+    if !pairing_text_matches(text, code) {
+        return None;
+    }
+    let user_id = message.from.as_ref()?.id;
+    Some(TelegramPairing {
+        user_id,
+        chat_id: message.chat.id,
+    })
+}
+
+fn pairing_text_matches(text: &str, code: &str) -> bool {
+    let normalized = text.trim();
+    normalized == code
+        || normalized == format!("/pair {code}")
+        || normalized == format!("/start {code}")
+}
+
+fn telegram_api_url(token: &str, method: &str) -> String {
+    format!("https://api.telegram.org/bot{token}/{method}")
 }
 
 fn parse_provider_kind(raw: &str) -> Result<ProviderKind> {
@@ -647,10 +1051,49 @@ fn help_text() -> &'static str {
   hajimi help            Show this help"
 }
 
+#[derive(Debug, Deserialize)]
+struct TelegramEnvelope<T> {
+    ok: bool,
+    result: T,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramUpdate {
+    update_id: i64,
+    message: Option<TelegramMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramMessage {
+    chat: TelegramChat,
+    from: Option<TelegramUser>,
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramChat {
+    id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramUser {
+    id: i64,
+    username: Option<String>,
+    first_name: String,
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{default_config_path, select_platform_mode, slugify};
+    use std::fs;
+    use std::path::Path;
+
+    use super::{
+        PersonaSection, default_config_path, ensure_persona_files, expand_home, open_store,
+        pairing_text_matches, resolve_model_choice, resolve_persona_paths, select_platform_mode,
+        slugify,
+    };
     use hajimi_claw_exec::PlatformMode;
+    use tempfile::tempdir;
 
     #[test]
     fn selects_explicit_mode() {
@@ -671,5 +1114,95 @@ mod tests {
             default_config_path().unwrap().file_name().unwrap(),
             "config.toml"
         );
+    }
+
+    #[test]
+    fn pairing_text_accepts_start_and_pair_commands() {
+        assert!(pairing_text_matches(
+            "/start hajimi-abcd1234",
+            "hajimi-abcd1234"
+        ));
+        assert!(pairing_text_matches(
+            "/pair hajimi-abcd1234",
+            "hajimi-abcd1234"
+        ));
+        assert!(!pairing_text_matches("/start other", "hajimi-abcd1234"));
+    }
+
+    #[test]
+    fn persona_paths_include_local_and_home_files() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let persona_dir = dir.path().join(".hajimi");
+        fs::write(dir.path().join("soul.md"), "Speak tersely.").unwrap();
+        ensure_persona_files(&persona_dir).unwrap();
+
+        let paths = resolve_persona_paths(
+            Some(&config_path),
+            &PersonaSection {
+                directory: Some(persona_dir.clone()),
+                prompt_files: vec![],
+            },
+        )
+        .unwrap();
+        assert!(paths.contains(&dir.path().join("soul.md")));
+        assert!(paths.contains(&persona_dir.join("skills.md")));
+    }
+
+    #[test]
+    fn expands_tilde_paths() {
+        let expanded = expand_home(Path::new("~/.hajimi"));
+        assert!(expanded.ends_with(".hajimi"));
+    }
+
+    #[test]
+    fn open_store_creates_storage_parent_dir() {
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join("master.key");
+        fs::write(&key_path, "test-master-key").unwrap();
+
+        let config = super::AppConfig {
+            telegram: super::TelegramSection {
+                bot_token: "token".into(),
+                poll_timeout_secs: Some(30),
+            },
+            llm: super::LlmSection {
+                base_url: None,
+                api_key: None,
+                model: None,
+                static_fallback_response: None,
+            },
+            storage: super::StorageSection {
+                sqlite_path: dir
+                    .path()
+                    .join("nested")
+                    .join("data")
+                    .join("hajimi.sqlite3"),
+            },
+            security: super::SecuritySection {
+                master_key_env: Some("HAJIMI_TEST_MASTER_KEY".into()),
+                master_key_file: Some(key_path),
+            },
+            policy: hajimi_claw_policy::PolicyConfig::default(),
+            execution: super::ExecutionSection { mode: None },
+            persona: super::PersonaSection::default(),
+        };
+
+        open_store(&config).unwrap();
+        assert!(config.storage.sqlite_path.exists());
+    }
+
+    #[test]
+    fn resolves_model_choice_by_index_or_literal() {
+        let models = vec!["gpt-4.1-mini".to_string(), "gpt-4.1".to_string()];
+        assert_eq!(
+            resolve_model_choice("1", &models).as_deref(),
+            Some("gpt-4.1-mini")
+        );
+        assert_eq!(
+            resolve_model_choice("custom-model", &models).as_deref(),
+            Some("custom-model")
+        );
+        assert!(resolve_model_choice("0", &models).is_none());
     }
 }

@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::{fs, path::Path};
 
 use chrono::Utc;
 use futures::TryStreamExt;
@@ -20,6 +21,8 @@ pub struct AgentRuntime {
     store: Arc<Store>,
     policy: Arc<PolicyEngine>,
     task_gate: Arc<Semaphore>,
+    prompt_source: Arc<dyn SystemPromptSource>,
+    persona_dir: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +37,8 @@ impl AgentRuntime {
         tools: Arc<ToolRegistry>,
         store: Arc<Store>,
         policy: Arc<PolicyEngine>,
+        prompt_source: Arc<dyn SystemPromptSource>,
+        persona_dir: PathBuf,
     ) -> Self {
         Self {
             llm,
@@ -41,6 +46,8 @@ impl AgentRuntime {
             store,
             policy,
             task_gate: Arc::new(Semaphore::new(1)),
+            prompt_source,
+            persona_dir,
         }
     }
 
@@ -54,6 +61,8 @@ impl AgentRuntime {
             tools,
             store,
             policy,
+            Arc::new(StaticSystemPrompt::new(default_system_prompt())),
+            std::env::temp_dir(),
         )
     }
 
@@ -193,6 +202,68 @@ impl AgentRuntime {
             .map(|output| output.content)
     }
 
+    pub async fn persona_list(&self) -> ClawResult<String> {
+        let mut lines = Vec::new();
+        for file in persona_file_names() {
+            let path = self.persona_dir.join(file);
+            let exists = fs::metadata(&path).is_ok();
+            lines.push(format!(
+                "{}\t{}",
+                if exists { "present" } else { "missing" },
+                path.display()
+            ));
+        }
+        Ok(lines.join("\n"))
+    }
+
+    pub async fn persona_read(&self, name: &str) -> ClawResult<String> {
+        let path = self.resolve_persona_file(name)?;
+        self.tools
+            .call(
+                "read_file",
+                ToolContext {
+                    conversation_id: ConversationId::new(),
+                    working_directory: Some(self.persona_dir.clone()),
+                    elevated: self.policy.is_elevated(),
+                },
+                json!({ "path": path, "max_bytes": 12 * 1024 }),
+            )
+            .await
+            .map(|output| output.content)
+    }
+
+    pub async fn persona_write(&self, name: &str, content: &str) -> ClawResult<String> {
+        let path = self.resolve_persona_file(name)?;
+        self.tools
+            .call(
+                "write_file",
+                ToolContext {
+                    conversation_id: ConversationId::new(),
+                    working_directory: Some(self.persona_dir.clone()),
+                    elevated: self.policy.is_elevated(),
+                },
+                json!({ "path": path, "content": content }),
+            )
+            .await
+            .map(|output| output.content)
+    }
+
+    pub async fn persona_append(&self, name: &str, content: &str) -> ClawResult<String> {
+        let path = self.resolve_persona_file(name)?;
+        self.tools
+            .call(
+                "append_file",
+                ToolContext {
+                    conversation_id: ConversationId::new(),
+                    working_directory: Some(self.persona_dir.clone()),
+                    elevated: self.policy.is_elevated(),
+                },
+                json!({ "path": path, "content": content }),
+            )
+            .await
+            .map(|output| output.content)
+    }
+
     pub fn request_elevated(&self, minutes: i64, reason: String) -> String {
         let approval = self.policy.request_elevation(minutes, reason.clone());
         let _ = self.store.save_approval(&approval, None);
@@ -259,7 +330,7 @@ impl AgentRuntime {
             .respond(AgentRequest {
                 conversation_id,
                 provider_id,
-                system_prompt: "You are hajimi-claw, a narrow single-user operations agent. Prefer concise, actionable answers. Use tools when possible.".into(),
+                system_prompt: self.prompt_source.load()?,
                 messages: vec![ConversationMessage {
                     role: MessageRole::User,
                     content: prompt.into(),
@@ -283,6 +354,116 @@ impl AgentRuntime {
 
 fn store_error(err: anyhow::Error) -> ClawError {
     ClawError::Backend(err.to_string())
+}
+
+impl AgentRuntime {
+    fn resolve_persona_file(&self, raw: &str) -> ClawResult<PathBuf> {
+        let trimmed = raw.trim().trim_matches('`');
+        let canonical = match trimmed.to_ascii_lowercase().as_str() {
+            "soul" | "soul.md" => "soul.md",
+            "agents" | "agents.md" => "agents.md",
+            "tools" | "tools.md" => "tools.md",
+            "skills" | "skills.md" => "skills.md",
+            _ => {
+                return Err(ClawError::InvalidRequest(
+                    "persona file must be one of: soul, agents, tools, skills".into(),
+                ));
+            }
+        };
+        Ok(self.persona_dir.join(canonical))
+    }
+}
+
+pub fn default_system_prompt() -> &'static str {
+    "You are hajimi-claw, a narrow single-user operations agent. Prefer concise, actionable answers. Use tools when possible."
+}
+
+pub trait SystemPromptSource: Send + Sync {
+    fn load(&self) -> ClawResult<String>;
+}
+
+pub struct StaticSystemPrompt {
+    prompt: String,
+}
+
+impl StaticSystemPrompt {
+    pub fn new(prompt: impl Into<String>) -> Self {
+        Self {
+            prompt: prompt.into(),
+        }
+    }
+}
+
+impl SystemPromptSource for StaticSystemPrompt {
+    fn load(&self) -> ClawResult<String> {
+        Ok(self.prompt.clone())
+    }
+}
+
+pub struct MarkdownPromptSource {
+    base_prompt: String,
+    files: Vec<PathBuf>,
+}
+
+impl MarkdownPromptSource {
+    pub fn new(base_prompt: impl Into<String>, files: Vec<PathBuf>) -> Self {
+        Self {
+            base_prompt: base_prompt.into(),
+            files,
+        }
+    }
+}
+
+impl SystemPromptSource for MarkdownPromptSource {
+    fn load(&self) -> ClawResult<String> {
+        let mut prompt = self.base_prompt.clone();
+        let mut sections = Vec::new();
+        for path in &self.files {
+            let content = match fs::read_to_string(path) {
+                Ok(content) => content,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(ClawError::Backend(err.to_string())),
+            };
+            let trimmed = content.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            sections.push(format!(
+                "[{}]\n{}",
+                file_label(path),
+                clamp_prompt_content(trimmed)
+            ));
+        }
+        if !sections.is_empty() {
+            prompt.push_str(
+                "\n\nLocal markdown guidance is attached below. Treat it as repo-specific operating guidance and persona shaping context.\n\n",
+            );
+            prompt.push_str(&sections.join("\n\n"));
+        }
+        Ok(prompt)
+    }
+}
+
+fn clamp_prompt_content(content: &str) -> String {
+    const MAX_BYTES: usize = 12_000;
+    if content.len() <= MAX_BYTES {
+        return content.to_string();
+    }
+    let mut end = MAX_BYTES;
+    while !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n[truncated]", &content[..end])
+}
+
+fn file_label(path: &Path) -> String {
+    path.file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+fn persona_file_names() -> &'static [&'static str] {
+    &["soul.md", "agents.md", "tools.md", "skills.md"]
 }
 
 fn select_tool(prompt: &str) -> Option<(&'static str, serde_json::Value)> {
