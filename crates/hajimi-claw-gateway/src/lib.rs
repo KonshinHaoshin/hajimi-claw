@@ -19,6 +19,7 @@ use tokio::sync::RwLock;
 pub enum GatewayCommand {
     Ask(String),
     ShellOpen(Option<String>),
+    ShellStatus,
     ShellExec(String),
     ShellClose,
     Status,
@@ -45,6 +46,7 @@ pub enum GatewayCommand {
     AgentsOff,
     AgentsAuto,
     AgentsStatus,
+    PersonaGuide,
     PersonaList,
     PersonaRead(String),
     PersonaWrite { file: String, content: String },
@@ -218,6 +220,16 @@ impl Gateway for InProcessGateway {
                     keyboard: None,
                 })
             }
+            GatewayCommand::ShellStatus => {
+                let session_id = request.current_session_id.ok_or_else(|| {
+                    ClawError::InvalidRequest("no active session, use /shell open first".into())
+                })?;
+                Ok(GatewayResponse {
+                    text: self.runtime.shell_status(&session_id).await?,
+                    session: SessionDirective::Keep,
+                    keyboard: None,
+                })
+            }
             GatewayCommand::ShellClose => {
                 let session_id = request.current_session_id.ok_or_else(|| {
                     ClawError::InvalidRequest("no active session, use /shell open first".into())
@@ -277,6 +289,10 @@ impl Gateway for InProcessGateway {
                     .await
             }
             GatewayCommand::AgentsStatus => self.agents_status(request.actor_chat_id).await,
+            GatewayCommand::PersonaGuide => Ok(text_response_with_keyboard(
+                &persona_guide_text(),
+                Some(persona_guide_keyboard()),
+            )),
             GatewayCommand::PersonaList => Ok(text_response(&self.runtime.persona_list().await?)),
             GatewayCommand::PersonaRead(file) => {
                 Ok(text_response(&self.runtime.persona_read(&file).await?))
@@ -393,7 +409,7 @@ impl InProcessGateway {
 
                 let health = test_provider(&self.client, &record).await?;
                 Ok(text_response(&format!(
-                    "onboarding complete.\nprovider=`{}` id=`{}`{}\nchat_binding=enabled\nhealth={}\n{}",
+                    "onboarding complete.\nprovider=`{}` id=`{}`{}\nchat_binding=enabled\nhealth={}\n{}\n\nNext: open `/persona guide` to configure identity, soul, and heartbeat from chat.",
                     record.label,
                     record.id,
                     if make_default { " default=yes" } else { "" },
@@ -703,6 +719,9 @@ pub fn parse_gateway_command(text: &str) -> GatewayCommand {
     if trimmed == "/persona list" {
         return GatewayCommand::PersonaList;
     }
+    if trimmed == "/persona guide" {
+        return GatewayCommand::PersonaGuide;
+    }
     if let Some(rest) = trimmed.strip_prefix("/persona read ") {
         return GatewayCommand::PersonaRead(rest.trim().into());
     }
@@ -753,6 +772,9 @@ pub fn parse_gateway_command(text: &str) -> GatewayCommand {
     if trimmed == "/shell close" {
         return GatewayCommand::ShellClose;
     }
+    if trimmed == "/shell status" {
+        return GatewayCommand::ShellStatus;
+    }
     if let Some(rest) = trimmed.strip_prefix("/shell open") {
         let name = rest.trim();
         return GatewayCommand::ShellOpen((!name.is_empty()).then(|| name.to_string()));
@@ -791,11 +813,13 @@ pub fn help_text() -> String {
         "/agents off",
         "/agents auto",
         "/agents status",
+        "/persona guide",
         "/persona list",
-        "/persona read <soul|agents|tools|skills>",
+        "/persona read <identity|soul|agents|tools|skills|heartbeat>",
         "/persona write <file> <content>",
         "/persona append <file> <content>",
         "/shell open [name]",
+        "/shell status",
         "/shell exec <cmd>",
         "/shell close",
         "/status",
@@ -974,9 +998,62 @@ fn main_menu_keyboard() -> InlineKeyboard {
                 },
                 InlineButton {
                     text: "Persona".into(),
+                    data: "/persona guide".into(),
+                },
+            ],
+        ],
+    }
+}
+
+fn persona_guide_text() -> String {
+    [
+        "persona guide",
+        "",
+        "`identity.md` = who the user is, what systems they own, and standing preferences.",
+        "`soul.md` = Hajimi's personality. It is preseeded as a concise cat AI assistant.",
+        "`heartbeat.md` = daemon heartbeat config.",
+        "",
+        "Heartbeat format example:",
+        "`enabled: true`",
+        "`interval_secs: 30`",
+        "",
+        "Useful commands:",
+        "`/persona read soul`",
+        "`/persona write identity You are helping Alice maintain two Linux VPS nodes.`",
+        "`/persona write soul You are Hajimi, a calm cat AI ops assistant.`",
+        "`/persona write heartbeat enabled: true`",
+        "`/persona append heartbeat interval_secs: 15`",
+    ]
+    .join("\n")
+}
+
+fn persona_guide_keyboard() -> InlineKeyboard {
+    InlineKeyboard {
+        rows: vec![
+            vec![
+                InlineButton {
+                    text: "Read soul".into(),
+                    data: "/persona read soul".into(),
+                },
+                InlineButton {
+                    text: "Read identity".into(),
+                    data: "/persona read identity".into(),
+                },
+            ],
+            vec![
+                InlineButton {
+                    text: "Read heartbeat".into(),
+                    data: "/persona read heartbeat".into(),
+                },
+                InlineButton {
+                    text: "List persona files".into(),
                     data: "/persona list".into(),
                 },
             ],
+            vec![InlineButton {
+                text: "Back to menu".into(),
+                data: "/menu".into(),
+            }],
         ],
     }
 }
@@ -1190,6 +1267,22 @@ mod tests {
                 file: "soul".into(),
                 content: "Be terse.".into(),
             }
+        );
+    }
+
+    #[test]
+    fn parses_persona_guide_command() {
+        assert_eq!(
+            parse_gateway_command("/persona guide"),
+            GatewayCommand::PersonaGuide
+        );
+    }
+
+    #[test]
+    fn parses_shell_status_command() {
+        assert_eq!(
+            parse_gateway_command("/shell status"),
+            GatewayCommand::ShellStatus
         );
     }
 

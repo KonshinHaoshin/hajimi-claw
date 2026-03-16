@@ -1,6 +1,6 @@
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -18,7 +18,7 @@ use hajimi_claw_llm::{StaticBackend, StoreBackedBackend, list_models, test_provi
 use hajimi_claw_policy::{PolicyConfig, PolicyEngine};
 use hajimi_claw_store::{SecretCipher, Store};
 use hajimi_claw_tools::ToolRegistry;
-use hajimi_claw_types::{ProviderConfig, ProviderKind, ProviderRecord};
+use hajimi_claw_types::{HeartbeatStatus, ProviderConfig, ProviderKind, ProviderRecord};
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -225,7 +225,7 @@ async fn run_with_context(config: AppConfig, config_path: Option<PathBuf>) -> Re
         store.clone(),
         policy.clone(),
         prompt_source,
-        persona_dir,
+        persona_dir.clone(),
         MultiAgentConfig {
             enabled: config.multi_agent.enabled,
             auto_delegate: config.multi_agent.auto_delegate,
@@ -240,6 +240,11 @@ async fn run_with_context(config: AppConfig, config_path: Option<PathBuf>) -> Re
         policy.clone(),
         store.clone(),
     ));
+    start_heartbeat_task(
+        store.clone(),
+        config.channel.kind.clone(),
+        persona_dir.clone(),
+    );
     match config.channel.kind.as_str() {
         "none" | "skip" => {
             anyhow::bail!(
@@ -609,7 +614,14 @@ fn resolve_persona_paths(
     }
 
     for root in roots {
-        for name in ["soul.md", "agents.md", "AGENTS.md", "tools.md", "skills.md"] {
+        for name in [
+            "identity.md",
+            "soul.md",
+            "agents.md",
+            "AGENTS.md",
+            "tools.md",
+            "skills.md",
+        ] {
             let candidate = root.join(name);
             if !paths.iter().any(|path| path == &candidate) {
                 paths.push(candidate);
@@ -633,10 +645,10 @@ fn resolve_persona_directory_from_section(persona: &PersonaSection) -> PathBuf {
 fn ensure_persona_files(persona_dir: &Path) -> Result<()> {
     fs::create_dir_all(persona_dir)
         .with_context(|| format!("create persona directory {}", persona_dir.display()))?;
-    for name in ["soul.md", "agents.md", "tools.md", "skills.md"] {
+    for (name, content) in default_persona_templates() {
         let path = persona_dir.join(name);
         if !path.exists() {
-            fs::write(&path, "")
+            fs::write(&path, content)
                 .with_context(|| format!("create persona file {}", path.display()))?;
         }
     }
@@ -888,6 +900,9 @@ async fn interactive_onboard(config_path: PathBuf) -> Result<()> {
     println!("Config saved to {}", config_path.display());
     println!("Master key file: {}", master_key_file.display());
     println!("Persona files ready in {}", persona_dir.display());
+    println!(
+        "Next: open Telegram or Feishu and use `/persona guide` to complete identity, soul, and heartbeat guidance there."
+    );
     Ok(())
 }
 
@@ -1129,26 +1144,154 @@ fn cli_status() -> Result<()> {
     let config_path = resolve_or_default_config_path()?;
     let pid_path = pid_file_path(&config_path);
     let log_path = log_file_path(&config_path);
+    let heartbeat_summary = load_heartbeat_summary().unwrap_or_default();
     match read_pid_file(&pid_path)? {
         Some(pid) if is_process_running(pid) => {
             println!(
-                "background_status=running\npid={}\nlog={}",
+                "background_status=running\npid={}\nlog={}\n{}",
                 pid,
-                log_path.display()
+                log_path.display(),
+                heartbeat_summary
             );
         }
         Some(pid) => {
             println!(
-                "background_status=stale\npid={}\nlog={}\nRemove with `hajimi stop`.",
+                "background_status=stale\npid={}\nlog={}\n{}\nRemove with `hajimi stop`.",
                 pid,
-                log_path.display()
+                log_path.display(),
+                heartbeat_summary
             );
         }
         None => {
-            println!("background_status=stopped\nlog={}", log_path.display());
+            println!(
+                "background_status=stopped\nlog={}\n{}",
+                log_path.display(),
+                heartbeat_summary
+            );
         }
     }
     Ok(())
+}
+
+fn load_heartbeat_summary() -> Result<String> {
+    let loaded = load_config_from_env_or_default()?;
+    let store = open_store(&loaded.config)?;
+    Ok(store
+        .get_heartbeat()?
+        .map(|heartbeat| {
+            let age = (Utc::now() - heartbeat.last_seen_at).num_seconds().max(0);
+            format!(
+                "heartbeat_last_seen_at={}\nheartbeat_age_secs={}\nheartbeat_pid={}\nheartbeat_channel={}",
+                heartbeat.last_seen_at,
+                age,
+                heartbeat
+                    .pid
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+                heartbeat.channel.unwrap_or_else(|| "unknown".into())
+            )
+        })
+        .unwrap_or_else(|| "heartbeat_last_seen_at=unknown".into()))
+}
+
+fn start_heartbeat_task(store: Arc<Store>, channel: String, persona_dir: PathBuf) {
+    let pid = std::process::id();
+    tokio::spawn(async move {
+        loop {
+            let heartbeat = load_heartbeat_file_config(&persona_dir);
+            if heartbeat.enabled {
+                let _ = store.set_heartbeat(&HeartbeatStatus {
+                    last_seen_at: Utc::now(),
+                    pid: Some(pid),
+                    channel: Some(channel.clone()),
+                });
+            }
+            tokio::time::sleep(Duration::from_secs(heartbeat.interval_secs)).await;
+        }
+    });
+}
+
+#[derive(Debug, Clone)]
+struct HeartbeatFileConfig {
+    enabled: bool,
+    interval_secs: u64,
+}
+
+impl Default for HeartbeatFileConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: 30,
+        }
+    }
+}
+
+fn default_persona_templates() -> [(&'static str, &'static str); 6] {
+    [
+        (
+            "identity.md",
+            "# Identity\n\nDescribe who the user is, what systems they own, and any standing preferences.\n",
+        ),
+        (
+            "soul.md",
+            "# Soul\n\nYou are Hajimi, a cat AI assistant with sharp operational instincts. Be concise, capable, and slightly cat-like without becoming noisy or childish. Prefer action, concrete terminal work, and honest status over fluff.\n",
+        ),
+        (
+            "agents.md",
+            "# Agents\n\nDocument sub-agent rules, delegation style, and multi-agent boundaries here.\n",
+        ),
+        (
+            "tools.md",
+            "# Tools\n\nDocument preferred tools, shell habits, and safety constraints here.\n",
+        ),
+        (
+            "skills.md",
+            "# Skills\n\nDocument reusable workflows and special operating skills here.\n",
+        ),
+        ("heartbeat.md", "enabled: true\ninterval_secs: 30\n"),
+    ]
+}
+
+fn load_heartbeat_file_config(persona_dir: &Path) -> HeartbeatFileConfig {
+    let path = persona_dir.join("heartbeat.md");
+    let file = match fs::File::open(&path) {
+        Ok(file) => file,
+        Err(_) => return HeartbeatFileConfig::default(),
+    };
+    let mut config = HeartbeatFileConfig::default();
+    for line in io::BufReader::new(file).lines().map_while(|line| line.ok()) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        match key {
+            "enabled" => {
+                if let Some(parsed) = parse_bool(value) {
+                    config.enabled = parsed;
+                }
+            }
+            "interval_secs" => {
+                if let Ok(parsed) = value.parse::<u64>() {
+                    config.interval_secs = parsed.max(5);
+                }
+            }
+            _ => {}
+        }
+    }
+    config
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Some(true),
+        "false" | "no" | "off" | "0" => Some(false),
+        _ => None,
+    }
 }
 
 fn cli_restart() -> Result<()> {
@@ -1743,9 +1886,9 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        PersonaSection, default_config_path, ensure_persona_files, expand_home, log_file_path,
-        open_store, pairing_text_matches, pid_file_path, resolve_model_choice,
-        resolve_persona_paths, select_platform_mode, slugify,
+        PersonaSection, default_config_path, ensure_persona_files, expand_home,
+        load_heartbeat_file_config, log_file_path, open_store, pairing_text_matches, pid_file_path,
+        resolve_model_choice, resolve_persona_paths, select_platform_mode, slugify,
     };
     use hajimi_claw_exec::PlatformMode;
     use tempfile::tempdir;
@@ -1800,8 +1943,37 @@ mod tests {
             },
         )
         .unwrap();
+        assert!(paths.contains(&persona_dir.join("identity.md")));
         assert!(paths.contains(&dir.path().join("soul.md")));
         assert!(paths.contains(&persona_dir.join("skills.md")));
+    }
+
+    #[test]
+    fn ensure_persona_files_creates_heartbeat_and_seeded_soul() {
+        let dir = tempdir().unwrap();
+        ensure_persona_files(dir.path()).unwrap();
+
+        let soul = fs::read_to_string(dir.path().join("soul.md")).unwrap();
+        let heartbeat = fs::read_to_string(dir.path().join("heartbeat.md")).unwrap();
+
+        assert!(soul.contains("cat AI assistant"));
+        assert!(heartbeat.contains("enabled: true"));
+        assert!(heartbeat.contains("interval_secs: 30"));
+    }
+
+    #[test]
+    fn heartbeat_config_reads_interval_and_enabled_flag() {
+        let dir = tempdir().unwrap();
+        ensure_persona_files(dir.path()).unwrap();
+        fs::write(
+            dir.path().join("heartbeat.md"),
+            "enabled: false\ninterval_secs: 12\n",
+        )
+        .unwrap();
+
+        let config = load_heartbeat_file_config(dir.path());
+        assert!(!config.enabled);
+        assert_eq!(config.interval_secs, 12);
     }
 
     #[test]

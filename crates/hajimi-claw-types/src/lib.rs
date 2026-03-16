@@ -197,6 +197,13 @@ pub struct SessionSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeartbeatStatus {
+    pub last_seen_at: DateTime<Utc>,
+    pub pid: Option<u32>,
+    pub channel: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     pub request_id: ApprovalId,
     pub reason: String,
@@ -327,5 +334,6 @@ pub trait Executor: Send + Sync {
     async fn run_once(&self, req: ExecRequest) -> ClawResult<ExecResult>;
     async fn open_session(&self, req: SessionOpenRequest) -> ClawResult<SessionHandle>;
     async fn run_in_session(&self, id: SessionId, req: ExecRequest) -> ClawResult<ExecResult>;
+    async fn describe_session(&self, id: SessionId) -> ClawResult<SessionHandle>;
     async fn close_session(&self, id: SessionId) -> ClawResult<()>;
 }

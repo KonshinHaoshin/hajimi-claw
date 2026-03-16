@@ -8,9 +8,9 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, Utc};
 use hajimi_claw_types::{
-    ApprovalRequest, ConversationId, ConversationMessage, OnboardingSession, ProviderConfig,
-    ProviderDraft, ProviderKind, ProviderRecord, SessionHandle, SessionSummary, TaskId, TaskKind,
-    TaskStatus,
+    ApprovalRequest, ConversationId, ConversationMessage, HeartbeatStatus, OnboardingSession,
+    ProviderConfig, ProviderDraft, ProviderKind, ProviderRecord, SessionHandle, SessionSummary,
+    TaskId, TaskKind, TaskStatus,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
@@ -372,6 +372,42 @@ impl Store {
             .map_err(Into::into)
     }
 
+    pub fn set_heartbeat(&self, heartbeat: &HeartbeatStatus) -> Result<()> {
+        self.set_config(
+            "heartbeat.last_seen_at",
+            &heartbeat.last_seen_at.to_rfc3339(),
+        )?;
+        self.set_config(
+            "heartbeat.pid",
+            &heartbeat.pid.map(|pid| pid.to_string()).unwrap_or_default(),
+        )?;
+        self.set_config(
+            "heartbeat.channel",
+            heartbeat.channel.as_deref().unwrap_or_default(),
+        )?;
+        Ok(())
+    }
+
+    pub fn get_heartbeat(&self) -> Result<Option<HeartbeatStatus>> {
+        let Some(last_seen_at) = self.get_config("heartbeat.last_seen_at")? else {
+            return Ok(None);
+        };
+        if last_seen_at.trim().is_empty() {
+            return Ok(None);
+        }
+        let pid = self
+            .get_config("heartbeat.pid")?
+            .and_then(|value| value.trim().parse::<u32>().ok());
+        let channel = self
+            .get_config("heartbeat.channel")?
+            .filter(|value| !value.trim().is_empty());
+        Ok(Some(HeartbeatStatus {
+            last_seen_at: parse_ts(last_seen_at),
+            pid,
+            channel,
+        }))
+    }
+
     pub fn upsert_provider(&self, record: &ProviderRecord) -> Result<()> {
         let connection = self.connection.lock().expect("store lock poisoned");
         if record.is_default {
@@ -724,7 +760,8 @@ mod tests {
 
     use chrono::Utc;
     use hajimi_claw_types::{
-        ConversationMessage, MessageRole, ProviderConfig, ProviderKind, ProviderRecord,
+        ConversationMessage, HeartbeatStatus, MessageRole, ProviderConfig, ProviderKind,
+        ProviderRecord,
     };
 
     use super::{SecretCipher, Store};
@@ -781,5 +818,19 @@ mod tests {
             .unwrap();
         let provider = store.get_default_provider().unwrap().unwrap();
         assert_eq!(provider.config.api_key, "top-secret");
+    }
+
+    #[test]
+    fn persists_heartbeat_status() {
+        let store = Store::open_in_memory().unwrap();
+        let heartbeat = HeartbeatStatus {
+            last_seen_at: Utc::now(),
+            pid: Some(1234),
+            channel: Some("telegram".into()),
+        };
+        store.set_heartbeat(&heartbeat).unwrap();
+        let loaded = store.get_heartbeat().unwrap().unwrap();
+        assert_eq!(loaded.pid, Some(1234));
+        assert_eq!(loaded.channel.as_deref(), Some("telegram"));
     }
 }

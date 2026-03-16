@@ -276,6 +276,21 @@ impl AgentRuntime {
             .map(|output| output.content)
     }
 
+    pub async fn shell_status(&self, session_id: &str) -> ClawResult<String> {
+        self.tools
+            .call(
+                "session_status",
+                ToolContext {
+                    conversation_id: ConversationId::new(),
+                    working_directory: None,
+                    elevated: self.policy.is_elevated(),
+                },
+                json!({ "session_id": session_id }),
+            )
+            .await
+            .map(|output| output.content)
+    }
+
     pub async fn shell_close(&self, session_id: &str) -> ClawResult<String> {
         self.tools
             .call(
@@ -413,7 +428,27 @@ impl AgentRuntime {
             PolicyMode::ApprovalPending => "approval_pending",
             PolicyMode::ElevatedLease => "elevated",
         };
-        Ok(format!("policy_mode={mode}\n{task_lines}"))
+        let heartbeat_line = self
+            .store
+            .get_heartbeat()
+            .map_err(store_error)?
+            .map(|heartbeat| {
+                let age = (Utc::now() - heartbeat.last_seen_at).num_seconds().max(0);
+                format!(
+                    "heartbeat_last_seen_at={}\nheartbeat_age_secs={}\nheartbeat_pid={}\nheartbeat_channel={}",
+                    heartbeat.last_seen_at,
+                    age,
+                    heartbeat
+                        .pid
+                        .map(|pid| pid.to_string())
+                        .unwrap_or_else(|| "unknown".into()),
+                    heartbeat.channel.unwrap_or_else(|| "unknown".into())
+                )
+            })
+            .unwrap_or_else(|| "heartbeat_last_seen_at=unknown".into());
+        Ok(format!(
+            "policy_mode={mode}\n{heartbeat_line}\n{task_lines}"
+        ))
     }
 
     async fn run_llm(
@@ -669,13 +704,16 @@ impl AgentRuntime {
     fn resolve_persona_file(&self, raw: &str) -> ClawResult<PathBuf> {
         let trimmed = raw.trim().trim_matches('`');
         let canonical = match trimmed.to_ascii_lowercase().as_str() {
+            "heartbeat" | "heartbeat.md" => "heartbeat.md",
             "soul" | "soul.md" => "soul.md",
             "agents" | "agents.md" => "agents.md",
             "tools" | "tools.md" => "tools.md",
             "skills" | "skills.md" => "skills.md",
+            "identity" | "identity.md" => "identity.md",
             _ => {
                 return Err(ClawError::InvalidRequest(
-                    "persona file must be one of: soul, agents, tools, skills".into(),
+                    "persona file must be one of: identity, heartbeat, soul, agents, tools, skills"
+                        .into(),
                 ));
             }
         };
@@ -781,7 +819,14 @@ fn file_label(path: &Path) -> String {
 }
 
 fn persona_file_names() -> &'static [&'static str] {
-    &["soul.md", "agents.md", "tools.md", "skills.md"]
+    &[
+        "identity.md",
+        "heartbeat.md",
+        "soul.md",
+        "agents.md",
+        "tools.md",
+        "skills.md",
+    ]
 }
 
 fn should_delegate_multi_agent(

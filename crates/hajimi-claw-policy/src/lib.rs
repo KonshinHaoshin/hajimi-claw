@@ -99,7 +99,9 @@ impl PolicyEngine {
     }
 
     pub fn authorize_telegram_actor(&self, user_id: i64, chat_id: i64) -> bool {
-        self.config.admin_user_id == user_id && self.config.admin_chat_id == chat_id
+        let user_allowed = self.config.admin_user_id == 0 || self.config.admin_user_id == user_id;
+        let chat_allowed = self.config.admin_chat_id == 0 || self.config.admin_chat_id == chat_id;
+        user_allowed && chat_allowed
     }
 
     pub fn current_mode(&self) -> PolicyMode {
@@ -400,5 +402,23 @@ mod tests {
             engine.evaluate_exec(&request),
             PolicyDecision::Allow { .. }
         ));
+    }
+
+    #[test]
+    fn zero_admin_ids_allow_any_actor() {
+        let engine = PolicyEngine::new(PolicyConfig::default());
+        assert!(engine.authorize_telegram_actor(123, 456));
+    }
+
+    #[test]
+    fn configured_admin_ids_still_restrict_actor() {
+        let engine = PolicyEngine::new(PolicyConfig {
+            admin_user_id: 123,
+            admin_chat_id: 456,
+            ..PolicyConfig::default()
+        });
+        assert!(engine.authorize_telegram_actor(123, 456));
+        assert!(!engine.authorize_telegram_actor(123, 999));
+        assert!(!engine.authorize_telegram_actor(999, 456));
     }
 }

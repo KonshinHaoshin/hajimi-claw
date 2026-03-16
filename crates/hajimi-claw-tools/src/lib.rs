@@ -56,6 +56,7 @@ impl ToolRegistry {
             Arc::new(ExecOnceTool::new(executor.clone())),
             Arc::new(PingHostTool::new(executor.clone())),
             Arc::new(SessionOpenTool::new(executor.clone())),
+            Arc::new(SessionStatusTool::new(executor.clone())),
             Arc::new(SessionExecTool::new(executor.clone())),
             Arc::new(SessionCloseTool::new(executor)),
         ])
@@ -1448,6 +1449,62 @@ impl SessionExecTool {
     }
 }
 
+struct SessionStatusTool {
+    executor: Arc<dyn Executor>,
+}
+
+impl SessionStatusTool {
+    fn new(executor: Arc<dyn Executor>) -> Self {
+        Self { executor }
+    }
+}
+
+#[async_trait]
+impl Tool for SessionStatusTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "session_status".into(),
+            description: "Inspect an existing shell session.".into(),
+            requires_approval: false,
+            input_schema: object_schema(
+                vec![("session_id", string_schema("Session identifier."))],
+                &["session_id"],
+            ),
+        }
+    }
+
+    async fn call(&self, _ctx: ToolContext, input: Value) -> ClawResult<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Input {
+            session_id: String,
+        }
+        let input: Input = serde_json::from_value(input)
+            .map_err(|err| ClawError::InvalidRequest(err.to_string()))?;
+        let session_id = SessionId(
+            uuid::Uuid::parse_str(&input.session_id)
+                .map_err(|err| ClawError::InvalidRequest(err.to_string()))?,
+        );
+        let session = self.executor.describe_session(session_id).await?;
+        Ok(ToolOutput {
+            content: format!(
+                "session_id={}\nname={}\ncwd={}\ncreated_at={}\nlast_used_at={}",
+                session.id,
+                session.name,
+                session.cwd.display(),
+                session.created_at,
+                session.last_used_at
+            ),
+            structured: Some(json!({
+                "session_id": session.id.to_string(),
+                "name": session.name,
+                "cwd": session.cwd,
+                "created_at": session.created_at,
+                "last_used_at": session.last_used_at,
+            })),
+        })
+    }
+}
+
 #[async_trait]
 impl Tool for SessionExecTool {
     fn spec(&self) -> ToolSpec {
@@ -1832,6 +1889,10 @@ mod tests {
             _id: SessionId,
             _req: ExecRequest,
         ) -> Result<ExecResult, ClawError> {
+            Err(ClawError::Backend("not used".into()))
+        }
+
+        async fn describe_session(&self, _id: SessionId) -> Result<SessionHandle, ClawError> {
             Err(ClawError::Backend("not used".into()))
         }
 

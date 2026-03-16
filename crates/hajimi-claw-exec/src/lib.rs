@@ -192,6 +192,14 @@ impl Executor for LocalExecutor {
         self.run_checked(req).await
     }
 
+    async fn describe_session(&self, id: SessionId) -> ClawResult<SessionHandle> {
+        let sessions = self.sessions.lock().await;
+        let state = sessions
+            .get(&id)
+            .ok_or_else(|| ClawError::NotFound(format!("session not found: {id}")))?;
+        Ok(state.handle.clone())
+    }
+
     async fn close_session(&self, id: SessionId) -> ClawResult<()> {
         self.sessions
             .lock()
