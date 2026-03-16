@@ -6,12 +6,15 @@ use anyhow::{Context, Result};
 use axum::extract::State;
 use axum::routing::post;
 use axum::{Json, Router};
+use futures::{SinkExt, StreamExt};
 use hajimi_claw_gateway::{
-    Gateway, GatewayRequest, InlineKeyboard, SessionDirective, parse_gateway_command,
+    Gateway, GatewayPreview, GatewayRequest, InlineKeyboard, SessionDirective,
+    parse_gateway_command,
 };
 use hajimi_claw_types::ClawError;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tracing::{error, info, warn};
 
 #[derive(Debug, Clone)]
@@ -28,6 +31,8 @@ pub struct FeishuConfig {
     pub app_secret: String,
     pub listen_addr: String,
     pub event_path: String,
+    pub card_callback_path: String,
+    pub mode: String,
     pub admin_user_id: i64,
     pub admin_chat_id: i64,
 }
@@ -45,12 +50,18 @@ pub struct FeishuBot {
     gateway: Arc<dyn Gateway>,
     current_session: Mutex<Option<String>>,
     token_cache: Mutex<Option<CachedTenantToken>>,
+    ws_state: Mutex<FeishuWsState>,
 }
 
 #[derive(Debug, Clone)]
 struct CachedTenantToken {
     value: String,
     expires_at: Instant,
+}
+
+#[derive(Debug, Clone, Default)]
+struct FeishuWsState {
+    service_id: i32,
 }
 
 impl TelegramBot {
@@ -103,8 +114,14 @@ impl TelegramBot {
             };
             if is_natural_language(&text) {
                 self.send_chat_action(message.chat.id, "typing").await?;
+                let preview = self.preview_command(&text).await;
+                let placeholder_text = preview
+                    .as_ref()
+                    .map(|item| item.text.as_str())
+                    .unwrap_or("Processing your request...");
+                let placeholder_keyboard = preview.clone().and_then(|item| item.keyboard);
                 let placeholder_id = self
-                    .send_message(message.chat.id, "Processing your request...", None)
+                    .send_message(message.chat.id, placeholder_text, placeholder_keyboard)
                     .await?;
                 let reply = self.dispatch_command(&text).await;
                 self.edit_message(message.chat.id, placeholder_id, &reply.text, reply.keyboard)
@@ -177,6 +194,19 @@ impl TelegramBot {
                 keyboard: None,
             },
         }
+    }
+
+    async fn preview_command(&self, text: &str) -> Option<GatewayPreview> {
+        let current_session_id = self.current_session.lock().await.clone();
+        self.gateway
+            .preview(GatewayRequest {
+                actor_user_id: self.config.admin_user_id,
+                actor_chat_id: self.config.admin_chat_id,
+                raw_text: text.to_string(),
+                command: parse_gateway_command(text),
+                current_session_id,
+            })
+            .await
     }
 
     async fn get_updates(&self, offset: i64) -> Result<Vec<Update>> {
@@ -319,6 +349,7 @@ impl TelegramBot {
                     { "command": "onboard", "description": "Add a provider" },
                     { "command": "provider", "description": "Manage providers" },
                     { "command": "model", "description": "Manage the active model" },
+                    { "command": "agents", "description": "Manage multi-agent mode" },
                     { "command": "elevated", "description": "Switch elevation mode" },
                     { "command": "persona", "description": "Manage persona files" },
                     { "command": "shell", "description": "Open or control shell sessions" },
@@ -356,15 +387,29 @@ impl FeishuBot {
             gateway,
             current_session: Mutex::new(None),
             token_cache: Mutex::new(None),
+            ws_state: Mutex::new(FeishuWsState::default()),
         }
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
+        let mode = self.config.mode.trim().to_ascii_lowercase();
+        if mode == "webhook" {
+            self.run_webhook_server().await
+        } else {
+            self.run_long_connection().await
+        }
+    }
+
+    async fn run_webhook_server(self: Arc<Self>) -> Result<()> {
         let addr: SocketAddr = self.config.listen_addr.parse().with_context(|| {
             format!("parse Feishu listen address `{}`", self.config.listen_addr)
         })?;
         let app = Router::new()
             .route(&self.config.event_path, post(feishu_event_handler))
+            .route(
+                &self.config.card_callback_path,
+                post(feishu_card_callback_handler),
+            )
             .with_state(self.clone());
         let listener = tokio::net::TcpListener::bind(addr)
             .await
@@ -372,11 +417,53 @@ impl FeishuBot {
         info!(
             listen_addr = %addr,
             event_path = %self.config.event_path,
-            "listening for Feishu events"
+            card_callback_path = %self.config.card_callback_path,
+            "listening for Feishu webhook events"
         );
         axum::serve(listener, app)
             .await
             .context("serve Feishu webhook")?;
+        Ok(())
+    }
+
+    async fn run_long_connection(self: Arc<Self>) -> Result<()> {
+        let webhook = self.clone();
+        let webhook_task = if !self.config.card_callback_path.trim().is_empty() {
+            Some(tokio::spawn(async move {
+                webhook.run_card_callback_server().await
+            }))
+        } else {
+            None
+        };
+
+        let ws_result = self.long_connection_loop().await;
+        if let Some(task) = webhook_task {
+            task.abort();
+        }
+        ws_result
+    }
+
+    async fn run_card_callback_server(self: Arc<Self>) -> Result<()> {
+        let addr: SocketAddr = self.config.listen_addr.parse().with_context(|| {
+            format!("parse Feishu listen address `{}`", self.config.listen_addr)
+        })?;
+        let app = Router::new()
+            .route(
+                &self.config.card_callback_path,
+                post(feishu_card_callback_handler),
+            )
+            .with_state(self.clone());
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("bind Feishu card callback listener {}", addr))?;
+        info!(
+            listen_addr = %addr,
+            card_callback_path = %self.config.card_callback_path,
+            "listening for Feishu card callbacks"
+        );
+        axum::serve(listener, app)
+            .await
+            .context("serve Feishu card callback webhook")?;
         Ok(())
     }
 
@@ -408,7 +495,11 @@ impl FeishuBot {
         if message_type != "text" {
             return Ok(serde_json::json!({ "code": 0 }));
         }
+        self.process_message_event(payload).await?;
+        Ok(serde_json::json!({ "code": 0 }))
+    }
 
+    async fn process_message_event(&self, payload: serde_json::Value) -> Result<()> {
         let content = payload
             .pointer("/event/message/content")
             .and_then(|value| value.as_str())
@@ -423,7 +514,7 @@ impl FeishuBot {
             })
             .unwrap_or_default();
         if text.trim().is_empty() {
-            return Ok(serde_json::json!({ "code": 0 }));
+            return Ok(());
         }
 
         let sender_id = payload
@@ -441,12 +532,65 @@ impl FeishuBot {
             .context("Feishu chat_id missing")?;
 
         let (actor_user_id, actor_chat_id) = self.resolve_actor_ids(sender_id, chat_id);
+        if is_natural_language(&text) {
+            if let Some(preview) = self
+                .preview_command(&text, actor_user_id, actor_chat_id)
+                .await
+            {
+                self.send_reply(
+                    chat_id,
+                    &BotReply {
+                        text: preview.text,
+                        keyboard: preview.keyboard,
+                    },
+                )
+                .await?;
+            }
+        }
         let reply = self
             .dispatch_command(&text, actor_user_id, actor_chat_id)
             .await;
-        self.send_message(chat_id, &render_feishu_text(&reply))
-            .await?;
-        Ok(serde_json::json!({ "code": 0 }))
+        self.send_reply(chat_id, &reply).await?;
+        Ok(())
+    }
+
+    async fn handle_card_callback(&self, payload: serde_json::Value) -> Result<serde_json::Value> {
+        if payload
+            .get("type")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value == "url_verification")
+        {
+            let challenge = payload
+                .get("challenge")
+                .and_then(|value| value.as_str())
+                .context("Feishu card callback challenge missing")?;
+            return Ok(serde_json::json!({ "challenge": challenge }));
+        }
+
+        let action = payload
+            .pointer("/action/value/command")
+            .and_then(|value| value.as_str())
+            .context("Feishu card callback command missing")?;
+        let sender_id = payload
+            .pointer("/open_id")
+            .and_then(|value| value.as_str())
+            .or_else(|| payload.pointer("/user_id").and_then(|value| value.as_str()))
+            .unwrap_or_default();
+        let chat_id = payload
+            .pointer("/action/value/chat_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or("card");
+        let (actor_user_id, actor_chat_id) = self.resolve_actor_ids(sender_id, chat_id);
+        let reply = self
+            .dispatch_command(action, actor_user_id, actor_chat_id)
+            .await;
+        Ok(serde_json::json!({
+            "toast": {
+                "type": "info",
+                "content": clamp_text("Updated"),
+            },
+            "card": build_feishu_card(&reply, Some(action), chat_id),
+        }))
     }
 
     async fn dispatch_command(
@@ -489,19 +633,180 @@ impl FeishuBot {
         }
     }
 
-    async fn send_message(&self, chat_id: &str, text: &str) -> Result<()> {
+    async fn preview_command(
+        &self,
+        text: &str,
+        actor_user_id: i64,
+        actor_chat_id: i64,
+    ) -> Option<GatewayPreview> {
+        let current_session_id = self.current_session.lock().await.clone();
+        self.gateway
+            .preview(GatewayRequest {
+                actor_user_id,
+                actor_chat_id,
+                raw_text: text.to_string(),
+                command: parse_gateway_command(text),
+                current_session_id,
+            })
+            .await
+    }
+
+    async fn long_connection_loop(&self) -> Result<()> {
+        loop {
+            let endpoint = self.fetch_ws_endpoint().await?;
+            let service_id = endpoint.service_id;
+            {
+                let mut state = self.ws_state.lock().await;
+                state.service_id = service_id;
+            }
+            info!(service_id, "connecting to Feishu long connection");
+            let (stream, _) = connect_async(&endpoint.url)
+                .await
+                .context("connect to Feishu websocket")?;
+            let (mut write, mut read) = stream.split();
+            let mut heartbeat = tokio::time::interval(Duration::from_secs(50));
+
+            loop {
+                tokio::select! {
+                    _ = heartbeat.tick() => {
+                        let ping = FeishuWsFrame {
+                            seq_id: 1,
+                            log_id: 1,
+                            service: service_id,
+                            method: 0,
+                            headers: vec![FeishuWsHeader {
+                                key: "type".into(),
+                                value: "ping".into(),
+                            }],
+                            payload_encoding: String::new(),
+                            payload_type: String::new(),
+                            payload: Vec::new(),
+                            log_id_new: String::new(),
+                        }.encode()?;
+                        write
+                            .send(WsMessage::Binary(ping.into()))
+                            .await
+                            .context("write Feishu websocket ping")?;
+                    }
+                    message = read.next() => {
+                        let Some(message) = message else {
+                            warn!("Feishu websocket stream ended; reconnecting");
+                            break;
+                        };
+                        let message = message.context("read Feishu websocket message")?;
+                        match message {
+                            WsMessage::Binary(payload) => {
+                                if let Some(response) = self.handle_ws_frame(payload.to_vec()).await? {
+                                    write
+                                        .send(WsMessage::Binary(response.into()))
+                                        .await
+                                        .context("write Feishu websocket frame")?;
+                                }
+                            }
+                            WsMessage::Ping(payload) => {
+                                write
+                                    .send(WsMessage::Pong(payload))
+                                    .await
+                                    .context("reply Feishu websocket pong")?;
+                            }
+                            WsMessage::Close(frame) => {
+                                warn!(?frame, "Feishu websocket closed; reconnecting");
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+
+    async fn fetch_ws_endpoint(&self) -> Result<FeishuWsEndpoint> {
+        let response = self
+            .client
+            .post("https://open.feishu.cn/callback/ws/endpoint")
+            .header("locale", "zh")
+            .json(&serde_json::json!({
+                "AppID": self.config.app_id,
+                "AppSecret": self.config.app_secret,
+            }))
+            .send()
+            .await
+            .context("request Feishu websocket endpoint")?;
+        let payload: FeishuWsEndpointResponse = response
+            .json()
+            .await
+            .context("decode Feishu websocket endpoint")?;
+        if payload.code != 0 {
+            anyhow::bail!(
+                "Feishu websocket endpoint failed: code={} msg={}",
+                payload.code,
+                payload.msg.unwrap_or_else(|| "unknown".into())
+            );
+        }
+        let url = payload
+            .data
+            .as_ref()
+            .and_then(|data| data.url.clone())
+            .context("Feishu websocket endpoint URL missing")?;
+        let service_id = url::Url::parse(&url)
+            .ok()
+            .and_then(|parsed| {
+                parsed
+                    .query_pairs()
+                    .find_map(|(key, value)| (key == "service_id").then_some(value.into_owned()))
+            })
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or_default();
+        Ok(FeishuWsEndpoint { url, service_id })
+    }
+
+    async fn handle_ws_frame(&self, payload: Vec<u8>) -> Result<Option<Vec<u8>>> {
+        let frame = FeishuWsFrame::decode(&payload)?;
+        let message_type = frame.header("type").unwrap_or_default();
+        if frame.method == 0 {
+            return Ok(None);
+        }
+
+        if message_type == "card" {
+            return Ok(Some(frame.response_payload(200, None)?));
+        }
+
+        if message_type != "event" {
+            return Ok(Some(frame.response_payload(200, None)?));
+        }
+
+        let event: serde_json::Value =
+            serde_json::from_slice(&frame.payload).context("decode Feishu event payload")?;
+        self.process_message_event(event).await?;
+        Ok(Some(frame.response_payload(200, None)?))
+    }
+
+    async fn send_reply(&self, chat_id: &str, reply: &BotReply) -> Result<()> {
         let token = self.tenant_access_token().await?;
-        let content = serde_json::to_string(&serde_json::json!({
-            "text": clamp_text(text),
-        }))
-        .context("serialize Feishu text payload")?;
+        let (msg_type, content) = if reply.keyboard.is_some() {
+            (
+                "interactive",
+                serde_json::to_string(&build_feishu_card(reply, None, chat_id))
+                    .context("serialize Feishu card payload")?,
+            )
+        } else {
+            (
+                "text",
+                serde_json::to_string(&serde_json::json!({
+                    "text": clamp_text(&reply.text),
+                }))
+                .context("serialize Feishu text payload")?,
+            )
+        };
         let response = self
             .client
             .post("https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id")
             .bearer_auth(token)
             .json(&serde_json::json!({
                 "receive_id": chat_id,
-                "msg_type": "text",
+                "msg_type": msg_type,
                 "content": content,
             }))
             .send()
@@ -560,12 +865,12 @@ impl FeishuBot {
 
     fn resolve_actor_ids(&self, raw_user_id: &str, raw_chat_id: &str) -> (i64, i64) {
         let user_id = if self.config.admin_user_id == 0 {
-            0
+            stable_channel_id(raw_user_id)
         } else {
             stable_channel_id(raw_user_id)
         };
         let chat_id = if self.config.admin_chat_id == 0 {
-            0
+            stable_channel_id(raw_chat_id)
         } else {
             stable_channel_id(raw_chat_id)
         };
@@ -583,6 +888,24 @@ async fn feishu_event_handler(
             error!(error = %err, "failed to handle Feishu event");
             Json(serde_json::json!({
                 "code": 0,
+            }))
+        }
+    }
+}
+
+async fn feishu_card_callback_handler(
+    State(bot): State<Arc<FeishuBot>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match bot.handle_card_callback(payload).await {
+        Ok(response) => Json(response),
+        Err(err) => {
+            error!(error = %err, "failed to handle Feishu card callback");
+            Json(serde_json::json!({
+                "toast": {
+                    "type": "error",
+                    "content": clamp_text(&format!("Request failed: {err}")),
+                }
             }))
         }
     }
@@ -702,21 +1025,214 @@ fn render_user_error(err: &ClawError) -> String {
     }
 }
 
-fn render_feishu_text(reply: &BotReply) -> String {
-    let mut text = reply.text.clone();
+fn build_feishu_card(
+    reply: &BotReply,
+    current_command: Option<&str>,
+    chat_id: &str,
+) -> serde_json::Value {
+    let mut elements = vec![serde_json::json!({
+        "tag": "markdown",
+        "content": clamp_text(&reply.text),
+    })];
+
     if let Some(keyboard) = &reply.keyboard {
-        let actions = keyboard
-            .rows
-            .iter()
-            .flat_map(|row| row.iter())
-            .map(|button| format!("{} -> {}", button.text, button.data))
-            .collect::<Vec<_>>();
-        if !actions.is_empty() {
-            text.push_str("\n\nActions:\n");
-            text.push_str(&actions.join("\n"));
+        let mut rows = Vec::new();
+        for row in &keyboard.rows {
+            let actions = row
+                .iter()
+                .map(|button| {
+                    serde_json::json!({
+                        "tag": "button",
+                        "type": if current_command.is_some_and(|command| command == button.data) {
+                            "primary"
+                        } else {
+                            "default"
+                        },
+                        "text": {
+                            "tag": "plain_text",
+                            "content": button.text,
+                        },
+                        "value": {
+                            "command": button.data,
+                            "chat_id": chat_id,
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            rows.push(serde_json::json!({
+                "tag": "action",
+                "actions": actions,
+            }));
         }
+        elements.extend(rows);
     }
-    text
+
+    serde_json::json!({
+        "config": {
+            "wide_screen_mode": true,
+        },
+        "header": {
+            "title": {
+                "tag": "plain_text",
+                "content": "hajimi"
+            },
+            "template": "blue"
+        },
+        "elements": elements,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct FeishuWsEndpointResponse {
+    code: i64,
+    msg: Option<String>,
+    data: Option<FeishuWsEndpointData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeishuWsEndpointData {
+    #[serde(rename = "URL")]
+    url: Option<String>,
+}
+
+#[derive(Debug)]
+struct FeishuWsEndpoint {
+    url: String,
+    service_id: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FeishuWsHeader {
+    key: String,
+    value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FeishuWsResponsePayload {
+    code: i32,
+    #[serde(default)]
+    headers: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    data: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone)]
+struct FeishuWsFrame {
+    seq_id: u64,
+    log_id: u64,
+    service: i32,
+    method: i32,
+    headers: Vec<FeishuWsHeader>,
+    payload_encoding: String,
+    payload_type: String,
+    payload: Vec<u8>,
+    log_id_new: String,
+}
+
+impl FeishuWsFrame {
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut index = 0;
+        let mut frame = Self {
+            seq_id: 0,
+            log_id: 0,
+            service: 0,
+            method: 0,
+            headers: Vec::new(),
+            payload_encoding: String::new(),
+            payload_type: String::new(),
+            payload: Vec::new(),
+            log_id_new: String::new(),
+        };
+        while index < bytes.len() {
+            let tag = read_varint(bytes, &mut index)?;
+            let field = tag >> 3;
+            let wire = tag & 0x7;
+            match (field, wire) {
+                (1, 0) => frame.seq_id = read_varint(bytes, &mut index)?,
+                (2, 0) => frame.log_id = read_varint(bytes, &mut index)?,
+                (3, 0) => frame.service = read_varint(bytes, &mut index)? as i32,
+                (4, 0) => frame.method = read_varint(bytes, &mut index)? as i32,
+                (5, 2) => {
+                    let len = read_varint(bytes, &mut index)? as usize;
+                    let end = index + len;
+                    let mut inner = index;
+                    let mut key = String::new();
+                    let mut value = String::new();
+                    while inner < end {
+                        let inner_tag = read_varint(bytes, &mut inner)?;
+                        match (inner_tag >> 3, inner_tag & 0x7) {
+                            (1, 2) => key = read_string(bytes, &mut inner)?,
+                            (2, 2) => value = read_string(bytes, &mut inner)?,
+                            _ => skip_wire(bytes, &mut inner, inner_tag & 0x7)?,
+                        }
+                    }
+                    index = end;
+                    frame.headers.push(FeishuWsHeader { key, value });
+                }
+                (6, 2) => frame.payload_encoding = read_string(bytes, &mut index)?,
+                (7, 2) => frame.payload_type = read_string(bytes, &mut index)?,
+                (8, 2) => frame.payload = read_bytes(bytes, &mut index)?,
+                (9, 2) => frame.log_id_new = read_string(bytes, &mut index)?,
+                _ => skip_wire(bytes, &mut index, wire)?,
+            }
+        }
+        Ok(frame)
+    }
+
+    fn response_payload(&self, code: i32, data: Option<serde_json::Value>) -> Result<Vec<u8>> {
+        let mut headers = self.headers.clone();
+        headers.push(FeishuWsHeader {
+            key: "biz_rt".into(),
+            value: "0".into(),
+        });
+        let payload = serde_json::to_vec(&FeishuWsResponsePayload {
+            code,
+            headers: std::collections::BTreeMap::new(),
+            data,
+        })?;
+        FeishuWsFrame {
+            seq_id: self.seq_id,
+            log_id: self.log_id,
+            service: self.service,
+            method: self.method,
+            headers,
+            payload_encoding: self.payload_encoding.clone(),
+            payload_type: self.payload_type.clone(),
+            payload,
+            log_id_new: self.log_id_new.clone(),
+        }
+        .encode()
+    }
+
+    fn encode(&self) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        write_varint_field(&mut out, 1, self.seq_id);
+        write_varint_field(&mut out, 2, self.log_id);
+        write_varint_field(&mut out, 3, self.service as u64);
+        write_varint_field(&mut out, 4, self.method as u64);
+        for header in &self.headers {
+            let mut nested = Vec::new();
+            write_len_field(&mut nested, 1, header.key.as_bytes());
+            write_len_field(&mut nested, 2, header.value.as_bytes());
+            write_len_field(&mut out, 5, &nested);
+        }
+        write_len_field(&mut out, 6, self.payload_encoding.as_bytes());
+        write_len_field(&mut out, 7, self.payload_type.as_bytes());
+        if !self.payload.is_empty() {
+            write_len_field(&mut out, 8, &self.payload);
+        }
+        if !self.log_id_new.is_empty() {
+            write_len_field(&mut out, 9, self.log_id_new.as_bytes());
+        }
+        Ok(out)
+    }
+
+    fn header(&self, key: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|header| header.key == key)
+            .map(|header| header.value.as_str())
+    }
 }
 
 fn stable_channel_id(value: &str) -> i64 {
@@ -725,6 +1241,76 @@ fn stable_channel_id(value: &str) -> i64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     value.hash(&mut hasher);
     (hasher.finish() & (i64::MAX as u64)) as i64
+}
+
+fn read_varint(bytes: &[u8], index: &mut usize) -> Result<u64> {
+    let mut shift = 0;
+    let mut value = 0_u64;
+    loop {
+        if *index >= bytes.len() {
+            anyhow::bail!("unexpected eof while decoding varint");
+        }
+        let byte = bytes[*index];
+        *index += 1;
+        value |= ((byte & 0x7f) as u64) << shift;
+        if byte < 0x80 {
+            return Ok(value);
+        }
+        shift += 7;
+        if shift >= 64 {
+            anyhow::bail!("varint overflow");
+        }
+    }
+}
+
+fn read_bytes(bytes: &[u8], index: &mut usize) -> Result<Vec<u8>> {
+    let len = read_varint(bytes, index)? as usize;
+    if *index + len > bytes.len() {
+        anyhow::bail!("unexpected eof while decoding bytes");
+    }
+    let value = bytes[*index..*index + len].to_vec();
+    *index += len;
+    Ok(value)
+}
+
+fn read_string(bytes: &[u8], index: &mut usize) -> Result<String> {
+    String::from_utf8(read_bytes(bytes, index)?).context("decode utf-8 string")
+}
+
+fn skip_wire(bytes: &[u8], index: &mut usize, wire: u64) -> Result<()> {
+    match wire {
+        0 => {
+            let _ = read_varint(bytes, index)?;
+        }
+        2 => {
+            let len = read_varint(bytes, index)? as usize;
+            if *index + len > bytes.len() {
+                anyhow::bail!("unexpected eof while skipping bytes");
+            }
+            *index += len;
+        }
+        _ => anyhow::bail!("unsupported protobuf wire type {wire}"),
+    }
+    Ok(())
+}
+
+fn write_varint_field(out: &mut Vec<u8>, field: u64, value: u64) {
+    write_varint(out, field << 3);
+    write_varint(out, value);
+}
+
+fn write_len_field(out: &mut Vec<u8>, field: u64, value: &[u8]) {
+    write_varint(out, (field << 3) | 2);
+    write_varint(out, value.len() as u64);
+    out.extend_from_slice(value);
+}
+
+fn write_varint(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        out.push(((value as u8) & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
 }
 
 fn to_reply_markup(keyboard: InlineKeyboard) -> serde_json::Value {

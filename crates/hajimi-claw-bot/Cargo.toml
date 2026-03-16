@@ -9,11 +9,14 @@ authors.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 chrono.workspace = true
+futures.workspace = true
 hajimi-claw-gateway = { path = "../hajimi-claw-gateway" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tokio-tungstenite.workspace = true
 tracing.workspace = true
+url.workspace = true
 hajimi-claw-store = { path = "../hajimi-claw-store" }
 hajimi-claw-types = { path = "../hajimi-claw-types" }

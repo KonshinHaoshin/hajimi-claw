@@ -1,6 +1,6 @@
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use hajimi_claw_agent::{AgentRuntime, MarkdownPromptSource, default_system_prompt};
+use hajimi_claw_agent::{
+    AgentRuntime, MarkdownPromptSource, MultiAgentConfig, default_system_prompt,
+};
 use hajimi_claw_bot::{FeishuBot, FeishuConfig, TelegramBot, TelegramConfig};
 use hajimi_claw_exec::{LocalExecutor, PlatformMode};
 use hajimi_claw_gateway::InProcessGateway;
@@ -16,7 +18,7 @@ use hajimi_claw_llm::{StaticBackend, StoreBackedBackend, list_models, test_provi
 use hajimi_claw_policy::{PolicyConfig, PolicyEngine};
 use hajimi_claw_store::{SecretCipher, Store};
 use hajimi_claw_tools::ToolRegistry;
-use hajimi_claw_types::{ProviderConfig, ProviderKind, ProviderRecord};
+use hajimi_claw_types::{HeartbeatStatus, ProviderConfig, ProviderKind, ProviderRecord};
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -35,6 +37,8 @@ pub struct AppConfig {
     pub security: SecuritySection,
     pub policy: PolicyConfig,
     pub execution: ExecutionSection,
+    #[serde(default)]
+    pub multi_agent: MultiAgentSection,
     #[serde(default)]
     pub persona: PersonaSection,
 }
@@ -64,6 +68,8 @@ pub struct FeishuSection {
     pub app_secret: String,
     pub listen_addr: Option<String>,
     pub event_path: Option<String>,
+    pub card_callback_path: Option<String>,
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +94,29 @@ pub struct SecuritySection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionSection {
     pub mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiAgentSection {
+    pub enabled: bool,
+    pub auto_delegate: bool,
+    pub default_workers: usize,
+    pub max_workers: usize,
+    pub worker_timeout_secs: u64,
+    pub max_context_chars_per_worker: usize,
+}
+
+impl Default for MultiAgentSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auto_delegate: false,
+            default_workers: 3,
+            max_workers: 8,
+            worker_timeout_secs: 90,
+            max_context_chars_per_worker: 24_000,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -196,14 +225,32 @@ async fn run_with_context(config: AppConfig, config_path: Option<PathBuf>) -> Re
         store.clone(),
         policy.clone(),
         prompt_source,
-        persona_dir,
+        persona_dir.clone(),
+        MultiAgentConfig {
+            enabled: config.multi_agent.enabled,
+            auto_delegate: config.multi_agent.auto_delegate,
+            default_workers: config.multi_agent.default_workers,
+            max_workers: config.multi_agent.max_workers,
+            worker_timeout_secs: config.multi_agent.worker_timeout_secs,
+            max_context_chars_per_worker: config.multi_agent.max_context_chars_per_worker,
+        },
     ));
     let gateway = Arc::new(InProcessGateway::new(
         runtime,
         policy.clone(),
         store.clone(),
     ));
+    start_heartbeat_task(
+        store.clone(),
+        config.channel.kind.clone(),
+        persona_dir.clone(),
+    );
     match config.channel.kind.as_str() {
+        "none" | "skip" => {
+            anyhow::bail!(
+                "no primary channel configured yet\nRun `hajimi onboard` and choose telegram or feishu to start the daemon."
+            )
+        }
         "feishu" => {
             let bot = Arc::new(FeishuBot::new(
                 FeishuConfig {
@@ -220,6 +267,18 @@ async fn run_with_context(config: AppConfig, config_path: Option<PathBuf>) -> Re
                             .as_deref()
                             .unwrap_or("/feishu/events"),
                     ),
+                    card_callback_path: normalize_event_path(
+                        config
+                            .feishu
+                            .card_callback_path
+                            .as_deref()
+                            .unwrap_or("/feishu/card"),
+                    ),
+                    mode: config
+                        .feishu
+                        .mode
+                        .clone()
+                        .unwrap_or_else(|| "webhook".into()),
                     admin_user_id: config.policy.admin_user_id,
                     admin_chat_id: config.policy.admin_chat_id,
                 },
@@ -382,6 +441,7 @@ fn bootstrap_provider_if_configured(store: &Store, config: &AppConfig) -> Result
                 base_url,
                 api_key,
                 model,
+                fallback_models: vec![],
                 enabled: true,
                 extra_headers: vec![],
                 created_at: Utc::now(),
@@ -554,7 +614,14 @@ fn resolve_persona_paths(
     }
 
     for root in roots {
-        for name in ["soul.md", "agents.md", "AGENTS.md", "tools.md", "skills.md"] {
+        for name in [
+            "identity.md",
+            "soul.md",
+            "agents.md",
+            "AGENTS.md",
+            "tools.md",
+            "skills.md",
+        ] {
             let candidate = root.join(name);
             if !paths.iter().any(|path| path == &candidate) {
                 paths.push(candidate);
@@ -578,10 +645,10 @@ fn resolve_persona_directory_from_section(persona: &PersonaSection) -> PathBuf {
 fn ensure_persona_files(persona_dir: &Path) -> Result<()> {
     fs::create_dir_all(persona_dir)
         .with_context(|| format!("create persona directory {}", persona_dir.display()))?;
-    for name in ["soul.md", "agents.md", "tools.md", "skills.md"] {
+    for (name, content) in default_persona_templates() {
         let path = persona_dir.join(name);
         if !path.exists() {
-            fs::write(&path, "")
+            fs::write(&path, content)
                 .with_context(|| format!("create persona file {}", path.display()))?;
         }
     }
@@ -604,13 +671,16 @@ async fn interactive_onboard(config_path: PathBuf) -> Result<()> {
     ensure_path_list_contains(&mut config.policy.writable_workdirs, &persona_dir);
     config.persona.directory = Some(persona_dir.clone());
 
+    print_brand_banner();
     println!("hajimi onboard");
     println!("config path: {}", config_path.display());
     println!("persona dir: {}", persona_dir.display());
 
     println!();
-    config.channel.kind =
-        prompt_default("Primary channel (telegram/feishu)", &config.channel.kind)?;
+    config.channel.kind = prompt_default(
+        "Primary channel (telegram/feishu/skip)",
+        &config.channel.kind,
+    )?;
     match config.channel.kind.trim().to_ascii_lowercase().as_str() {
         "telegram" => {
             config.channel.kind = "telegram".into();
@@ -663,6 +733,10 @@ async fn interactive_onboard(config_path: PathBuf) -> Result<()> {
             if config.feishu.app_secret.trim().is_empty() {
                 config.feishu.app_secret = prompt("Feishu app_secret")?;
             }
+            config.feishu.mode = Some(prompt_default(
+                "Feishu mode (webhook/long-connection)",
+                config.feishu.mode.as_deref().unwrap_or("webhook"),
+            )?);
             config.feishu.listen_addr = Some(prompt_default(
                 "Feishu listen address",
                 config
@@ -678,6 +752,14 @@ async fn interactive_onboard(config_path: PathBuf) -> Result<()> {
                     .event_path
                     .as_deref()
                     .unwrap_or("/feishu/events"),
+            )?));
+            config.feishu.card_callback_path = Some(normalize_event_path(&prompt_default(
+                "Feishu card callback path",
+                config
+                    .feishu
+                    .card_callback_path
+                    .as_deref()
+                    .unwrap_or("/feishu/card"),
             )?));
             let token_info =
                 verify_feishu_app(&config.feishu.app_id, &config.feishu.app_secret).await?;
@@ -699,7 +781,8 @@ async fn interactive_onboard(config_path: PathBuf) -> Result<()> {
                 .map(stable_channel_hash)
                 .unwrap_or(0);
             println!(
-                "Feishu webhook ready on {}{}",
+                "Feishu {} ready on {}{}",
+                config.feishu.mode.as_deref().unwrap_or("webhook"),
                 config
                     .feishu
                     .listen_addr
@@ -711,8 +794,22 @@ async fn interactive_onboard(config_path: PathBuf) -> Result<()> {
                     .as_deref()
                     .unwrap_or("/feishu/events")
             );
+            println!(
+                "Feishu card callback path: {}",
+                config
+                    .feishu
+                    .card_callback_path
+                    .as_deref()
+                    .unwrap_or("/feishu/card")
+            );
         }
-        other => anyhow::bail!("channel must be `telegram` or `feishu`, got `{other}`"),
+        "skip" | "none" => {
+            config.channel.kind = "none".into();
+            println!("channel setup skipped for now");
+        }
+        other => {
+            anyhow::bail!("channel must be `telegram`, `feishu`, or `skip`, got `{other}`")
+        }
     }
 
     let master_key_file = config
@@ -760,11 +857,15 @@ async fn interactive_onboard(config_path: PathBuf) -> Result<()> {
         base_url: base_url.clone(),
         api_key: api_key.clone(),
         model: String::new(),
+        fallback_models: vec![],
         enabled: true,
         extra_headers: vec![],
         created_at: Utc::now(),
     })
     .await?;
+    let fallback_models = prompt_optional("Fallback model ids (comma-separated, optional)")?
+        .map(|raw| parse_csv_items(&raw))
+        .unwrap_or_default();
 
     let record = ProviderRecord {
         config: ProviderConfig {
@@ -774,6 +875,7 @@ async fn interactive_onboard(config_path: PathBuf) -> Result<()> {
             base_url,
             api_key,
             model,
+            fallback_models,
             enabled: true,
             extra_headers: vec![],
             created_at: Utc::now(),
@@ -789,9 +891,18 @@ async fn interactive_onboard(config_path: PathBuf) -> Result<()> {
         record.config.label, record.config.id
     );
     println!("Health: {}", health.message);
+    if !record.config.fallback_models.is_empty() {
+        println!(
+            "Fallback models: {}",
+            record.config.fallback_models.join(", ")
+        );
+    }
     println!("Config saved to {}", config_path.display());
     println!("Master key file: {}", master_key_file.display());
     println!("Persona files ready in {}", persona_dir.display());
+    println!(
+        "Next: open Telegram or Feishu and use `/persona guide` to complete identity, soul, and heartbeat guidance there."
+    );
     Ok(())
 }
 
@@ -1033,26 +1144,154 @@ fn cli_status() -> Result<()> {
     let config_path = resolve_or_default_config_path()?;
     let pid_path = pid_file_path(&config_path);
     let log_path = log_file_path(&config_path);
+    let heartbeat_summary = load_heartbeat_summary().unwrap_or_default();
     match read_pid_file(&pid_path)? {
         Some(pid) if is_process_running(pid) => {
             println!(
-                "background_status=running\npid={}\nlog={}",
+                "background_status=running\npid={}\nlog={}\n{}",
                 pid,
-                log_path.display()
+                log_path.display(),
+                heartbeat_summary
             );
         }
         Some(pid) => {
             println!(
-                "background_status=stale\npid={}\nlog={}\nRemove with `hajimi stop`.",
+                "background_status=stale\npid={}\nlog={}\n{}\nRemove with `hajimi stop`.",
                 pid,
-                log_path.display()
+                log_path.display(),
+                heartbeat_summary
             );
         }
         None => {
-            println!("background_status=stopped\nlog={}", log_path.display());
+            println!(
+                "background_status=stopped\nlog={}\n{}",
+                log_path.display(),
+                heartbeat_summary
+            );
         }
     }
     Ok(())
+}
+
+fn load_heartbeat_summary() -> Result<String> {
+    let loaded = load_config_from_env_or_default()?;
+    let store = open_store(&loaded.config)?;
+    Ok(store
+        .get_heartbeat()?
+        .map(|heartbeat| {
+            let age = (Utc::now() - heartbeat.last_seen_at).num_seconds().max(0);
+            format!(
+                "heartbeat_last_seen_at={}\nheartbeat_age_secs={}\nheartbeat_pid={}\nheartbeat_channel={}",
+                heartbeat.last_seen_at,
+                age,
+                heartbeat
+                    .pid
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+                heartbeat.channel.unwrap_or_else(|| "unknown".into())
+            )
+        })
+        .unwrap_or_else(|| "heartbeat_last_seen_at=unknown".into()))
+}
+
+fn start_heartbeat_task(store: Arc<Store>, channel: String, persona_dir: PathBuf) {
+    let pid = std::process::id();
+    tokio::spawn(async move {
+        loop {
+            let heartbeat = load_heartbeat_file_config(&persona_dir);
+            if heartbeat.enabled {
+                let _ = store.set_heartbeat(&HeartbeatStatus {
+                    last_seen_at: Utc::now(),
+                    pid: Some(pid),
+                    channel: Some(channel.clone()),
+                });
+            }
+            tokio::time::sleep(Duration::from_secs(heartbeat.interval_secs)).await;
+        }
+    });
+}
+
+#[derive(Debug, Clone)]
+struct HeartbeatFileConfig {
+    enabled: bool,
+    interval_secs: u64,
+}
+
+impl Default for HeartbeatFileConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: 30,
+        }
+    }
+}
+
+fn default_persona_templates() -> [(&'static str, &'static str); 6] {
+    [
+        (
+            "identity.md",
+            "# Identity\n\nDescribe who the user is, what systems they own, and any standing preferences.\n",
+        ),
+        (
+            "soul.md",
+            "# Soul\n\nYou are Hajimi, a cat AI assistant with sharp operational instincts. Be concise, capable, and slightly cat-like without becoming noisy or childish. Prefer action, concrete terminal work, and honest status over fluff.\n",
+        ),
+        (
+            "agents.md",
+            "# Agents\n\nDocument sub-agent rules, delegation style, and multi-agent boundaries here.\n",
+        ),
+        (
+            "tools.md",
+            "# Tools\n\nDocument preferred tools, shell habits, and safety constraints here.\n",
+        ),
+        (
+            "skills.md",
+            "# Skills\n\nDocument reusable workflows and special operating skills here.\n",
+        ),
+        ("heartbeat.md", "enabled: true\ninterval_secs: 30\n"),
+    ]
+}
+
+fn load_heartbeat_file_config(persona_dir: &Path) -> HeartbeatFileConfig {
+    let path = persona_dir.join("heartbeat.md");
+    let file = match fs::File::open(&path) {
+        Ok(file) => file,
+        Err(_) => return HeartbeatFileConfig::default(),
+    };
+    let mut config = HeartbeatFileConfig::default();
+    for line in io::BufReader::new(file).lines().map_while(|line| line.ok()) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        match key {
+            "enabled" => {
+                if let Some(parsed) = parse_bool(value) {
+                    config.enabled = parsed;
+                }
+            }
+            "interval_secs" => {
+                if let Ok(parsed) = value.parse::<u64>() {
+                    config.interval_secs = parsed.max(5);
+                }
+            }
+            _ => {}
+        }
+    }
+    config
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Some(true),
+        "false" | "no" | "off" | "0" => Some(false),
+        _ => None,
+    }
 }
 
 fn cli_restart() -> Result<()> {
@@ -1187,6 +1426,8 @@ fn default_app_config(config_path: &Path) -> AppConfig {
             app_secret: String::new(),
             listen_addr: Some("0.0.0.0:8787".into()),
             event_path: Some("/feishu/events".into()),
+            card_callback_path: Some("/feishu/card".into()),
+            mode: Some("webhook".into()),
         },
         llm: LlmSection {
             base_url: None,
@@ -1215,6 +1456,7 @@ fn default_app_config(config_path: &Path) -> AppConfig {
         execution: ExecutionSection {
             mode: Some("auto".into()),
         },
+        multi_agent: MultiAgentSection::default(),
         persona: PersonaSection {
             directory: Some(default_persona_dir()),
             prompt_files: vec![],
@@ -1305,6 +1547,14 @@ fn prompt_optional(label: &str) -> Result<Option<String>> {
     } else {
         Ok(Some(trimmed))
     }
+}
+
+fn parse_csv_items(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }
 
 async fn prompt_provider_model(provider: &ProviderConfig) -> Result<String> {
@@ -1559,7 +1809,18 @@ fn slugify(value: &str) -> String {
     }
 }
 
+fn print_brand_banner() {
+    println!(r"  /\_/\\      hajimi");
+    println!(r" ( o.o )     cat x ferris");
+    println!(r"  > ^ <   _  _");
+    println!(r"         ( \/ )");
+    println!(r"          \  /");
+    println!("         /_/\\\\_\\\\");
+    println!();
+}
+
 fn print_help() {
+    print_brand_banner();
     println!("{}", help_text());
 }
 
@@ -1570,11 +1831,12 @@ fn help_text() -> &'static str {
   hajimi launch          Launch the daemon in background
   hajimi stop            Stop the background daemon
   hajimi status          Show background daemon status
-  hajimi onboard         Interactive local onboarding
+  hajimi onboard         Interactive local onboarding (telegram/feishu/skip)
   hajimi providers       List configured providers
   hajimi provider ...    Manage providers
   hajimi model ...       Manage the active model
   hajimi models [id]     List models for the default or named provider
+  hajimi launch          Start the configured channel and multi-agent runtime in background
   hajimi restart         Restart the installed service
   hajimi help            Show this help"
 }
@@ -1624,9 +1886,9 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        PersonaSection, default_config_path, ensure_persona_files, expand_home, log_file_path,
-        open_store, pairing_text_matches, pid_file_path, resolve_model_choice,
-        resolve_persona_paths, select_platform_mode, slugify,
+        PersonaSection, default_config_path, ensure_persona_files, expand_home,
+        load_heartbeat_file_config, log_file_path, open_store, pairing_text_matches, pid_file_path,
+        resolve_model_choice, resolve_persona_paths, select_platform_mode, slugify,
     };
     use hajimi_claw_exec::PlatformMode;
     use tempfile::tempdir;
@@ -1681,8 +1943,37 @@ mod tests {
             },
         )
         .unwrap();
+        assert!(paths.contains(&persona_dir.join("identity.md")));
         assert!(paths.contains(&dir.path().join("soul.md")));
         assert!(paths.contains(&persona_dir.join("skills.md")));
+    }
+
+    #[test]
+    fn ensure_persona_files_creates_heartbeat_and_seeded_soul() {
+        let dir = tempdir().unwrap();
+        ensure_persona_files(dir.path()).unwrap();
+
+        let soul = fs::read_to_string(dir.path().join("soul.md")).unwrap();
+        let heartbeat = fs::read_to_string(dir.path().join("heartbeat.md")).unwrap();
+
+        assert!(soul.contains("cat AI assistant"));
+        assert!(heartbeat.contains("enabled: true"));
+        assert!(heartbeat.contains("interval_secs: 30"));
+    }
+
+    #[test]
+    fn heartbeat_config_reads_interval_and_enabled_flag() {
+        let dir = tempdir().unwrap();
+        ensure_persona_files(dir.path()).unwrap();
+        fs::write(
+            dir.path().join("heartbeat.md"),
+            "enabled: false\ninterval_secs: 12\n",
+        )
+        .unwrap();
+
+        let config = load_heartbeat_file_config(dir.path());
+        assert!(!config.enabled);
+        assert_eq!(config.interval_secs, 12);
     }
 
     #[test]
@@ -1723,6 +2014,7 @@ mod tests {
             },
             policy: hajimi_claw_policy::PolicyConfig::default(),
             execution: super::ExecutionSection { mode: None },
+            multi_agent: super::MultiAgentSection::default(),
             persona: super::PersonaSection::default(),
         };
 

@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use hajimi_claw_agent::AgentRuntime;
+use hajimi_claw_agent::{AgentRuntime, MultiAgentPreference};
 use hajimi_claw_llm::{list_models, test_provider};
 use hajimi_claw_policy::PolicyEngine;
 use hajimi_claw_store::Store;
@@ -12,11 +13,13 @@ use hajimi_claw_types::{
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GatewayCommand {
     Ask(String),
     ShellOpen(Option<String>),
+    ShellStatus,
     ShellExec(String),
     ShellClose,
     Status,
@@ -39,6 +42,11 @@ pub enum GatewayCommand {
     ModelCurrent,
     ModelPicker,
     ModelUse(String),
+    AgentsOn,
+    AgentsOff,
+    AgentsAuto,
+    AgentsStatus,
+    PersonaGuide,
     PersonaList,
     PersonaRead(String),
     PersonaWrite { file: String, content: String },
@@ -71,6 +79,12 @@ pub struct GatewayResponse {
     pub keyboard: Option<InlineKeyboard>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayPreview {
+    pub text: String,
+    pub keyboard: Option<InlineKeyboard>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InlineKeyboard {
     pub rows: Vec<Vec<InlineButton>>,
@@ -85,6 +99,10 @@ pub struct InlineButton {
 #[async_trait]
 pub trait Gateway: Send + Sync {
     async fn handle(&self, request: GatewayRequest) -> ClawResult<GatewayResponse>;
+
+    async fn preview(&self, _request: GatewayRequest) -> Option<GatewayPreview> {
+        None
+    }
 }
 
 pub struct InProcessGateway {
@@ -92,6 +110,14 @@ pub struct InProcessGateway {
     policy: Arc<PolicyEngine>,
     store: Arc<Store>,
     client: Client,
+    multi_agent_modes: RwLock<HashMap<i64, SessionMultiAgentMode>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionMultiAgentMode {
+    Auto,
+    On,
+    Off,
 }
 
 impl InProcessGateway {
@@ -101,12 +127,37 @@ impl InProcessGateway {
             policy,
             store,
             client: Client::new(),
+            multi_agent_modes: RwLock::new(HashMap::new()),
         }
     }
 }
 
 #[async_trait]
 impl Gateway for InProcessGateway {
+    async fn preview(&self, request: GatewayRequest) -> Option<GatewayPreview> {
+        if !self
+            .policy
+            .authorize_telegram_actor(request.actor_user_id, request.actor_chat_id)
+        {
+            return None;
+        }
+        match request.command {
+            GatewayCommand::Ask(prompt) => {
+                let preference = self.multi_agent_preference(request.actor_chat_id).await;
+                let preview = self
+                    .runtime
+                    .preview_multi_agent_request(&prompt, preference)?;
+                Some(GatewayPreview {
+                    text: format!("已拆成 {} 个 agents，正在汇总...", preview.worker_count),
+                    keyboard: Some(agents_keyboard(
+                        self.multi_agent_mode(request.actor_chat_id).await,
+                    )),
+                })
+            }
+            _ => None,
+        }
+    }
+
     async fn handle(&self, request: GatewayRequest) -> ClawResult<GatewayResponse> {
         if !self
             .policy
@@ -136,6 +187,7 @@ impl Gateway for InProcessGateway {
 
         match request.command {
             GatewayCommand::Ask(prompt) => {
+                let preference = self.multi_agent_preference(request.actor_chat_id).await;
                 let provider_id = self
                     .store
                     .resolve_provider_for_chat(request.actor_chat_id)
@@ -144,7 +196,7 @@ impl Gateway for InProcessGateway {
                 Ok(GatewayResponse {
                     text: self
                         .runtime
-                        .ask_with_provider(&prompt, None, provider_id)
+                        .ask_with_provider_and_preference(&prompt, None, provider_id, preference)
                         .await?,
                     session: SessionDirective::Keep,
                     keyboard: None,
@@ -164,6 +216,16 @@ impl Gateway for InProcessGateway {
                 })?;
                 Ok(GatewayResponse {
                     text: self.runtime.shell_exec(&session_id, &command).await?,
+                    session: SessionDirective::Keep,
+                    keyboard: None,
+                })
+            }
+            GatewayCommand::ShellStatus => {
+                let session_id = request.current_session_id.ok_or_else(|| {
+                    ClawError::InvalidRequest("no active session, use /shell open first".into())
+                })?;
+                Ok(GatewayResponse {
+                    text: self.runtime.shell_status(&session_id).await?,
                     session: SessionDirective::Keep,
                     keyboard: None,
                 })
@@ -214,6 +276,23 @@ impl Gateway for InProcessGateway {
             GatewayCommand::ModelCurrent => self.model_current(request.actor_chat_id).await,
             GatewayCommand::ModelPicker => self.model_picker(request.actor_chat_id).await,
             GatewayCommand::ModelUse(model) => self.model_use(request.actor_chat_id, &model).await,
+            GatewayCommand::AgentsOn => {
+                self.agents_set_mode(request.actor_chat_id, SessionMultiAgentMode::On)
+                    .await
+            }
+            GatewayCommand::AgentsOff => {
+                self.agents_set_mode(request.actor_chat_id, SessionMultiAgentMode::Off)
+                    .await
+            }
+            GatewayCommand::AgentsAuto => {
+                self.agents_set_mode(request.actor_chat_id, SessionMultiAgentMode::Auto)
+                    .await
+            }
+            GatewayCommand::AgentsStatus => self.agents_status(request.actor_chat_id).await,
+            GatewayCommand::PersonaGuide => Ok(text_response_with_keyboard(
+                &persona_guide_text(),
+                Some(persona_guide_keyboard()),
+            )),
             GatewayCommand::PersonaList => Ok(text_response(&self.runtime.persona_list().await?)),
             GatewayCommand::PersonaRead(file) => {
                 Ok(text_response(&self.runtime.persona_read(&file).await?))
@@ -330,7 +409,7 @@ impl InProcessGateway {
 
                 let health = test_provider(&self.client, &record).await?;
                 Ok(text_response(&format!(
-                    "onboarding complete.\nprovider=`{}` id=`{}`{}\nchat_binding=enabled\nhealth={}\n{}",
+                    "onboarding complete.\nprovider=`{}` id=`{}`{}\nchat_binding=enabled\nhealth={}\n{}\n\nNext: open `/persona guide` to configure identity, soul, and heartbeat from chat.",
                     record.label,
                     record.id,
                     if make_default { " default=yes" } else { "" },
@@ -540,6 +619,51 @@ impl InProcessGateway {
             .map_err(store_error)?;
         self.model_current(chat_id).await
     }
+
+    async fn multi_agent_mode(&self, chat_id: i64) -> SessionMultiAgentMode {
+        self.multi_agent_modes
+            .read()
+            .await
+            .get(&chat_id)
+            .copied()
+            .unwrap_or(SessionMultiAgentMode::Auto)
+    }
+
+    async fn multi_agent_preference(&self, chat_id: i64) -> MultiAgentPreference {
+        match self.multi_agent_mode(chat_id).await {
+            SessionMultiAgentMode::Auto => MultiAgentPreference::Auto,
+            SessionMultiAgentMode::On => MultiAgentPreference::ForceOn,
+            SessionMultiAgentMode::Off => MultiAgentPreference::ForceOff,
+        }
+    }
+
+    async fn agents_set_mode(
+        &self,
+        chat_id: i64,
+        mode: SessionMultiAgentMode,
+    ) -> ClawResult<GatewayResponse> {
+        self.multi_agent_modes.write().await.insert(chat_id, mode);
+        self.agents_status(chat_id).await
+    }
+
+    async fn agents_status(&self, chat_id: i64) -> ClawResult<GatewayResponse> {
+        let mode = self.multi_agent_mode(chat_id).await;
+        let description = match mode {
+            SessionMultiAgentMode::Auto => {
+                "mode=auto\nmulti-agent follows prompt keywords or explicit `N agents`."
+            }
+            SessionMultiAgentMode::On => {
+                "mode=on\nnatural-language asks will force multi-agent execution."
+            }
+            SessionMultiAgentMode::Off => {
+                "mode=off\nnatural-language asks stay single-agent unless you change the mode."
+            }
+        };
+        Ok(text_response_with_keyboard(
+            &format!("multi-agent for chat `{chat_id}`\n{description}"),
+            Some(agents_keyboard(mode)),
+        ))
+    }
 }
 
 pub fn parse_gateway_command(text: &str) -> GatewayCommand {
@@ -574,6 +698,18 @@ pub fn parse_gateway_command(text: &str) -> GatewayCommand {
     if trimmed == "/model current" {
         return GatewayCommand::ModelCurrent;
     }
+    if trimmed == "/agents on" {
+        return GatewayCommand::AgentsOn;
+    }
+    if trimmed == "/agents off" {
+        return GatewayCommand::AgentsOff;
+    }
+    if trimmed == "/agents auto" {
+        return GatewayCommand::AgentsAuto;
+    }
+    if trimmed == "/agents status" || trimmed == "/agents" {
+        return GatewayCommand::AgentsStatus;
+    }
     if trimmed == "/model use" {
         return GatewayCommand::ModelPicker;
     }
@@ -582,6 +718,9 @@ pub fn parse_gateway_command(text: &str) -> GatewayCommand {
     }
     if trimmed == "/persona list" {
         return GatewayCommand::PersonaList;
+    }
+    if trimmed == "/persona guide" {
+        return GatewayCommand::PersonaGuide;
     }
     if let Some(rest) = trimmed.strip_prefix("/persona read ") {
         return GatewayCommand::PersonaRead(rest.trim().into());
@@ -633,6 +772,9 @@ pub fn parse_gateway_command(text: &str) -> GatewayCommand {
     if trimmed == "/shell close" {
         return GatewayCommand::ShellClose;
     }
+    if trimmed == "/shell status" {
+        return GatewayCommand::ShellStatus;
+    }
     if let Some(rest) = trimmed.strip_prefix("/shell open") {
         let name = rest.trim();
         return GatewayCommand::ShellOpen((!name.is_empty()).then(|| name.to_string()));
@@ -667,11 +809,17 @@ pub fn help_text() -> String {
         "/provider set-model <provider-id> <model>",
         "/model current",
         "/model use [model]",
+        "/agents on",
+        "/agents off",
+        "/agents auto",
+        "/agents status",
+        "/persona guide",
         "/persona list",
-        "/persona read <soul|agents|tools|skills>",
+        "/persona read <identity|soul|agents|tools|skills|heartbeat>",
         "/persona write <file> <content>",
         "/persona append <file> <content>",
         "/shell open [name]",
+        "/shell status",
         "/shell exec <cmd>",
         "/shell close",
         "/status",
@@ -724,6 +872,7 @@ fn finalize_provider(draft: ProviderDraft) -> ClawResult<ProviderConfig> {
         base_url,
         api_key,
         model,
+        fallback_models: draft.fallback_models.unwrap_or_default(),
         enabled: true,
         extra_headers: vec![],
         created_at: Utc::now(),
@@ -837,6 +986,10 @@ fn main_menu_keyboard() -> InlineKeyboard {
                     text: "Model".into(),
                     data: "/model current".into(),
                 },
+                InlineButton {
+                    text: "Agents".into(),
+                    data: "/agents status".into(),
+                },
             ],
             vec![
                 InlineButton {
@@ -845,9 +998,62 @@ fn main_menu_keyboard() -> InlineKeyboard {
                 },
                 InlineButton {
                     text: "Persona".into(),
+                    data: "/persona guide".into(),
+                },
+            ],
+        ],
+    }
+}
+
+fn persona_guide_text() -> String {
+    [
+        "persona guide",
+        "",
+        "`identity.md` = who the user is, what systems they own, and standing preferences.",
+        "`soul.md` = Hajimi's personality. It is preseeded as a concise cat AI assistant.",
+        "`heartbeat.md` = daemon heartbeat config.",
+        "",
+        "Heartbeat format example:",
+        "`enabled: true`",
+        "`interval_secs: 30`",
+        "",
+        "Useful commands:",
+        "`/persona read soul`",
+        "`/persona write identity You are helping Alice maintain two Linux VPS nodes.`",
+        "`/persona write soul You are Hajimi, a calm cat AI ops assistant.`",
+        "`/persona write heartbeat enabled: true`",
+        "`/persona append heartbeat interval_secs: 15`",
+    ]
+    .join("\n")
+}
+
+fn persona_guide_keyboard() -> InlineKeyboard {
+    InlineKeyboard {
+        rows: vec![
+            vec![
+                InlineButton {
+                    text: "Read soul".into(),
+                    data: "/persona read soul".into(),
+                },
+                InlineButton {
+                    text: "Read identity".into(),
+                    data: "/persona read identity".into(),
+                },
+            ],
+            vec![
+                InlineButton {
+                    text: "Read heartbeat".into(),
+                    data: "/persona read heartbeat".into(),
+                },
+                InlineButton {
+                    text: "List persona files".into(),
                     data: "/persona list".into(),
                 },
             ],
+            vec![InlineButton {
+                text: "Back to menu".into(),
+                data: "/menu".into(),
+            }],
         ],
     }
 }
@@ -906,6 +1112,43 @@ fn provider_list_keyboard(providers: &[ProviderRecord]) -> InlineKeyboard {
         data: "/provider add".into(),
     }]);
     InlineKeyboard { rows }
+}
+
+fn agents_keyboard(mode: SessionMultiAgentMode) -> InlineKeyboard {
+    InlineKeyboard {
+        rows: vec![
+            vec![
+                InlineButton {
+                    text: if mode == SessionMultiAgentMode::On {
+                        "* Agents on".into()
+                    } else {
+                        "Agents on".into()
+                    },
+                    data: "/agents on".into(),
+                },
+                InlineButton {
+                    text: if mode == SessionMultiAgentMode::Off {
+                        "* Agents off".into()
+                    } else {
+                        "Agents off".into()
+                    },
+                    data: "/agents off".into(),
+                },
+                InlineButton {
+                    text: if mode == SessionMultiAgentMode::Auto {
+                        "* Agents auto".into()
+                    } else {
+                        "Agents auto".into()
+                    },
+                    data: "/agents auto".into(),
+                },
+            ],
+            vec![InlineButton {
+                text: "Back to menu".into(),
+                data: "/menu".into(),
+            }],
+        ],
+    }
 }
 
 fn model_picker_keyboard(
@@ -989,6 +1232,26 @@ mod tests {
     }
 
     #[test]
+    fn parses_agents_commands() {
+        assert_eq!(
+            parse_gateway_command("/agents status"),
+            GatewayCommand::AgentsStatus
+        );
+        assert_eq!(
+            parse_gateway_command("/agents on"),
+            GatewayCommand::AgentsOn
+        );
+        assert_eq!(
+            parse_gateway_command("/agents off"),
+            GatewayCommand::AgentsOff
+        );
+        assert_eq!(
+            parse_gateway_command("/agents auto"),
+            GatewayCommand::AgentsAuto
+        );
+    }
+
+    #[test]
     fn parses_plain_text_as_ask() {
         assert_eq!(
             parse_gateway_command("帮我检查 docker 日志"),
@@ -1004,6 +1267,22 @@ mod tests {
                 file: "soul".into(),
                 content: "Be terse.".into(),
             }
+        );
+    }
+
+    #[test]
+    fn parses_persona_guide_command() {
+        assert_eq!(
+            parse_gateway_command("/persona guide"),
+            GatewayCommand::PersonaGuide
+        );
+    }
+
+    #[test]
+    fn parses_shell_status_command() {
+        assert_eq!(
+            parse_gateway_command("/shell status"),
+            GatewayCommand::ShellStatus
         );
     }
 
@@ -1098,6 +1377,7 @@ mod tests {
                 base_url: "https://example.com/v1".into(),
                 api_key: "secret".into(),
                 model: "gpt-5.1".into(),
+                fallback_models: vec![],
                 enabled: true,
                 extra_headers: vec![],
                 created_at: chrono::Utc::now(),
@@ -1121,6 +1401,52 @@ mod tests {
             })
             .await?;
         assert!(response.keyboard.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agents_on_enables_multi_agent_preview() -> Result<()> {
+        let dir = tempdir()?;
+        let mut config = hajimi_claw_policy::PolicyConfig::default();
+        config.allowed_workdirs = vec![dir.path().to_path_buf(), std::env::current_dir()?];
+        config.admin_user_id = 1;
+        config.admin_chat_id = 2;
+        let policy = Arc::new(PolicyEngine::new(config));
+        let executor = Arc::new(LocalExecutor::new(
+            policy.clone(),
+            PlatformMode::WindowsSafe,
+        ));
+        let tools = Arc::new(ToolRegistry::default(executor, policy.clone()));
+        let store = Arc::new(Store::open_in_memory()?);
+        let runtime = Arc::new(AgentRuntime::for_tests(
+            tools,
+            store.clone(),
+            policy.clone(),
+        ));
+        let gateway = InProcessGateway::new(runtime, policy, store);
+
+        let _ = gateway
+            .handle(GatewayRequest {
+                actor_user_id: 1,
+                actor_chat_id: 2,
+                raw_text: "/agents on".into(),
+                command: GatewayCommand::AgentsOn,
+                current_session_id: None,
+            })
+            .await?;
+
+        let preview = gateway
+            .preview(GatewayRequest {
+                actor_user_id: 1,
+                actor_chat_id: 2,
+                raw_text: "你好".into(),
+                command: GatewayCommand::Ask("你好".into()),
+                current_session_id: None,
+            })
+            .await
+            .expect("preview should exist");
+        assert!(preview.text.contains("agents"));
+        assert!(preview.keyboard.is_some());
         Ok(())
     }
 }

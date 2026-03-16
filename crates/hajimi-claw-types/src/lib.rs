@@ -79,6 +79,8 @@ pub struct ProviderConfig {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    #[serde(default)]
+    pub fallback_models: Vec<String>,
     pub enabled: bool,
     pub extra_headers: Vec<(String, String)>,
     pub created_at: DateTime<Utc>,
@@ -107,6 +109,7 @@ pub struct ProviderDraft {
     pub base_url: Option<String>,
     pub api_key: Option<String>,
     pub model: Option<String>,
+    pub fallback_models: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,6 +197,13 @@ pub struct SessionSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeartbeatStatus {
+    pub last_seen_at: DateTime<Utc>,
+    pub pid: Option<u32>,
+    pub channel: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     pub request_id: ApprovalId,
     pub reason: String,
@@ -215,6 +225,7 @@ pub struct ToolSpec {
     pub name: String,
     pub description: String,
     pub requires_approval: bool,
+    pub input_schema: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -246,18 +257,45 @@ pub struct ConversationMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallRecord {
+    pub id: Option<String>,
+    pub name: String,
+    pub arguments: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolResultRecord {
+    pub call_id: Option<String>,
+    pub name: String,
+    pub content: String,
+    pub structured: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolExchange {
+    pub call: ToolCallRecord,
+    pub result: ToolResultRecord,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRequest {
     pub conversation_id: ConversationId,
     pub provider_id: Option<String>,
     pub system_prompt: String,
     pub messages: Vec<ConversationMessage>,
     pub tool_specs: Vec<ToolSpec>,
+    #[serde(default)]
+    pub tool_history: Vec<ToolExchange>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AgentEvent {
     TextDelta(String),
-    ToolCall { tool: String, input: Value },
+    ToolCall {
+        id: Option<String>,
+        tool: String,
+        input: Value,
+    },
     Finished,
 }
 
@@ -296,5 +334,6 @@ pub trait Executor: Send + Sync {
     async fn run_once(&self, req: ExecRequest) -> ClawResult<ExecResult>;
     async fn open_session(&self, req: SessionOpenRequest) -> ClawResult<SessionHandle>;
     async fn run_in_session(&self, id: SessionId, req: ExecRequest) -> ClawResult<ExecResult>;
+    async fn describe_session(&self, id: SessionId) -> ClawResult<SessionHandle>;
     async fn close_session(&self, id: SessionId) -> ClawResult<()>;
 }

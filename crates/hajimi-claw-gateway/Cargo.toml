@@ -17,6 +17,7 @@ hajimi-claw-types = { path = "../hajimi-claw-types" }
 reqwest.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
@@ -24,4 +25,3 @@ hajimi-claw-exec = { path = "../hajimi-claw-exec" }
 hajimi-claw-store = { path = "../hajimi-claw-store" }
 hajimi-claw-tools = { path = "../hajimi-claw-tools" }
 tempfile.workspace = true
-tokio.workspace = true

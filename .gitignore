@@ -13,11 +13,15 @@
 /.env
 /.env.*
 /config.toml
+*.key
+master.key
 
 # Logs and temp files
 *.log
 *.tmp
 *.temp
+*.pid
+*.out
 
 # OS/editor noise
 .DS_Store
@@ -29,4 +33,12 @@ desktop.ini
 # Node packaging artifacts
 node_modules/
 npm-dist/
+npm/platforms/*/bin/hajimi-claw
+npm/platforms/*/bin/hajimi-claw.exe
 *.tgz
+
+# Local persona / runtime home
+.hajimi/
+
+# Local private notes
+.release-local.md

@@ -1,0 +1,21 @@
+{
+  "name": "hajimi-claw-linux-arm64-gnu",
+  "version": "0.1.2",
+  "description": "Prebuilt Linux arm64 glibc binary for hajimi-claw",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "files": [
+    "bin",
+    "index.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "MIT"
+}

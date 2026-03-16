@@ -1,27 +1,33 @@
 {
   "name": "hajimi-claw",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Single-user Telegram-first ops agent in Rust",
   "bin": {
     "hajimi": "bin/hajimi-claw.js",
     "hajimi-claw": "bin/hajimi-claw.js"
   },
-  "files": [
-    "Cargo.toml",
-    "Cargo.lock",
-    "src",
-    "crates",
-    "bin",
-    "scripts/npm-install.js",
-    "config.example.toml",
-    "README.md"
-  ],
-  "scripts": {
-    "postinstall": "node scripts/npm-install.js"
-  },
   "preferGlobal": true,
   "license": "MIT",
   "engines": {
     "node": ">=18"
+  },
+  "optionalDependencies": {
+    "hajimi-claw-linux-arm64-gnu": "0.1.2",
+    "hajimi-claw-linux-x64-gnu": "0.1.2",
+    "hajimi-claw-win32-arm64-msvc": "0.1.2",
+    "hajimi-claw-win32-x64-msvc": "0.1.2"
+  },
+  "files": [
+    "bin",
+    "npm/platforms",
+    "scripts/sync-npm-versions.js",
+    "scripts/stage-prebuilt.js",
+    "config.example.toml",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "sync:npm-versions": "node scripts/sync-npm-versions.js",
+    "stage:binary": "npm run sync:npm-versions && node scripts/stage-prebuilt.js"
   }
 }

@@ -8,9 +8,9 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, Utc};
 use hajimi_claw_types::{
-    ApprovalRequest, ConversationId, ConversationMessage, OnboardingSession, ProviderConfig,
-    ProviderDraft, ProviderKind, ProviderRecord, SessionHandle, SessionSummary, TaskId, TaskKind,
-    TaskStatus,
+    ApprovalRequest, ConversationId, ConversationMessage, HeartbeatStatus, OnboardingSession,
+    ProviderConfig, ProviderDraft, ProviderKind, ProviderRecord, SessionHandle, SessionSummary,
+    TaskId, TaskKind, TaskStatus,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
@@ -127,6 +127,7 @@ impl Store {
                 base_url TEXT NOT NULL,
                 api_key TEXT NOT NULL,
                 model TEXT NOT NULL,
+                fallback_models_json TEXT NOT NULL DEFAULT '[]',
                 enabled INTEGER NOT NULL,
                 extra_headers_json TEXT NOT NULL,
                 is_default INTEGER NOT NULL,
@@ -147,6 +148,12 @@ impl Store {
                 provider_id TEXT NOT NULL
             );
             "#,
+        )?;
+        ensure_column(
+            &connection,
+            "providers",
+            "fallback_models_json",
+            "ALTER TABLE providers ADD COLUMN fallback_models_json TEXT NOT NULL DEFAULT '[]'",
         )?;
         Ok(())
     }
@@ -365,6 +372,42 @@ impl Store {
             .map_err(Into::into)
     }
 
+    pub fn set_heartbeat(&self, heartbeat: &HeartbeatStatus) -> Result<()> {
+        self.set_config(
+            "heartbeat.last_seen_at",
+            &heartbeat.last_seen_at.to_rfc3339(),
+        )?;
+        self.set_config(
+            "heartbeat.pid",
+            &heartbeat.pid.map(|pid| pid.to_string()).unwrap_or_default(),
+        )?;
+        self.set_config(
+            "heartbeat.channel",
+            heartbeat.channel.as_deref().unwrap_or_default(),
+        )?;
+        Ok(())
+    }
+
+    pub fn get_heartbeat(&self) -> Result<Option<HeartbeatStatus>> {
+        let Some(last_seen_at) = self.get_config("heartbeat.last_seen_at")? else {
+            return Ok(None);
+        };
+        if last_seen_at.trim().is_empty() {
+            return Ok(None);
+        }
+        let pid = self
+            .get_config("heartbeat.pid")?
+            .and_then(|value| value.trim().parse::<u32>().ok());
+        let channel = self
+            .get_config("heartbeat.channel")?
+            .filter(|value| !value.trim().is_empty());
+        Ok(Some(HeartbeatStatus {
+            last_seen_at: parse_ts(last_seen_at),
+            pid,
+            channel,
+        }))
+    }
+
     pub fn upsert_provider(&self, record: &ProviderRecord) -> Result<()> {
         let connection = self.connection.lock().expect("store lock poisoned");
         if record.is_default {
@@ -373,14 +416,15 @@ impl Store {
         let encrypted_api_key = self.encrypt_secret(&record.config.api_key)?;
         connection.execute(
             r#"
-            INSERT INTO providers (id, label, kind, base_url, api_key, model, enabled, extra_headers_json, is_default, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO providers (id, label, kind, base_url, api_key, model, fallback_models_json, enabled, extra_headers_json, is_default, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 label=excluded.label,
                 kind=excluded.kind,
                 base_url=excluded.base_url,
                 api_key=excluded.api_key,
                 model=excluded.model,
+                fallback_models_json=excluded.fallback_models_json,
                 enabled=excluded.enabled,
                 extra_headers_json=excluded.extra_headers_json,
                 is_default=excluded.is_default,
@@ -393,6 +437,7 @@ impl Store {
                 record.config.base_url,
                 encrypted_api_key,
                 record.config.model,
+                serde_json::to_string(&record.config.fallback_models)?,
                 i64::from(record.config.enabled),
                 serde_json::to_string(&record.config.extra_headers)?,
                 i64::from(record.is_default),
@@ -406,7 +451,7 @@ impl Store {
         let connection = self.connection.lock().expect("store lock poisoned");
         let mut stmt = connection.prepare(
             r#"
-            SELECT id, label, kind, base_url, api_key, model, enabled, extra_headers_json, is_default, created_at
+            SELECT id, label, kind, base_url, api_key, model, fallback_models_json, enabled, extra_headers_json, is_default, created_at
             FROM providers
             ORDER BY is_default DESC, created_at ASC
             "#,
@@ -421,7 +466,7 @@ impl Store {
         connection
             .query_row(
                 r#"
-                SELECT id, label, kind, base_url, api_key, model, enabled, extra_headers_json, is_default, created_at
+                SELECT id, label, kind, base_url, api_key, model, fallback_models_json, enabled, extra_headers_json, is_default, created_at
                 FROM providers WHERE id = ?
                 "#,
                 params![provider_id],
@@ -436,7 +481,7 @@ impl Store {
         connection
             .query_row(
                 r#"
-                SELECT id, label, kind, base_url, api_key, model, enabled, extra_headers_json, is_default, created_at
+                SELECT id, label, kind, base_url, api_key, model, fallback_models_json, enabled, extra_headers_json, is_default, created_at
                 FROM providers WHERE is_default = 1 LIMIT 1
                 "#,
                 [],
@@ -451,7 +496,7 @@ impl Store {
         connection
             .query_row(
                 r#"
-                SELECT id, label, kind, base_url, api_key, model, enabled, extra_headers_json, is_default, created_at
+                SELECT id, label, kind, base_url, api_key, model, fallback_models_json, enabled, extra_headers_json, is_default, created_at
                 FROM providers
                 ORDER BY created_at ASC
                 LIMIT 1
@@ -583,7 +628,9 @@ impl Store {
             "custom-chat-completions" => ProviderKind::CustomChatCompletions,
             _ => ProviderKind::OpenAiCompatible,
         };
-        let headers_json: String = row.get(7)?;
+        let fallback_models_json: String = row.get(6)?;
+        let fallback_models = serde_json::from_str(&fallback_models_json).map_err(to_sql_err)?;
+        let headers_json: String = row.get(8)?;
         let extra_headers = serde_json::from_str(&headers_json).map_err(to_sql_err)?;
         let api_key_raw: String = row.get(4)?;
         let api_key = self
@@ -597,11 +644,12 @@ impl Store {
                 base_url: row.get(3)?,
                 api_key,
                 model: row.get(5)?,
-                enabled: row.get::<_, i64>(6)? != 0,
+                fallback_models,
+                enabled: row.get::<_, i64>(7)? != 0,
                 extra_headers,
-                created_at: parse_ts(row.get(9)?),
+                created_at: parse_ts(row.get(10)?),
             },
-            is_default: row.get::<_, i64>(8)? != 0,
+            is_default: row.get::<_, i64>(9)? != 0,
         })
     }
 
@@ -681,6 +729,19 @@ fn parse_onboarding_step(step: String) -> hajimi_claw_types::OnboardingStep {
     }
 }
 
+fn ensure_column(connection: &Connection, table: &str, column: &str, sql: &str) -> Result<()> {
+    let mut stmt = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let exists = columns
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .any(|name| name == column);
+    if !exists {
+        connection.execute(sql, [])?;
+    }
+    Ok(())
+}
+
 fn to_sql_err(err: serde_json::Error) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
 }
@@ -699,7 +760,8 @@ mod tests {
 
     use chrono::Utc;
     use hajimi_claw_types::{
-        ConversationMessage, MessageRole, ProviderConfig, ProviderKind, ProviderRecord,
+        ConversationMessage, HeartbeatStatus, MessageRole, ProviderConfig, ProviderKind,
+        ProviderRecord,
     };
 
     use super::{SecretCipher, Store};
@@ -746,6 +808,7 @@ mod tests {
                     base_url: "https://example.com/v1".into(),
                     api_key: "top-secret".into(),
                     model: "gpt-demo".into(),
+                    fallback_models: vec![],
                     enabled: true,
                     extra_headers: vec![],
                     created_at: Utc::now(),
@@ -755,5 +818,19 @@ mod tests {
             .unwrap();
         let provider = store.get_default_provider().unwrap().unwrap();
         assert_eq!(provider.config.api_key, "top-secret");
+    }
+
+    #[test]
+    fn persists_heartbeat_status() {
+        let store = Store::open_in_memory().unwrap();
+        let heartbeat = HeartbeatStatus {
+            last_seen_at: Utc::now(),
+            pid: Some(1234),
+            channel: Some("telegram".into()),
+        };
+        store.set_heartbeat(&heartbeat).unwrap();
+        let loaded = store.get_heartbeat().unwrap().unwrap();
+        assert_eq!(loaded.pid, Some(1234));
+        assert_eq!(loaded.channel.as_deref(), Some("telegram"));
     }
 }

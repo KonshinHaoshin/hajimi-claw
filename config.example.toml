@@ -6,11 +6,14 @@ bot_token = "123456:replace-me"
 poll_timeout_secs = 30
 
 [feishu]
-# Feishu webhook mode. Expose listen_addr + event_path through your reverse proxy or public host.
+# `mode = "webhook"`: expose listen_addr + event_path through your reverse proxy or public host.
+# `mode = "long-connection"`: message events come from Feishu WebSocket; keep card_callback_path reachable if you want card button callbacks.
 app_id = ""
 app_secret = ""
+mode = "webhook"
 listen_addr = "0.0.0.0:8787"
 event_path = "/feishu/events"
+card_callback_path = "/feishu/card"
 
 [llm]
 # Optional bootstrap provider written into SQLite on first start.
@@ -18,6 +21,9 @@ base_url = "https://api.openai.com/v1"
 api_key = "replace-me"
 model = "gpt-4.1-mini"
 static_fallback_response = "LLM backend not configured."
+
+# Provider fallback models are stored in SQLite per provider by `hajimi onboard`.
+# Example: gpt-4o-mini -> gpt-4.1-mini -> gpt-4.1
 
 [storage]
 sqlite_path = "./data/hajimi-claw.sqlite3"
@@ -28,6 +34,14 @@ master_key_env = "HAJIMI_CLAW_MASTER_KEY"
 
 [execution]
 mode = "auto"
+
+[multi_agent]
+enabled = true
+auto_delegate = false
+default_workers = 3
+max_workers = 8
+worker_timeout_secs = 90
+max_context_chars_per_worker = 24000
 
 [persona]
 # hajimi onboard creates soul.md, agents.md, tools.md, and skills.md here.

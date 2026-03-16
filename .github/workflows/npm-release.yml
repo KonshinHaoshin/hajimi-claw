@@ -1,0 +1,78 @@
+name: npm-release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  publish-platform:
+    name: publish-${{ matrix.package_name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package_name: hajimi-claw-win32-x64-msvc
+            runner: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            stage_target: win32-x64-msvc
+            binary_path: target/x86_64-pc-windows-msvc/release/hajimi-claw.exe
+            package_dir: npm/platforms/win32-x64-msvc
+          - package_name: hajimi-claw-linux-x64-gnu
+            runner: ubuntu-latest
+            rust_target: x86_64-unknown-linux-gnu
+            stage_target: linux-x64-gnu
+            binary_path: target/x86_64-unknown-linux-gnu/release/hajimi-claw
+            package_dir: npm/platforms/linux-x64-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Sync npm versions
+        run: node scripts/sync-npm-versions.js
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.rust_target }}
+
+      - name: Stage prebuilt binary
+        run: node scripts/stage-prebuilt.js ${{ matrix.stage_target }} ${{ matrix.binary_path }}
+
+      - name: Publish platform package
+        run: npm publish
+        working-directory: ${{ matrix.package_dir }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish-root:
+    name: publish-root
+    runs-on: ubuntu-latest
+    needs: publish-platform
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Sync npm versions
+        run: node scripts/sync-npm-versions.js
+
+      - name: Publish root package
+        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
