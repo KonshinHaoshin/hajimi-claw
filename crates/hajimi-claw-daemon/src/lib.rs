@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use hajimi_claw_agent::{AgentRuntime, MarkdownPromptSource, default_system_prompt};
+use hajimi_claw_agent::{
+    AgentRuntime, MarkdownPromptSource, MultiAgentConfig, default_system_prompt,
+};
 use hajimi_claw_bot::{FeishuBot, FeishuConfig, TelegramBot, TelegramConfig};
 use hajimi_claw_exec::{LocalExecutor, PlatformMode};
 use hajimi_claw_gateway::InProcessGateway;
@@ -35,6 +37,8 @@ pub struct AppConfig {
     pub security: SecuritySection,
     pub policy: PolicyConfig,
     pub execution: ExecutionSection,
+    #[serde(default)]
+    pub multi_agent: MultiAgentSection,
     #[serde(default)]
     pub persona: PersonaSection,
 }
@@ -64,6 +68,8 @@ pub struct FeishuSection {
     pub app_secret: String,
     pub listen_addr: Option<String>,
     pub event_path: Option<String>,
+    pub card_callback_path: Option<String>,
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +94,29 @@ pub struct SecuritySection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionSection {
     pub mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiAgentSection {
+    pub enabled: bool,
+    pub auto_delegate: bool,
+    pub default_workers: usize,
+    pub max_workers: usize,
+    pub worker_timeout_secs: u64,
+    pub max_context_chars_per_worker: usize,
+}
+
+impl Default for MultiAgentSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auto_delegate: false,
+            default_workers: 3,
+            max_workers: 8,
+            worker_timeout_secs: 90,
+            max_context_chars_per_worker: 24_000,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -197,6 +226,14 @@ async fn run_with_context(config: AppConfig, config_path: Option<PathBuf>) -> Re
         policy.clone(),
         prompt_source,
         persona_dir,
+        MultiAgentConfig {
+            enabled: config.multi_agent.enabled,
+            auto_delegate: config.multi_agent.auto_delegate,
+            default_workers: config.multi_agent.default_workers,
+            max_workers: config.multi_agent.max_workers,
+            worker_timeout_secs: config.multi_agent.worker_timeout_secs,
+            max_context_chars_per_worker: config.multi_agent.max_context_chars_per_worker,
+        },
     ));
     let gateway = Arc::new(InProcessGateway::new(
         runtime,
@@ -204,6 +241,11 @@ async fn run_with_context(config: AppConfig, config_path: Option<PathBuf>) -> Re
         store.clone(),
     ));
     match config.channel.kind.as_str() {
+        "none" | "skip" => {
+            anyhow::bail!(
+                "no primary channel configured yet\nRun `hajimi onboard` and choose telegram or feishu to start the daemon."
+            )
+        }
         "feishu" => {
             let bot = Arc::new(FeishuBot::new(
                 FeishuConfig {
@@ -220,6 +262,18 @@ async fn run_with_context(config: AppConfig, config_path: Option<PathBuf>) -> Re
                             .as_deref()
                             .unwrap_or("/feishu/events"),
                     ),
+                    card_callback_path: normalize_event_path(
+                        config
+                            .feishu
+                            .card_callback_path
+                            .as_deref()
+                            .unwrap_or("/feishu/card"),
+                    ),
+                    mode: config
+                        .feishu
+                        .mode
+                        .clone()
+                        .unwrap_or_else(|| "webhook".into()),
                     admin_user_id: config.policy.admin_user_id,
                     admin_chat_id: config.policy.admin_chat_id,
                 },
@@ -382,6 +436,7 @@ fn bootstrap_provider_if_configured(store: &Store, config: &AppConfig) -> Result
                 base_url,
                 api_key,
                 model,
+                fallback_models: vec![],
                 enabled: true,
                 extra_headers: vec![],
                 created_at: Utc::now(),
@@ -604,13 +659,16 @@ async fn interactive_onboard(config_path: PathBuf) -> Result<()> {
     ensure_path_list_contains(&mut config.policy.writable_workdirs, &persona_dir);
     config.persona.directory = Some(persona_dir.clone());
 
+    print_brand_banner();
     println!("hajimi onboard");
     println!("config path: {}", config_path.display());
     println!("persona dir: {}", persona_dir.display());
 
     println!();
-    config.channel.kind =
-        prompt_default("Primary channel (telegram/feishu)", &config.channel.kind)?;
+    config.channel.kind = prompt_default(
+        "Primary channel (telegram/feishu/skip)",
+        &config.channel.kind,
+    )?;
     match config.channel.kind.trim().to_ascii_lowercase().as_str() {
         "telegram" => {
             config.channel.kind = "telegram".into();
@@ -663,6 +721,10 @@ async fn interactive_onboard(config_path: PathBuf) -> Result<()> {
             if config.feishu.app_secret.trim().is_empty() {
                 config.feishu.app_secret = prompt("Feishu app_secret")?;
             }
+            config.feishu.mode = Some(prompt_default(
+                "Feishu mode (webhook/long-connection)",
+                config.feishu.mode.as_deref().unwrap_or("webhook"),
+            )?);
             config.feishu.listen_addr = Some(prompt_default(
                 "Feishu listen address",
                 config
@@ -678,6 +740,14 @@ async fn interactive_onboard(config_path: PathBuf) -> Result<()> {
                     .event_path
                     .as_deref()
                     .unwrap_or("/feishu/events"),
+            )?));
+            config.feishu.card_callback_path = Some(normalize_event_path(&prompt_default(
+                "Feishu card callback path",
+                config
+                    .feishu
+                    .card_callback_path
+                    .as_deref()
+                    .unwrap_or("/feishu/card"),
             )?));
             let token_info =
                 verify_feishu_app(&config.feishu.app_id, &config.feishu.app_secret).await?;
@@ -699,7 +769,8 @@ async fn interactive_onboard(config_path: PathBuf) -> Result<()> {
                 .map(stable_channel_hash)
                 .unwrap_or(0);
             println!(
-                "Feishu webhook ready on {}{}",
+                "Feishu {} ready on {}{}",
+                config.feishu.mode.as_deref().unwrap_or("webhook"),
                 config
                     .feishu
                     .listen_addr
@@ -711,8 +782,22 @@ async fn interactive_onboard(config_path: PathBuf) -> Result<()> {
                     .as_deref()
                     .unwrap_or("/feishu/events")
             );
+            println!(
+                "Feishu card callback path: {}",
+                config
+                    .feishu
+                    .card_callback_path
+                    .as_deref()
+                    .unwrap_or("/feishu/card")
+            );
         }
-        other => anyhow::bail!("channel must be `telegram` or `feishu`, got `{other}`"),
+        "skip" | "none" => {
+            config.channel.kind = "none".into();
+            println!("channel setup skipped for now");
+        }
+        other => {
+            anyhow::bail!("channel must be `telegram`, `feishu`, or `skip`, got `{other}`")
+        }
     }
 
     let master_key_file = config
@@ -760,11 +845,15 @@ async fn interactive_onboard(config_path: PathBuf) -> Result<()> {
         base_url: base_url.clone(),
         api_key: api_key.clone(),
         model: String::new(),
+        fallback_models: vec![],
         enabled: true,
         extra_headers: vec![],
         created_at: Utc::now(),
     })
     .await?;
+    let fallback_models = prompt_optional("Fallback model ids (comma-separated, optional)")?
+        .map(|raw| parse_csv_items(&raw))
+        .unwrap_or_default();
 
     let record = ProviderRecord {
         config: ProviderConfig {
@@ -774,6 +863,7 @@ async fn interactive_onboard(config_path: PathBuf) -> Result<()> {
             base_url,
             api_key,
             model,
+            fallback_models,
             enabled: true,
             extra_headers: vec![],
             created_at: Utc::now(),
@@ -789,6 +879,12 @@ async fn interactive_onboard(config_path: PathBuf) -> Result<()> {
         record.config.label, record.config.id
     );
     println!("Health: {}", health.message);
+    if !record.config.fallback_models.is_empty() {
+        println!(
+            "Fallback models: {}",
+            record.config.fallback_models.join(", ")
+        );
+    }
     println!("Config saved to {}", config_path.display());
     println!("Master key file: {}", master_key_file.display());
     println!("Persona files ready in {}", persona_dir.display());
@@ -1187,6 +1283,8 @@ fn default_app_config(config_path: &Path) -> AppConfig {
             app_secret: String::new(),
             listen_addr: Some("0.0.0.0:8787".into()),
             event_path: Some("/feishu/events".into()),
+            card_callback_path: Some("/feishu/card".into()),
+            mode: Some("webhook".into()),
         },
         llm: LlmSection {
             base_url: None,
@@ -1215,6 +1313,7 @@ fn default_app_config(config_path: &Path) -> AppConfig {
         execution: ExecutionSection {
             mode: Some("auto".into()),
         },
+        multi_agent: MultiAgentSection::default(),
         persona: PersonaSection {
             directory: Some(default_persona_dir()),
             prompt_files: vec![],
@@ -1305,6 +1404,14 @@ fn prompt_optional(label: &str) -> Result<Option<String>> {
     } else {
         Ok(Some(trimmed))
     }
+}
+
+fn parse_csv_items(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }
 
 async fn prompt_provider_model(provider: &ProviderConfig) -> Result<String> {
@@ -1559,7 +1666,18 @@ fn slugify(value: &str) -> String {
     }
 }
 
+fn print_brand_banner() {
+    println!(r"  /\_/\\      hajimi");
+    println!(r" ( o.o )     cat x ferris");
+    println!(r"  > ^ <   _  _");
+    println!(r"         ( \/ )");
+    println!(r"          \  /");
+    println!("         /_/\\\\_\\\\");
+    println!();
+}
+
 fn print_help() {
+    print_brand_banner();
     println!("{}", help_text());
 }
 
@@ -1570,11 +1688,12 @@ fn help_text() -> &'static str {
   hajimi launch          Launch the daemon in background
   hajimi stop            Stop the background daemon
   hajimi status          Show background daemon status
-  hajimi onboard         Interactive local onboarding
+  hajimi onboard         Interactive local onboarding (telegram/feishu/skip)
   hajimi providers       List configured providers
   hajimi provider ...    Manage providers
   hajimi model ...       Manage the active model
   hajimi models [id]     List models for the default or named provider
+  hajimi launch          Start the configured channel and multi-agent runtime in background
   hajimi restart         Restart the installed service
   hajimi help            Show this help"
 }
@@ -1723,6 +1842,7 @@ mod tests {
             },
             policy: hajimi_claw_policy::PolicyConfig::default(),
             execution: super::ExecutionSection { mode: None },
+            multi_agent: super::MultiAgentSection::default(),
             persona: super::PersonaSection::default(),
         };
 

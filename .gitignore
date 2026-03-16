@@ -29,4 +29,6 @@ desktop.ini
 # Node packaging artifacts
 node_modules/
 npm-dist/
+npm/platforms/*/bin/hajimi-claw
+npm/platforms/*/bin/hajimi-claw.exe
 *.tgz

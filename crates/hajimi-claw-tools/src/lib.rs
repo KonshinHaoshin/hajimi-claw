@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use hajimi_claw_policy::PolicyEngine;
@@ -9,9 +10,16 @@ use hajimi_claw_types::{
     ToolOutput, ToolSpec,
 };
 use regex::Regex;
+use reqwest::Method;
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, RootCertStore};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::fs;
+use tokio::net::{TcpStream, lookup_host};
+use tokio::time::{Duration, timeout};
+use tokio_rustls::TlsConnector;
+use url::Url;
 
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
@@ -34,12 +42,19 @@ impl ToolRegistry {
             Arc::new(GrepTextTool::new(policy.clone())),
             Arc::new(WriteFileTool::new(policy.clone())),
             Arc::new(AppendFileTool::new(policy.clone())),
+            Arc::new(HttpProbeTool::new()),
+            Arc::new(CurlRequestTool::new()),
+            Arc::new(DnsLookupTool::new()),
+            Arc::new(PortCheckTool::new()),
+            Arc::new(TlsCheckTool::new()),
             Arc::new(SystemdStatusTool::new(executor.clone())),
             Arc::new(SystemdRestartTool::new(executor.clone())),
             Arc::new(DockerPsTool::new(executor.clone())),
             Arc::new(DockerLogsTool::new(executor.clone())),
             Arc::new(DockerRestartTool::new(executor.clone())),
             Arc::new(RunCommandTool::new(executor.clone())),
+            Arc::new(ExecOnceTool::new(executor.clone())),
+            Arc::new(PingHostTool::new(executor.clone())),
             Arc::new(SessionOpenTool::new(executor.clone())),
             Arc::new(SessionExecTool::new(executor.clone())),
             Arc::new(SessionCloseTool::new(executor)),
@@ -59,6 +74,135 @@ impl ToolRegistry {
     }
 }
 
+fn object_schema(properties: Vec<(&str, Value)>, required: &[&str]) -> Value {
+    let mut map = serde_json::Map::new();
+    for (name, schema) in properties {
+        map.insert(name.to_string(), schema);
+    }
+    json!({
+        "type": "object",
+        "properties": map,
+        "required": required,
+        "additionalProperties": false,
+    })
+}
+
+fn string_schema(description: &str) -> Value {
+    json!({
+        "type": "string",
+        "description": description,
+    })
+}
+
+fn integer_schema(description: &str, minimum: Option<u64>) -> Value {
+    let mut schema = json!({
+        "type": "integer",
+        "description": description,
+    });
+    if let Some(minimum) = minimum {
+        schema["minimum"] = json!(minimum);
+    }
+    schema
+}
+
+fn bool_schema(description: &str) -> Value {
+    json!({
+        "type": "boolean",
+        "description": description,
+    })
+}
+
+fn string_array_schema(description: &str) -> Value {
+    json!({
+        "type": "array",
+        "description": description,
+        "items": {
+            "type": "string",
+        },
+    })
+}
+
+fn string_map_schema(description: &str) -> Value {
+    json!({
+        "type": "object",
+        "description": description,
+        "additionalProperties": {
+            "type": "string",
+        },
+    })
+}
+
+#[derive(Debug, Clone)]
+struct HttpRequestOptions {
+    url: String,
+    method: Method,
+    headers: HashMap<String, String>,
+    body: Option<String>,
+    max_body_bytes: usize,
+    follow_redirects: bool,
+}
+
+async fn perform_http_request(input: HttpRequestOptions) -> ClawResult<ToolOutput> {
+    let client = reqwest::Client::builder()
+        .redirect(if input.follow_redirects {
+            reqwest::redirect::Policy::limited(5)
+        } else {
+            reqwest::redirect::Policy::none()
+        })
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|err| ClawError::Backend(err.to_string()))?;
+    let mut request = client.request(input.method.clone(), &input.url);
+    for (key, value) in input.headers {
+        request = request.header(&key, value);
+    }
+    if let Some(body) = input.body {
+        request = request.body(body);
+    }
+
+    let started = Instant::now();
+    let response = request
+        .send()
+        .await
+        .map_err(|err| ClawError::Backend(err.to_string()))?;
+    let elapsed_ms = started.elapsed().as_millis();
+    let status = response.status();
+    let final_url = response.url().to_string();
+    let headers = response
+        .headers()
+        .iter()
+        .map(|(key, value)| {
+            (
+                key.to_string(),
+                value.to_str().unwrap_or("<non-utf8>").to_string(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let body = response
+        .text()
+        .await
+        .map_err(|err| ClawError::Backend(err.to_string()))?;
+    let body_sample = truncate_string(body, input.max_body_bytes);
+
+    Ok(ToolOutput {
+        content: format!(
+            "status={}\nfinal_url={}\nduration_ms={}\nbody:\n{}",
+            status.as_u16(),
+            final_url,
+            elapsed_ms,
+            body_sample
+        ),
+        structured: Some(json!({
+            "status": status.as_u16(),
+            "final_url": final_url,
+            "duration_ms": elapsed_ms,
+            "headers": headers,
+            "body_sample": body_sample,
+            "method": input.method.as_str(),
+        })),
+    })
+}
+
 struct ReadFileTool {
     policy: Arc<PolicyEngine>,
 }
@@ -76,6 +220,16 @@ impl Tool for ReadFileTool {
             name: "read_file".into(),
             description: "Read a text file from an allowed directory.".into(),
             requires_approval: false,
+            input_schema: object_schema(
+                vec![
+                    ("path", string_schema("Path to the file to read.")),
+                    (
+                        "max_bytes",
+                        integer_schema("Maximum number of bytes to return.", Some(1)),
+                    ),
+                ],
+                &["path"],
+            ),
         }
     }
 
@@ -117,6 +271,16 @@ impl Tool for TailFileTool {
             name: "tail_file".into(),
             description: "Read the tail of a text file.".into(),
             requires_approval: false,
+            input_schema: object_schema(
+                vec![
+                    ("path", string_schema("Path to the file to tail.")),
+                    (
+                        "lines",
+                        integer_schema("Number of lines to return.", Some(1)),
+                    ),
+                ],
+                &["path"],
+            ),
         }
     }
 
@@ -166,6 +330,10 @@ impl Tool for ListDirTool {
             name: "list_dir".into(),
             description: "List files and folders in an allowed directory.".into(),
             requires_approval: false,
+            input_schema: object_schema(
+                vec![("path", string_schema("Directory path to list."))],
+                &["path"],
+            ),
         }
     }
 
@@ -232,6 +400,13 @@ impl Tool for WriteFileTool {
                 "Write text to a file in a writable allowed directory, replacing existing content."
                     .into(),
             requires_approval: false,
+            input_schema: object_schema(
+                vec![
+                    ("path", string_schema("Path to write.")),
+                    ("content", string_schema("Full replacement content.")),
+                ],
+                &["path", "content"],
+            ),
         }
     }
 
@@ -276,6 +451,13 @@ impl Tool for AppendFileTool {
             name: "append_file".into(),
             description: "Append text to a file in a writable allowed directory.".into(),
             requires_approval: false,
+            input_schema: object_schema(
+                vec![
+                    ("path", string_schema("Path to append to.")),
+                    ("content", string_schema("Text to append.")),
+                ],
+                &["path", "content"],
+            ),
         }
     }
 
@@ -317,6 +499,13 @@ impl Tool for GrepTextTool {
             name: "grep_text".into(),
             description: "Search a text file with a regex pattern.".into(),
             requires_approval: false,
+            input_schema: object_schema(
+                vec![
+                    ("path", string_schema("Path to the file to search.")),
+                    ("pattern", string_schema("Regex pattern to search for.")),
+                ],
+                &["path", "pattern"],
+            ),
         }
     }
 
@@ -351,6 +540,410 @@ impl Tool for GrepTextTool {
     }
 }
 
+struct HttpProbeTool;
+
+impl HttpProbeTool {
+    fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl Tool for HttpProbeTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "http_probe".into(),
+            description: "Make an HTTP request and return status, timing, and a short body sample."
+                .into(),
+            requires_approval: false,
+            input_schema: object_schema(
+                vec![
+                    ("url", string_schema("Absolute HTTP or HTTPS URL to probe.")),
+                    ("method", string_schema("HTTP method, default GET.")),
+                    ("headers", string_map_schema("Optional HTTP headers.")),
+                    (
+                        "body",
+                        string_schema("Optional request body for POST-like methods."),
+                    ),
+                    (
+                        "follow_redirects",
+                        bool_schema("Whether to follow up to 5 redirects. Default true."),
+                    ),
+                    (
+                        "max_body_bytes",
+                        integer_schema(
+                            "Maximum body bytes to include in the response sample.",
+                            Some(1),
+                        ),
+                    ),
+                ],
+                &["url"],
+            ),
+        }
+    }
+
+    async fn call(&self, _ctx: ToolContext, input: Value) -> ClawResult<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Input {
+            url: String,
+            method: Option<String>,
+            headers: Option<HashMap<String, String>>,
+            body: Option<String>,
+            follow_redirects: Option<bool>,
+            max_body_bytes: Option<usize>,
+        }
+
+        let input: Input = serde_json::from_value(input)
+            .map_err(|err| ClawError::InvalidRequest(err.to_string()))?;
+        let method = input
+            .method
+            .as_deref()
+            .unwrap_or("GET")
+            .parse::<Method>()
+            .map_err(|err| ClawError::InvalidRequest(err.to_string()))?;
+        perform_http_request(HttpRequestOptions {
+            url: input.url,
+            method,
+            headers: input.headers.unwrap_or_default(),
+            body: input.body,
+            max_body_bytes: input.max_body_bytes.unwrap_or(2048),
+            follow_redirects: input.follow_redirects.unwrap_or(true),
+        })
+        .await
+    }
+}
+
+struct CurlRequestTool;
+
+impl CurlRequestTool {
+    fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl Tool for CurlRequestTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "curl_request".into(),
+            description:
+                "Send an HTTP request similar to curl, including headers, redirects, and body."
+                    .into(),
+            requires_approval: false,
+            input_schema: object_schema(
+                vec![
+                    (
+                        "url",
+                        string_schema("Absolute HTTP or HTTPS URL to request."),
+                    ),
+                    ("method", string_schema("HTTP method, default GET.")),
+                    ("headers", string_map_schema("Optional request headers.")),
+                    ("body", string_schema("Optional request body.")),
+                    (
+                        "follow_redirects",
+                        bool_schema("Whether to follow redirects. Default true."),
+                    ),
+                    (
+                        "max_body_bytes",
+                        integer_schema(
+                            "Maximum body bytes to include in the response sample.",
+                            Some(1),
+                        ),
+                    ),
+                ],
+                &["url"],
+            ),
+        }
+    }
+
+    async fn call(&self, _ctx: ToolContext, input: Value) -> ClawResult<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Input {
+            url: String,
+            method: Option<String>,
+            headers: Option<HashMap<String, String>>,
+            body: Option<String>,
+            follow_redirects: Option<bool>,
+            max_body_bytes: Option<usize>,
+        }
+
+        let input: Input = serde_json::from_value(input)
+            .map_err(|err| ClawError::InvalidRequest(err.to_string()))?;
+        let method = input
+            .method
+            .as_deref()
+            .unwrap_or("GET")
+            .parse::<Method>()
+            .map_err(|err| ClawError::InvalidRequest(err.to_string()))?;
+        perform_http_request(HttpRequestOptions {
+            url: input.url,
+            method,
+            headers: input.headers.unwrap_or_default(),
+            body: input.body,
+            max_body_bytes: input.max_body_bytes.unwrap_or(4096),
+            follow_redirects: input.follow_redirects.unwrap_or(true),
+        })
+        .await
+    }
+}
+
+struct DnsLookupTool;
+
+impl DnsLookupTool {
+    fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl Tool for DnsLookupTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "dns_lookup".into(),
+            description: "Resolve a hostname to IP addresses using the local resolver.".into(),
+            requires_approval: false,
+            input_schema: object_schema(
+                vec![
+                    ("host", string_schema("Hostname to resolve.")),
+                    (
+                        "port",
+                        integer_schema("Port to pair with the lookup, default 0.", Some(0)),
+                    ),
+                ],
+                &["host"],
+            ),
+        }
+    }
+
+    async fn call(&self, _ctx: ToolContext, input: Value) -> ClawResult<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Input {
+            host: String,
+            port: Option<u16>,
+        }
+
+        let input: Input = serde_json::from_value(input)
+            .map_err(|err| ClawError::InvalidRequest(err.to_string()))?;
+        let addresses = lookup_host((input.host.as_str(), input.port.unwrap_or(0)))
+            .await
+            .map_err(|err| ClawError::Backend(err.to_string()))?
+            .map(|addr| addr.ip().to_string())
+            .collect::<Vec<_>>();
+
+        let mut unique = Vec::new();
+        for address in addresses {
+            if !unique.iter().any(|item| item == &address) {
+                unique.push(address);
+            }
+        }
+
+        Ok(ToolOutput {
+            content: if unique.is_empty() {
+                format!("no addresses resolved for {}", input.host)
+            } else {
+                unique.join("\n")
+            },
+            structured: Some(json!({
+                "host": input.host,
+                "addresses": unique,
+            })),
+        })
+    }
+}
+
+struct PortCheckTool;
+
+impl PortCheckTool {
+    fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl Tool for PortCheckTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "port_check".into(),
+            description: "Check whether a TCP port is reachable from this host.".into(),
+            requires_approval: false,
+            input_schema: object_schema(
+                vec![
+                    ("host", string_schema("Target hostname or IP.")),
+                    ("port", integer_schema("TCP port to check.", Some(1))),
+                    (
+                        "timeout_secs",
+                        integer_schema("Connection timeout in seconds.", Some(1)),
+                    ),
+                ],
+                &["host", "port"],
+            ),
+        }
+    }
+
+    async fn call(&self, _ctx: ToolContext, input: Value) -> ClawResult<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Input {
+            host: String,
+            port: u16,
+            timeout_secs: Option<u64>,
+        }
+
+        let input: Input = serde_json::from_value(input)
+            .map_err(|err| ClawError::InvalidRequest(err.to_string()))?;
+        let timeout_secs = input.timeout_secs.unwrap_or(5).max(1);
+        let address = format!("{}:{}", input.host, input.port);
+        let started = Instant::now();
+        let result = timeout(
+            Duration::from_secs(timeout_secs),
+            TcpStream::connect(&address),
+        )
+        .await;
+
+        let (open, message) = match result {
+            Ok(Ok(_stream)) => (true, "connected".to_string()),
+            Ok(Err(err)) => (false, err.to_string()),
+            Err(_) => (false, format!("timed out after {timeout_secs}s")),
+        };
+
+        Ok(ToolOutput {
+            content: format!(
+                "host={}\nport={}\nopen={}\nduration_ms={}\nmessage={}",
+                input.host,
+                input.port,
+                open,
+                started.elapsed().as_millis(),
+                message
+            ),
+            structured: Some(json!({
+                "host": input.host,
+                "port": input.port,
+                "open": open,
+                "duration_ms": started.elapsed().as_millis(),
+                "message": message,
+            })),
+        })
+    }
+}
+
+struct TlsCheckTool;
+
+impl TlsCheckTool {
+    fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl Tool for TlsCheckTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "tls_check".into(),
+            description: "Open a TLS connection and report negotiated protocol details.".into(),
+            requires_approval: false,
+            input_schema: object_schema(
+                vec![
+                    ("url", string_schema("HTTPS URL to inspect.")),
+                    ("host", string_schema("Optional hostname override.")),
+                    (
+                        "port",
+                        integer_schema("Optional TCP port override.", Some(1)),
+                    ),
+                    (
+                        "timeout_secs",
+                        integer_schema("Connection timeout in seconds.", Some(1)),
+                    ),
+                ],
+                &["url"],
+            ),
+        }
+    }
+
+    async fn call(&self, _ctx: ToolContext, input: Value) -> ClawResult<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Input {
+            url: String,
+            host: Option<String>,
+            port: Option<u16>,
+            timeout_secs: Option<u64>,
+        }
+
+        let input: Input = serde_json::from_value(input)
+            .map_err(|err| ClawError::InvalidRequest(err.to_string()))?;
+        let parsed = Url::parse(&input.url)
+            .map_err(|err| ClawError::InvalidRequest(format!("invalid url: {err}")))?;
+        let host = input
+            .host
+            .or_else(|| parsed.host_str().map(ToString::to_string))
+            .ok_or_else(|| ClawError::InvalidRequest("url does not contain a hostname".into()))?;
+        let port = input.port.or_else(|| parsed.port()).unwrap_or(443);
+        let timeout_secs = input.timeout_secs.unwrap_or(10).max(1);
+
+        let mut roots = RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(config));
+        let server_name = ServerName::try_from(host.clone())
+            .map_err(|_| ClawError::InvalidRequest(format!("invalid tls server name: {host}")))?;
+
+        let started = Instant::now();
+        let tcp = timeout(
+            Duration::from_secs(timeout_secs),
+            TcpStream::connect((host.as_str(), port)),
+        )
+        .await
+        .map_err(|_| ClawError::Backend(format!("tcp connect timed out after {timeout_secs}s")))?
+        .map_err(|err| ClawError::Backend(err.to_string()))?;
+        let tls = timeout(
+            Duration::from_secs(timeout_secs),
+            connector.connect(server_name, tcp),
+        )
+        .await
+        .map_err(|_| ClawError::Backend(format!("tls handshake timed out after {timeout_secs}s")))?
+        .map_err(|err| ClawError::Backend(err.to_string()))?;
+        let elapsed_ms = started.elapsed().as_millis();
+        let (_, session) = tls.get_ref();
+        let protocol = session
+            .protocol_version()
+            .map(|value| format!("{value:?}"))
+            .unwrap_or_else(|| "unknown".into());
+        let alpn = session
+            .alpn_protocol()
+            .map(|value| String::from_utf8_lossy(value).to_string());
+        let certificate_count = session
+            .peer_certificates()
+            .map(|certs| certs.len())
+            .unwrap_or_default();
+        let cipher_suite = session
+            .negotiated_cipher_suite()
+            .map(|suite| format!("{:?}", suite.suite()))
+            .unwrap_or_else(|| "unknown".into());
+
+        Ok(ToolOutput {
+            content: format!(
+                "host={}\nport={}\nprotocol={}\ncipher_suite={}\nalpn={}\npeer_certificates={}\nduration_ms={}",
+                host,
+                port,
+                protocol,
+                cipher_suite,
+                alpn.clone().unwrap_or_else(|| "none".into()),
+                certificate_count,
+                elapsed_ms
+            ),
+            structured: Some(json!({
+                "host": host,
+                "port": port,
+                "protocol": protocol,
+                "cipher_suite": cipher_suite,
+                "alpn": alpn,
+                "peer_certificates": certificate_count,
+                "duration_ms": elapsed_ms,
+            })),
+        })
+    }
+}
+
 struct SystemdStatusTool {
     executor: Arc<dyn Executor>,
 }
@@ -368,6 +961,10 @@ impl Tool for SystemdStatusTool {
             name: "systemd_status".into(),
             description: "Inspect a systemd service status.".into(),
             requires_approval: false,
+            input_schema: object_schema(
+                vec![("service", string_schema("Systemd service name."))],
+                &["service"],
+            ),
         }
     }
 
@@ -411,6 +1008,10 @@ impl Tool for SystemdRestartTool {
             name: "systemd_restart".into(),
             description: "Restart a systemd service.".into(),
             requires_approval: true,
+            input_schema: object_schema(
+                vec![("service", string_schema("Systemd service name."))],
+                &["service"],
+            ),
         }
     }
 
@@ -454,6 +1055,7 @@ impl Tool for DockerPsTool {
             name: "docker_ps".into(),
             description: "List running containers.".into(),
             requires_approval: false,
+            input_schema: object_schema(vec![], &[]),
         }
     }
 
@@ -491,6 +1093,16 @@ impl Tool for DockerLogsTool {
             name: "docker_logs".into(),
             description: "Fetch recent logs from a container.".into(),
             requires_approval: false,
+            input_schema: object_schema(
+                vec![
+                    ("container", string_schema("Container name or ID.")),
+                    (
+                        "tail",
+                        integer_schema("How many recent lines to fetch.", Some(1)),
+                    ),
+                ],
+                &["container"],
+            ),
         }
     }
 
@@ -540,6 +1152,10 @@ impl Tool for DockerRestartTool {
             name: "docker_restart".into(),
             description: "Restart a Docker container.".into(),
             requires_approval: true,
+            input_schema: object_schema(
+                vec![("container", string_schema("Container name or ID."))],
+                &["container"],
+            ),
         }
     }
 
@@ -583,6 +1199,14 @@ impl Tool for RunCommandTool {
             name: "run_command".into(),
             description: "Run a guarded command once.".into(),
             requires_approval: true,
+            input_schema: object_schema(
+                vec![
+                    ("command", string_schema("Executable name or path.")),
+                    ("args", string_array_schema("Command arguments.")),
+                    ("cwd", string_schema("Working directory override.")),
+                ],
+                &["command"],
+            ),
         }
     }
 
@@ -611,6 +1235,155 @@ impl Tool for RunCommandTool {
     }
 }
 
+struct ExecOnceTool {
+    executor: Arc<dyn Executor>,
+}
+
+impl ExecOnceTool {
+    fn new(executor: Arc<dyn Executor>) -> Self {
+        Self { executor }
+    }
+}
+
+#[async_trait]
+impl Tool for ExecOnceTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "exec_once".into(),
+            description: "Run one guarded terminal command with explicit argv.".into(),
+            requires_approval: true,
+            input_schema: object_schema(
+                vec![
+                    ("command", string_schema("Executable name or path.")),
+                    ("args", string_array_schema("Explicit argument vector.")),
+                    ("cwd", string_schema("Working directory override.")),
+                    (
+                        "timeout_secs",
+                        integer_schema("Execution timeout in seconds.", Some(1)),
+                    ),
+                    (
+                        "max_output_bytes",
+                        integer_schema("Maximum stdout/stderr bytes to retain.", Some(256)),
+                    ),
+                    (
+                        "requires_tty",
+                        bool_schema("Whether the command requires a TTY-like environment."),
+                    ),
+                ],
+                &["command"],
+            ),
+        }
+    }
+
+    async fn call(&self, ctx: ToolContext, input: Value) -> ClawResult<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Input {
+            command: String,
+            args: Option<Vec<String>>,
+            cwd: Option<PathBuf>,
+            timeout_secs: Option<u64>,
+            max_output_bytes: Option<usize>,
+            requires_tty: Option<bool>,
+        }
+
+        let input: Input = serde_json::from_value(input)
+            .map_err(|err| ClawError::InvalidRequest(err.to_string()))?;
+        let result = self
+            .executor
+            .run_once(ExecRequest {
+                command: input.command,
+                args: input.args.unwrap_or_default(),
+                cwd: input.cwd.or(ctx.working_directory),
+                env_allowlist: vec![],
+                timeout_secs: input.timeout_secs.unwrap_or(60).max(1),
+                max_output_bytes: input.max_output_bytes.unwrap_or(24 * 1024).max(256),
+                requires_tty: input.requires_tty.unwrap_or(false),
+            })
+            .await?;
+        Ok(command_output(result))
+    }
+}
+
+struct PingHostTool {
+    executor: Arc<dyn Executor>,
+}
+
+impl PingHostTool {
+    fn new(executor: Arc<dyn Executor>) -> Self {
+        Self { executor }
+    }
+}
+
+#[async_trait]
+impl Tool for PingHostTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "ping_host".into(),
+            description: "Ping a host using the local system ping command.".into(),
+            requires_approval: false,
+            input_schema: object_schema(
+                vec![
+                    ("host", string_schema("Hostname or IP address to ping.")),
+                    (
+                        "count",
+                        integer_schema("Number of echo requests to send.", Some(1)),
+                    ),
+                    (
+                        "timeout_secs",
+                        integer_schema("Timeout in seconds for each attempt.", Some(1)),
+                    ),
+                ],
+                &["host"],
+            ),
+        }
+    }
+
+    async fn call(&self, ctx: ToolContext, input: Value) -> ClawResult<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Input {
+            host: String,
+            count: Option<u32>,
+            timeout_secs: Option<u64>,
+        }
+
+        let input: Input = serde_json::from_value(input)
+            .map_err(|err| ClawError::InvalidRequest(err.to_string()))?;
+        let count = input.count.unwrap_or(4).max(1);
+        let timeout_secs = input.timeout_secs.unwrap_or(5).max(1);
+        let args = if cfg!(windows) {
+            vec![
+                "-n".into(),
+                count.to_string(),
+                "-w".into(),
+                (timeout_secs * 1000).to_string(),
+                input.host,
+            ]
+        } else {
+            vec![
+                "-n".into(),
+                "-c".into(),
+                count.to_string(),
+                "-W".into(),
+                timeout_secs.to_string(),
+                input.host,
+            ]
+        };
+        let result = self
+            .executor
+            .run_once(ExecRequest {
+                command: "ping".into(),
+                args,
+                cwd: ctx.working_directory,
+                env_allowlist: vec![],
+                timeout_secs: (timeout_secs * count as u64).max(timeout_secs),
+                max_output_bytes: 16 * 1024,
+                requires_tty: false,
+            })
+            .await?;
+        Ok(command_output(result))
+    }
+}
+
 struct SessionOpenTool {
     executor: Arc<dyn Executor>,
 }
@@ -628,6 +1401,13 @@ impl Tool for SessionOpenTool {
             name: "session_open".into(),
             description: "Open a persistent shell session.".into(),
             requires_approval: false,
+            input_schema: object_schema(
+                vec![
+                    ("name", string_schema("Optional session name.")),
+                    ("cwd", string_schema("Optional working directory.")),
+                ],
+                &[],
+            ),
         }
     }
 
@@ -675,6 +1455,16 @@ impl Tool for SessionExecTool {
             name: "session_exec".into(),
             description: "Run a command in an existing session.".into(),
             requires_approval: true,
+            input_schema: object_schema(
+                vec![
+                    ("session_id", string_schema("Session identifier.")),
+                    (
+                        "command",
+                        string_schema("Shell command to execute in the session."),
+                    ),
+                ],
+                &["session_id", "command"],
+            ),
         }
     }
 
@@ -727,6 +1517,10 @@ impl Tool for SessionCloseTool {
             name: "session_close".into(),
             description: "Close a shell session.".into(),
             requires_approval: false,
+            input_schema: object_schema(
+                vec![("session_id", string_schema("Session identifier."))],
+                &["session_id"],
+            ),
         }
     }
 
@@ -831,9 +1625,15 @@ mod tests {
     use anyhow::Result;
     use hajimi_claw_exec::{LocalExecutor, PlatformMode};
     use hajimi_claw_policy::{PolicyConfig, PolicyEngine};
-    use hajimi_claw_types::{ConversationId, ToolContext};
+    use hajimi_claw_types::{
+        ClawError, ConversationId, ExecRequest, ExecResult, Executor, SessionHandle, SessionId,
+        SessionOpenRequest, ToolContext,
+    };
     use serde_json::json;
     use tempfile::tempdir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::Mutex;
 
     use super::ToolRegistry;
 
@@ -864,6 +1664,235 @@ mod tests {
             )
             .await?;
         assert_eq!(output.content, "hello");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_probe_returns_status_and_body() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer).await.expect("read request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Type: text/plain\r\n\r\nhello",
+                )
+                .await
+                .expect("write response");
+        });
+
+        let policy = Arc::new(PolicyEngine::new(PolicyConfig::default()));
+        let executor = Arc::new(LocalExecutor::new(
+            policy.clone(),
+            PlatformMode::WindowsSafe,
+        ));
+        let tools = ToolRegistry::default(executor, policy);
+        let output = tools
+            .call(
+                "http_probe",
+                ToolContext {
+                    conversation_id: ConversationId::new(),
+                    working_directory: None,
+                    elevated: false,
+                },
+                json!({ "url": format!("http://{addr}/") }),
+            )
+            .await?;
+
+        server.await?;
+        assert!(output.content.contains("status=200"));
+        assert!(output.content.contains("hello"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn port_check_reports_open_listener() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let accept_task = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        let policy = Arc::new(PolicyEngine::new(PolicyConfig::default()));
+        let executor = Arc::new(LocalExecutor::new(
+            policy.clone(),
+            PlatformMode::WindowsSafe,
+        ));
+        let tools = ToolRegistry::default(executor, policy);
+        let output = tools
+            .call(
+                "port_check",
+                ToolContext {
+                    conversation_id: ConversationId::new(),
+                    working_directory: None,
+                    elevated: false,
+                },
+                json!({ "host": "127.0.0.1", "port": addr.port() }),
+            )
+            .await?;
+
+        accept_task.await?;
+        assert!(output.content.contains("open=true"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dns_lookup_resolves_localhost() -> Result<()> {
+        let policy = Arc::new(PolicyEngine::new(PolicyConfig::default()));
+        let executor = Arc::new(LocalExecutor::new(
+            policy.clone(),
+            PlatformMode::WindowsSafe,
+        ));
+        let tools = ToolRegistry::default(executor, policy);
+        let output = tools
+            .call(
+                "dns_lookup",
+                ToolContext {
+                    conversation_id: ConversationId::new(),
+                    working_directory: None,
+                    elevated: false,
+                },
+                json!({ "host": "localhost" }),
+            )
+            .await?;
+
+        assert!(
+            output.content.contains("127.0.0.1") || output.content.contains("::1"),
+            "unexpected dns output: {}",
+            output.content
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn curl_request_returns_response_body() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer).await.expect("read request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 201 Created\r\nContent-Length: 7\r\nContent-Type: text/plain\r\n\r\ncreated",
+                )
+                .await
+                .expect("write response");
+        });
+
+        let policy = Arc::new(PolicyEngine::new(PolicyConfig::default()));
+        let executor = Arc::new(LocalExecutor::new(
+            policy.clone(),
+            PlatformMode::WindowsSafe,
+        ));
+        let tools = ToolRegistry::default(executor, policy);
+        let output = tools
+            .call(
+                "curl_request",
+                ToolContext {
+                    conversation_id: ConversationId::new(),
+                    working_directory: None,
+                    elevated: false,
+                },
+                json!({ "url": format!("http://{addr}/"), "method": "POST", "body": "demo" }),
+            )
+            .await?;
+
+        server.await?;
+        assert!(output.content.contains("status=201"));
+        assert!(output.content.contains("created"));
+        Ok(())
+    }
+
+    struct FakeExecutor {
+        last_request: Mutex<Option<ExecRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Executor for FakeExecutor {
+        async fn run_once(&self, req: ExecRequest) -> Result<ExecResult, ClawError> {
+            *self.last_request.lock().await = Some(req);
+            Ok(ExecResult {
+                exit_code: Some(0),
+                stdout: "pong".into(),
+                stderr: String::new(),
+                duration_ms: 5,
+                truncated: false,
+            })
+        }
+
+        async fn open_session(&self, _req: SessionOpenRequest) -> Result<SessionHandle, ClawError> {
+            Err(ClawError::Backend("not used".into()))
+        }
+
+        async fn run_in_session(
+            &self,
+            _id: SessionId,
+            _req: ExecRequest,
+        ) -> Result<ExecResult, ClawError> {
+            Err(ClawError::Backend("not used".into()))
+        }
+
+        async fn close_session(&self, _id: SessionId) -> Result<(), ClawError> {
+            Err(ClawError::Backend("not used".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn ping_host_builds_ping_command() -> Result<()> {
+        let executor = Arc::new(FakeExecutor {
+            last_request: Mutex::new(None),
+        });
+        let policy = Arc::new(PolicyEngine::new(PolicyConfig::default()));
+        let tools = ToolRegistry::default(executor.clone(), policy);
+        let output = tools
+            .call(
+                "ping_host",
+                ToolContext {
+                    conversation_id: ConversationId::new(),
+                    working_directory: None,
+                    elevated: false,
+                },
+                json!({ "host": "example.com", "count": 2, "timeout_secs": 3 }),
+            )
+            .await?;
+
+        let request = executor
+            .last_request
+            .lock()
+            .await
+            .clone()
+            .expect("captured request");
+        assert_eq!(request.command, "ping");
+        assert!(request.args.iter().any(|arg| arg == "example.com"));
+        assert!(output.content.contains("exit_code=0"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tls_check_rejects_invalid_url() -> Result<()> {
+        let policy = Arc::new(PolicyEngine::new(PolicyConfig::default()));
+        let executor = Arc::new(LocalExecutor::new(
+            policy.clone(),
+            PlatformMode::WindowsSafe,
+        ));
+        let tools = ToolRegistry::default(executor, policy);
+        let err = tools
+            .call(
+                "tls_check",
+                ToolContext {
+                    conversation_id: ConversationId::new(),
+                    working_directory: None,
+                    elevated: false,
+                },
+                json!({ "url": "not-a-url" }),
+            )
+            .await
+            .expect_err("invalid tls input should fail");
+
+        assert!(matches!(err, ClawError::InvalidRequest(_)));
         Ok(())
     }
 }

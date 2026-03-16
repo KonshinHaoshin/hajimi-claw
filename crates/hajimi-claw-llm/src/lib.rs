@@ -5,7 +5,7 @@ use async_stream::try_stream;
 use hajimi_claw_store::Store;
 use hajimi_claw_types::{
     AgentEvent, AgentRequest, AgentStream, ClawError, ClawResult, ConversationMessage, LlmBackend,
-    MessageRole, ProviderConfig, ProviderHealth, ProviderKind, ProviderRecord,
+    MessageRole, ProviderConfig, ProviderHealth, ProviderKind, ProviderRecord, ToolSpec,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -44,6 +44,7 @@ impl OpenAiCompatibleBackend {
 #[async_trait::async_trait]
 impl LlmBackend for OpenAiCompatibleBackend {
     async fn respond(&self, req: AgentRequest) -> ClawResult<AgentStream> {
+        let has_tools = !req.tool_specs.is_empty();
         let mut builder = self
             .client
             .post(format!(
@@ -57,7 +58,9 @@ impl LlmBackend for OpenAiCompatibleBackend {
         let response = builder
             .json(&ChatCompletionRequest {
                 model: self.model.clone(),
-                messages: flatten_messages(req.system_prompt, req.messages),
+                messages: flatten_messages(req.system_prompt, req.messages, req.tool_history),
+                tools: has_tools.then(|| map_tool_specs(&req.tool_specs)),
+                tool_choice: has_tools.then_some("auto".into()),
                 stream: false,
             })
             .send()
@@ -75,14 +78,28 @@ impl LlmBackend for OpenAiCompatibleBackend {
             .json()
             .await
             .map_err(|err| ClawError::Backend(err.to_string()))?;
-        let text = body
-            .choices
-            .first()
-            .and_then(|choice| choice.message.content.clone())
-            .unwrap_or_default();
+        let choice = body.choices.first().cloned().unwrap_or(Choice {
+            message: ChatCompletionMessage {
+                content: None,
+                tool_calls: None,
+            },
+        });
+        let text = choice.message.content.unwrap_or_default();
+        let tool_calls = choice.message.tool_calls.unwrap_or_default();
 
         let stream = try_stream! {
-            yield AgentEvent::TextDelta(text);
+            if !text.is_empty() {
+                yield AgentEvent::TextDelta(text);
+            }
+            for tool_call in tool_calls {
+                let input = serde_json::from_str(&tool_call.function.arguments)
+                    .map_err(|err| ClawError::Backend(format!("decode tool arguments: {err}")))?;
+                yield AgentEvent::ToolCall {
+                    id: Some(tool_call.id),
+                    tool: tool_call.function.name,
+                    input,
+                };
+            }
             yield AgentEvent::Finished;
         };
 
@@ -135,9 +152,7 @@ impl LlmBackend for StoreBackedBackend {
         match provider {
             Some(record) if record.config.enabled => match record.config.kind {
                 ProviderKind::OpenAiCompatible | ProviderKind::CustomChatCompletions => {
-                    OpenAiCompatibleBackend::from_provider(&record.config)
-                        .respond(req)
-                        .await
+                    respond_with_fallback_models(&record.config, req).await
                 }
             },
             Some(_) => Err(ClawError::Backend("provider is disabled".into())),
@@ -148,6 +163,42 @@ impl LlmBackend for StoreBackedBackend {
                 )),
             },
         }
+    }
+}
+
+async fn respond_with_fallback_models(
+    provider: &ProviderConfig,
+    req: AgentRequest,
+) -> ClawResult<AgentStream> {
+    let mut models = vec![provider.model.clone()];
+    for model in &provider.fallback_models {
+        if !model.trim().is_empty() && !models.iter().any(|item| item == model) {
+            models.push(model.clone());
+        }
+    }
+
+    let mut last_error = None;
+    for model in models {
+        let mut attempt = provider.clone();
+        attempt.model = model.clone();
+        match OpenAiCompatibleBackend::from_provider(&attempt)
+            .respond(req.clone())
+            .await
+        {
+            Ok(stream) => return Ok(stream),
+            Err(err) => {
+                last_error = Some((model, err));
+            }
+        }
+    }
+
+    match last_error {
+        Some((model, err)) => Err(ClawError::Backend(format!(
+            "provider failed after trying primary/fallback models; last model `{model}`: {err}"
+        ))),
+        None => Err(ClawError::Backend(
+            "provider has no primary or fallback models configured".into(),
+        )),
     }
 }
 
@@ -245,28 +296,66 @@ fn default_http_client() -> Client {
 struct ChatCompletionRequest {
     model: String,
     messages: Vec<ChatMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<OpenAiToolSpec>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<String>,
     stream: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct ChatMessage {
     role: String,
-    content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<OpenAiToolCall>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Clone)]
+struct OpenAiToolSpec {
+    #[serde(rename = "type")]
+    tool_type: String,
+    function: OpenAiFunctionSpec,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct OpenAiFunctionSpec {
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 struct ChatCompletionResponse {
     choices: Vec<Choice>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct Choice {
     message: ChatCompletionMessage,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct ChatCompletionMessage {
     content: Option<String>,
+    tool_calls: Option<Vec<OpenAiToolCall>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct OpenAiToolCall {
+    id: String,
+    #[serde(rename = "type", default)]
+    tool_type: String,
+    function: OpenAiFunctionCall,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct OpenAiFunctionCall {
+    name: String,
+    arguments: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -279,10 +368,16 @@ struct ModelItem {
     id: String,
 }
 
-fn flatten_messages(system_prompt: String, messages: Vec<ConversationMessage>) -> Vec<ChatMessage> {
+fn flatten_messages(
+    system_prompt: String,
+    messages: Vec<ConversationMessage>,
+    tool_history: Vec<hajimi_claw_types::ToolExchange>,
+) -> Vec<ChatMessage> {
     let mut flattened = vec![ChatMessage {
         role: "system".into(),
-        content: system_prompt,
+        content: Some(system_prompt),
+        tool_call_id: None,
+        tool_calls: None,
     }];
     flattened.extend(messages.into_iter().map(|message| {
         ChatMessage {
@@ -293,10 +388,52 @@ fn flatten_messages(system_prompt: String, messages: Vec<ConversationMessage>) -
                 MessageRole::Tool => "tool",
             }
             .into(),
-            content: message.content,
+            content: Some(message.content),
+            tool_call_id: None,
+            tool_calls: None,
         }
     }));
+    for exchange in tool_history {
+        flattened.push(ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            tool_call_id: None,
+            tool_calls: Some(vec![OpenAiToolCall {
+                id: exchange
+                    .call
+                    .id
+                    .clone()
+                    .unwrap_or_else(|| format!("call_{}", exchange.call.name)),
+                tool_type: "function".into(),
+                function: OpenAiFunctionCall {
+                    name: exchange.call.name,
+                    arguments: serde_json::to_string(&exchange.call.arguments)
+                        .unwrap_or_else(|_| "{}".into()),
+                },
+            }]),
+        });
+        flattened.push(ChatMessage {
+            role: "tool".into(),
+            content: Some(exchange.result.content),
+            tool_call_id: exchange.result.call_id,
+            tool_calls: None,
+        });
+    }
     flattened
+}
+
+fn map_tool_specs(specs: &[ToolSpec]) -> Vec<OpenAiToolSpec> {
+    specs
+        .iter()
+        .map(|spec| OpenAiToolSpec {
+            tool_type: "function".into(),
+            function: OpenAiFunctionSpec {
+                name: spec.name.clone(),
+                description: spec.description.clone(),
+                parameters: spec.input_schema.clone(),
+            },
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -327,6 +464,7 @@ mod tests {
                     created_at: Utc::now(),
                 }],
                 tool_specs: vec![],
+                tool_history: vec![],
             })
             .await
             .unwrap();
@@ -350,6 +488,7 @@ mod tests {
                     created_at: Utc::now(),
                 }],
                 tool_specs: vec![],
+                tool_history: vec![],
             })
             .await
             .unwrap();
@@ -369,6 +508,7 @@ mod tests {
                     base_url: "https://example.com/v1".into(),
                     api_key: "secret".into(),
                     model: "gpt-demo".into(),
+                    fallback_models: vec![],
                     enabled: true,
                     extra_headers: vec![],
                     created_at: Utc::now(),
@@ -377,5 +517,26 @@ mod tests {
             })
             .unwrap();
         assert!(store.get_default_provider().unwrap().is_some());
+    }
+
+    #[test]
+    fn maps_tool_specs_to_openai_functions() {
+        let specs = vec![hajimi_claw_types::ToolSpec {
+            name: "exec_once".into(),
+            description: "Run one command.".into(),
+            requires_approval: true,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" }
+                },
+                "required": ["command"]
+            }),
+        }];
+
+        let mapped = super::map_tool_specs(&specs);
+        assert_eq!(mapped.len(), 1);
+        assert_eq!(mapped[0].tool_type, "function");
+        assert_eq!(mapped[0].function.name, "exec_once");
     }
 }

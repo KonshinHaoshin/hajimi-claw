@@ -127,6 +127,7 @@ impl Store {
                 base_url TEXT NOT NULL,
                 api_key TEXT NOT NULL,
                 model TEXT NOT NULL,
+                fallback_models_json TEXT NOT NULL DEFAULT '[]',
                 enabled INTEGER NOT NULL,
                 extra_headers_json TEXT NOT NULL,
                 is_default INTEGER NOT NULL,
@@ -147,6 +148,12 @@ impl Store {
                 provider_id TEXT NOT NULL
             );
             "#,
+        )?;
+        ensure_column(
+            &connection,
+            "providers",
+            "fallback_models_json",
+            "ALTER TABLE providers ADD COLUMN fallback_models_json TEXT NOT NULL DEFAULT '[]'",
         )?;
         Ok(())
     }
@@ -373,14 +380,15 @@ impl Store {
         let encrypted_api_key = self.encrypt_secret(&record.config.api_key)?;
         connection.execute(
             r#"
-            INSERT INTO providers (id, label, kind, base_url, api_key, model, enabled, extra_headers_json, is_default, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO providers (id, label, kind, base_url, api_key, model, fallback_models_json, enabled, extra_headers_json, is_default, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 label=excluded.label,
                 kind=excluded.kind,
                 base_url=excluded.base_url,
                 api_key=excluded.api_key,
                 model=excluded.model,
+                fallback_models_json=excluded.fallback_models_json,
                 enabled=excluded.enabled,
                 extra_headers_json=excluded.extra_headers_json,
                 is_default=excluded.is_default,
@@ -393,6 +401,7 @@ impl Store {
                 record.config.base_url,
                 encrypted_api_key,
                 record.config.model,
+                serde_json::to_string(&record.config.fallback_models)?,
                 i64::from(record.config.enabled),
                 serde_json::to_string(&record.config.extra_headers)?,
                 i64::from(record.is_default),
@@ -406,7 +415,7 @@ impl Store {
         let connection = self.connection.lock().expect("store lock poisoned");
         let mut stmt = connection.prepare(
             r#"
-            SELECT id, label, kind, base_url, api_key, model, enabled, extra_headers_json, is_default, created_at
+            SELECT id, label, kind, base_url, api_key, model, fallback_models_json, enabled, extra_headers_json, is_default, created_at
             FROM providers
             ORDER BY is_default DESC, created_at ASC
             "#,
@@ -421,7 +430,7 @@ impl Store {
         connection
             .query_row(
                 r#"
-                SELECT id, label, kind, base_url, api_key, model, enabled, extra_headers_json, is_default, created_at
+                SELECT id, label, kind, base_url, api_key, model, fallback_models_json, enabled, extra_headers_json, is_default, created_at
                 FROM providers WHERE id = ?
                 "#,
                 params![provider_id],
@@ -436,7 +445,7 @@ impl Store {
         connection
             .query_row(
                 r#"
-                SELECT id, label, kind, base_url, api_key, model, enabled, extra_headers_json, is_default, created_at
+                SELECT id, label, kind, base_url, api_key, model, fallback_models_json, enabled, extra_headers_json, is_default, created_at
                 FROM providers WHERE is_default = 1 LIMIT 1
                 "#,
                 [],
@@ -451,7 +460,7 @@ impl Store {
         connection
             .query_row(
                 r#"
-                SELECT id, label, kind, base_url, api_key, model, enabled, extra_headers_json, is_default, created_at
+                SELECT id, label, kind, base_url, api_key, model, fallback_models_json, enabled, extra_headers_json, is_default, created_at
                 FROM providers
                 ORDER BY created_at ASC
                 LIMIT 1
@@ -583,7 +592,9 @@ impl Store {
             "custom-chat-completions" => ProviderKind::CustomChatCompletions,
             _ => ProviderKind::OpenAiCompatible,
         };
-        let headers_json: String = row.get(7)?;
+        let fallback_models_json: String = row.get(6)?;
+        let fallback_models = serde_json::from_str(&fallback_models_json).map_err(to_sql_err)?;
+        let headers_json: String = row.get(8)?;
         let extra_headers = serde_json::from_str(&headers_json).map_err(to_sql_err)?;
         let api_key_raw: String = row.get(4)?;
         let api_key = self
@@ -597,11 +608,12 @@ impl Store {
                 base_url: row.get(3)?,
                 api_key,
                 model: row.get(5)?,
-                enabled: row.get::<_, i64>(6)? != 0,
+                fallback_models,
+                enabled: row.get::<_, i64>(7)? != 0,
                 extra_headers,
-                created_at: parse_ts(row.get(9)?),
+                created_at: parse_ts(row.get(10)?),
             },
-            is_default: row.get::<_, i64>(8)? != 0,
+            is_default: row.get::<_, i64>(9)? != 0,
         })
     }
 
@@ -681,6 +693,19 @@ fn parse_onboarding_step(step: String) -> hajimi_claw_types::OnboardingStep {
     }
 }
 
+fn ensure_column(connection: &Connection, table: &str, column: &str, sql: &str) -> Result<()> {
+    let mut stmt = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let exists = columns
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .any(|name| name == column);
+    if !exists {
+        connection.execute(sql, [])?;
+    }
+    Ok(())
+}
+
 fn to_sql_err(err: serde_json::Error) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
 }
@@ -746,6 +771,7 @@ mod tests {
                     base_url: "https://example.com/v1".into(),
                     api_key: "top-secret".into(),
                     model: "gpt-demo".into(),
+                    fallback_models: vec![],
                     enabled: true,
                     extra_headers: vec![],
                     created_at: Utc::now(),
