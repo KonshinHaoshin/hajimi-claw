@@ -264,13 +264,21 @@ impl AgentRuntime {
             .map(|output| output.content)
     }
 
-    pub fn request_elevated(&self, minutes: i64, reason: String) -> String {
-        let approval = self.policy.request_elevation(minutes, reason.clone());
-        let _ = self.store.save_approval(&approval, None);
-        format!(
-            "approval required: {} [{}], expires at {}",
-            reason, approval.request_id, approval.expires_at
-        )
+    pub fn enable_elevated(&self) -> String {
+        self.policy
+            .enable_elevation(10, "manual elevated on".into());
+        "elevated mode enabled for 10 minutes".into()
+    }
+
+    pub fn enable_full_elevated(&self) -> String {
+        self.policy
+            .enable_full_elevation("manual elevated full".into());
+        "full elevated mode enabled until /elevated off".into()
+    }
+
+    pub fn enable_approval_mode(&self) -> String {
+        self.policy.stop_elevation();
+        "approval mode enabled. Guarded and dangerous commands will ask before running.".into()
     }
 
     pub fn approve(&self, request_id: &str) -> ClawResult<String> {
@@ -291,7 +299,7 @@ impl AgentRuntime {
 
     pub fn stop_elevated(&self) -> String {
         self.policy.stop_elevation();
-        "elevated lease stopped".into()
+        "elevated mode disabled".into()
     }
 
     pub fn status(&self) -> ClawResult<String> {

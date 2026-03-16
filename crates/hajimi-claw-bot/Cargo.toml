@@ -7,6 +7,7 @@ authors.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+axum.workspace = true
 chrono.workspace = true
 hajimi-claw-gateway = { path = "../hajimi-claw-gateway" }
 reqwest.workspace = true

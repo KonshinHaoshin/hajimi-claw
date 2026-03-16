@@ -225,7 +225,12 @@ fn resolve_provider(
     if let Some(provider_id) = provider_id {
         return store.get_provider(provider_id);
     }
-    store.get_default_provider()
+    store
+        .get_default_provider()
+        .and_then(|record| match record {
+            Some(record) => Ok(Some(record)),
+            None => store.get_first_provider(),
+        })
 }
 
 fn default_http_client() -> Client {

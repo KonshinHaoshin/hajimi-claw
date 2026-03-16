@@ -21,8 +21,10 @@ pub enum GatewayCommand {
     ShellClose,
     Status,
     Approve(String),
-    ElevatedStart { minutes: i64, reason: String },
-    ElevatedStop,
+    ElevatedOn,
+    ElevatedOff,
+    ElevatedAsk,
+    ElevatedFull,
     Cancel(String),
     Onboard,
     OnboardCancel,
@@ -35,12 +37,14 @@ pub enum GatewayCommand {
     ProviderAdd,
     ProviderSetModel { provider_id: String, model: String },
     ModelCurrent,
+    ModelPicker,
     ModelUse(String),
     PersonaList,
     PersonaRead(String),
     PersonaWrite { file: String, content: String },
     PersonaAppend { file: String, content: String },
     Help,
+    Menu,
     Unknown(String),
 }
 
@@ -178,17 +182,19 @@ impl Gateway for InProcessGateway {
             GatewayCommand::Approve(request_id) => {
                 Ok(text_response(&self.runtime.approve(&request_id)?))
             }
-            GatewayCommand::ElevatedStart { minutes, reason } => Ok(text_response(
-                &self.runtime.request_elevated(minutes, reason),
-            )),
-            GatewayCommand::ElevatedStop => Ok(text_response(&self.runtime.stop_elevated())),
+            GatewayCommand::ElevatedOn => Ok(text_response(&self.runtime.enable_elevated())),
+            GatewayCommand::ElevatedOff => Ok(text_response(&self.runtime.stop_elevated())),
+            GatewayCommand::ElevatedAsk => Ok(text_response(&self.runtime.enable_approval_mode())),
+            GatewayCommand::ElevatedFull => Ok(text_response(&self.runtime.enable_full_elevated())),
             GatewayCommand::Cancel(task_id) => Ok(text_response(&format!(
                 "cancel is not implemented yet for task {task_id}"
             ))),
             GatewayCommand::Onboard => self.start_onboarding(request).await,
             GatewayCommand::ProviderAdd => self.start_onboarding(request).await,
             GatewayCommand::ProviderList => self.provider_list().await,
-            GatewayCommand::ProviderUse(provider_id) => self.provider_use(&provider_id).await,
+            GatewayCommand::ProviderUse(provider_id) => {
+                self.provider_use(request.actor_chat_id, &provider_id).await
+            }
             GatewayCommand::ProviderBind(provider_id) => {
                 self.provider_bind(request.actor_chat_id, &provider_id)
                     .await
@@ -206,6 +212,7 @@ impl Gateway for InProcessGateway {
                     .await
             }
             GatewayCommand::ModelCurrent => self.model_current(request.actor_chat_id).await,
+            GatewayCommand::ModelPicker => self.model_picker(request.actor_chat_id).await,
             GatewayCommand::ModelUse(model) => self.model_use(request.actor_chat_id, &model).await,
             GatewayCommand::PersonaList => Ok(text_response(&self.runtime.persona_list().await?)),
             GatewayCommand::PersonaRead(file) => {
@@ -217,7 +224,10 @@ impl Gateway for InProcessGateway {
             GatewayCommand::PersonaAppend { file, content } => Ok(text_response(
                 &self.runtime.persona_append(&file, &content).await?,
             )),
-            GatewayCommand::Help => Ok(text_response(&help_text())),
+            GatewayCommand::Help | GatewayCommand::Menu => Ok(text_response_with_keyboard(
+                &help_text(),
+                Some(main_menu_keyboard()),
+            )),
             GatewayCommand::Unknown(raw) => Ok(text_response(&format!(
                 "unrecognized command: {raw}\n\n{}",
                 help_text()
@@ -340,7 +350,7 @@ impl InProcessGateway {
             ));
         }
         let text = providers
-            .into_iter()
+            .iter()
             .map(|provider| {
                 format!(
                     "`{}` {} kind={} model={}{}",
@@ -353,17 +363,18 @@ impl InProcessGateway {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        Ok(text_response(&text))
+        Ok(text_response_with_keyboard(
+            &text,
+            Some(provider_list_keyboard(&providers)),
+        ))
     }
 
-    async fn provider_use(&self, provider_id: &str) -> ClawResult<GatewayResponse> {
+    async fn provider_use(&self, chat_id: i64, provider_id: &str) -> ClawResult<GatewayResponse> {
         ensure_provider_exists(&self.store, provider_id)?;
         self.store
             .set_default_provider(provider_id)
             .map_err(store_error)?;
-        Ok(text_response(&format!(
-            "default provider set to `{provider_id}`"
-        )))
+        self.provider_current(chat_id).await
     }
 
     async fn provider_bind(&self, chat_id: i64, provider_id: &str) -> ClawResult<GatewayResponse> {
@@ -371,9 +382,7 @@ impl InProcessGateway {
         self.store
             .bind_provider_to_chat(chat_id, provider_id)
             .map_err(store_error)?;
-        Ok(text_response(&format!(
-            "chat `{chat_id}` now uses provider `{provider_id}`"
-        )))
+        self.provider_current(chat_id).await
     }
 
     async fn provider_current(&self, chat_id: i64) -> ClawResult<GatewayResponse> {
@@ -386,18 +395,21 @@ impl InProcessGateway {
             .resolve_provider_for_chat(chat_id)
             .map_err(store_error)?;
         match resolved {
-            Some(provider) => Ok(text_response(&format!(
-                "current provider for chat `{chat_id}`: `{}` ({}){}\nmodel={}\ndefault={}",
-                provider.config.id,
-                provider.config.label,
-                if bound.is_some() {
-                    " bound=yes"
-                } else {
-                    " bound=no"
-                },
-                provider.config.model,
-                provider.is_default
-            ))),
+            Some(provider) => Ok(text_response_with_keyboard(
+                &format!(
+                    "current provider for chat `{chat_id}`: `{}` ({}){}\nmodel={}\ndefault={}",
+                    provider.config.id,
+                    provider.config.label,
+                    if bound.is_some() {
+                        " bound=yes"
+                    } else {
+                        " bound=no"
+                    },
+                    provider.config.model,
+                    provider.is_default
+                ),
+                Some(provider_current_keyboard(&provider.config.id)),
+            )),
             None => Ok(text_response("no provider configured")),
         }
     }
@@ -411,10 +423,22 @@ impl InProcessGateway {
         self.store
             .update_provider_model(provider_id, model)
             .map_err(store_error)?;
-        Ok(text_response(&format!(
-            "provider `{}` model set to `{}`",
-            provider_id, model
-        )))
+        let provider = self
+            .store
+            .get_provider(provider_id)
+            .map_err(store_error)?
+            .ok_or_else(|| ClawError::NotFound(format!("provider not found: {provider_id}")))?;
+        Ok(text_response_with_keyboard(
+            &format!(
+                "provider `{}` now uses model `{}`",
+                provider_id, provider.config.model
+            ),
+            Some(model_picker_keyboard(
+                &provider.config.id,
+                &provider.config.model,
+                &[],
+            )),
+        ))
     }
 
     async fn provider_test(
@@ -468,11 +492,18 @@ impl InProcessGateway {
         if models.is_empty() {
             return Ok(text_response("provider returned no models"));
         }
-        Ok(text_response(&format!(
-            "models for `{}`:\n{}",
-            provider.config.id,
-            models.join("\n")
-        )))
+        Ok(text_response_with_keyboard(
+            &format!(
+                "models for `{}`:\n{}",
+                provider.config.id,
+                models.join("\n")
+            ),
+            Some(model_picker_keyboard(
+                &provider.config.id,
+                &provider.config.model,
+                &models,
+            )),
+        ))
     }
 
     async fn model_current(&self, chat_id: i64) -> ClawResult<GatewayResponse> {
@@ -481,10 +512,21 @@ impl InProcessGateway {
             .resolve_provider_for_chat(chat_id)
             .map_err(store_error)?
             .ok_or_else(|| ClawError::NotFound("no provider configured".into()))?;
-        Ok(text_response(&format!(
-            "current provider=`{}`\ncurrent model=`{}`",
-            provider.config.id, provider.config.model
-        )))
+        Ok(text_response_with_keyboard(
+            &format!(
+                "current provider=`{}`\ncurrent model=`{}`",
+                provider.config.id, provider.config.model
+            ),
+            Some(model_picker_keyboard(
+                &provider.config.id,
+                &provider.config.model,
+                &[],
+            )),
+        ))
+    }
+
+    async fn model_picker(&self, chat_id: i64) -> ClawResult<GatewayResponse> {
+        self.provider_models(chat_id, None).await
     }
 
     async fn model_use(&self, chat_id: i64, model: &str) -> ClawResult<GatewayResponse> {
@@ -496,10 +538,7 @@ impl InProcessGateway {
         self.store
             .update_provider_model(&provider.config.id, model)
             .map_err(store_error)?;
-        Ok(text_response(&format!(
-            "provider `{}` now uses model `{}`",
-            provider.config.id, model
-        )))
+        self.model_current(chat_id).await
     }
 }
 
@@ -513,6 +552,9 @@ pub fn parse_gateway_command(text: &str) -> GatewayCommand {
     }
     if trimmed == "/status" {
         return GatewayCommand::Status;
+    }
+    if trimmed == "/menu" {
+        return GatewayCommand::Menu;
     }
     if trimmed == "/onboard" {
         return GatewayCommand::Onboard;
@@ -531,6 +573,9 @@ pub fn parse_gateway_command(text: &str) -> GatewayCommand {
     }
     if trimmed == "/model current" {
         return GatewayCommand::ModelCurrent;
+    }
+    if trimmed == "/model use" {
+        return GatewayCommand::ModelPicker;
     }
     if let Some(rest) = trimmed.strip_prefix("/model use ") {
         return GatewayCommand::ModelUse(rest.trim().into());
@@ -573,17 +618,17 @@ pub fn parse_gateway_command(text: &str) -> GatewayCommand {
     if let Some(rest) = trimmed.strip_prefix("/approve ") {
         return GatewayCommand::Approve(rest.trim().into());
     }
-    if trimmed == "/elevated stop" {
-        return GatewayCommand::ElevatedStop;
+    if trimmed == "/elevated on" {
+        return GatewayCommand::ElevatedOn;
     }
-    if let Some(rest) = trimmed.strip_prefix("/elevated start ") {
-        let mut parts = rest.trim().splitn(2, ' ');
-        let minutes = parts
-            .next()
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or(10);
-        let reason = parts.next().unwrap_or("manual request").trim().to_string();
-        return GatewayCommand::ElevatedStart { minutes, reason };
+    if trimmed == "/elevated off" {
+        return GatewayCommand::ElevatedOff;
+    }
+    if trimmed == "/elevated ask" {
+        return GatewayCommand::ElevatedAsk;
+    }
+    if trimmed == "/elevated full" {
+        return GatewayCommand::ElevatedFull;
     }
     if trimmed == "/shell close" {
         return GatewayCommand::ShellClose;
@@ -621,7 +666,7 @@ pub fn help_text() -> String {
         "/provider models [id]",
         "/provider set-model <provider-id> <model>",
         "/model current",
-        "/model use <model>",
+        "/model use [model]",
         "/persona list",
         "/persona read <soul|agents|tools|skills>",
         "/persona write <file> <content>",
@@ -630,9 +675,12 @@ pub fn help_text() -> String {
         "/shell exec <cmd>",
         "/shell close",
         "/status",
+        "/menu",
         "/approve <request-id>",
-        "/elevated start <minutes> <reason>",
-        "/elevated stop",
+        "/elevated on",
+        "/elevated off",
+        "/elevated ask",
+        "/elevated full",
         "/cancel <task-id>",
         "plain text = natural-language task",
     ]
@@ -773,6 +821,132 @@ fn cancel_keyboard() -> InlineKeyboard {
     }
 }
 
+fn main_menu_keyboard() -> InlineKeyboard {
+    InlineKeyboard {
+        rows: vec![
+            vec![
+                InlineButton {
+                    text: "Status".into(),
+                    data: "/status".into(),
+                },
+                InlineButton {
+                    text: "Provider".into(),
+                    data: "/provider current".into(),
+                },
+                InlineButton {
+                    text: "Model".into(),
+                    data: "/model current".into(),
+                },
+            ],
+            vec![
+                InlineButton {
+                    text: "Providers".into(),
+                    data: "/provider list".into(),
+                },
+                InlineButton {
+                    text: "Persona".into(),
+                    data: "/persona list".into(),
+                },
+            ],
+        ],
+    }
+}
+
+fn provider_current_keyboard(provider_id: &str) -> InlineKeyboard {
+    InlineKeyboard {
+        rows: vec![
+            vec![
+                InlineButton {
+                    text: "Switch provider".into(),
+                    data: "/provider list".into(),
+                },
+                InlineButton {
+                    text: "Switch model".into(),
+                    data: format!("/provider models {provider_id}"),
+                },
+            ],
+            vec![
+                InlineButton {
+                    text: "Test provider".into(),
+                    data: format!("/provider test {provider_id}"),
+                },
+                InlineButton {
+                    text: "Bind this chat".into(),
+                    data: format!("/provider bind {provider_id}"),
+                },
+            ],
+            vec![InlineButton {
+                text: "Back to menu".into(),
+                data: "/menu".into(),
+            }],
+        ],
+    }
+}
+
+fn provider_list_keyboard(providers: &[ProviderRecord]) -> InlineKeyboard {
+    let mut rows = providers
+        .iter()
+        .map(|provider| {
+            vec![InlineButton {
+                text: if provider.is_default {
+                    format!("* {} ({})", provider.config.label, provider.config.id)
+                } else {
+                    format!("{} ({})", provider.config.label, provider.config.id)
+                },
+                data: format!("/provider use {}", provider.config.id),
+            }]
+        })
+        .collect::<Vec<_>>();
+    rows.push(vec![InlineButton {
+        text: "Back to provider".into(),
+        data: "/provider current".into(),
+    }]);
+    rows.push(vec![InlineButton {
+        text: "Add provider".into(),
+        data: "/provider add".into(),
+    }]);
+    InlineKeyboard { rows }
+}
+
+fn model_picker_keyboard(
+    provider_id: &str,
+    current_model: &str,
+    models: &[String],
+) -> InlineKeyboard {
+    let mut rows = Vec::new();
+    for model in models.iter().take(12) {
+        rows.push(vec![InlineButton {
+            text: if model == current_model {
+                format!("* {model}")
+            } else {
+                model.clone()
+            },
+            data: format!("/provider set-model {provider_id} {model}"),
+        }]);
+    }
+    if rows.is_empty() {
+        rows.push(vec![InlineButton {
+            text: "Open model list".into(),
+            data: format!("/provider models {provider_id}"),
+        }]);
+    }
+    rows.push(vec![
+        InlineButton {
+            text: "Refresh models".into(),
+            data: format!("/provider models {provider_id}"),
+        },
+        InlineButton {
+            text: "Provider card".into(),
+            data: "/provider current".into(),
+        },
+    ]);
+    rows.push(vec![InlineButton {
+        text: "Back to menu".into(),
+        data: "/menu".into(),
+    }]);
+    InlineKeyboard { rows }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -803,6 +977,14 @@ mod tests {
         assert_eq!(
             parse_gateway_command("/model use gpt-5.1"),
             GatewayCommand::ModelUse("gpt-5.1".into())
+        );
+    }
+
+    #[test]
+    fn parses_model_picker_command() {
+        assert_eq!(
+            parse_gateway_command("/model use"),
+            GatewayCommand::ModelPicker
         );
     }
 
@@ -891,6 +1073,54 @@ mod tests {
             .await?;
         assert!(response.text.contains("Step 1/5"));
         assert!(store.load_onboarding_session(2, 1)?.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_current_returns_keyboard() -> Result<()> {
+        let dir = tempdir()?;
+        let mut config = hajimi_claw_policy::PolicyConfig::default();
+        config.allowed_workdirs = vec![dir.path().to_path_buf(), std::env::current_dir()?];
+        config.admin_user_id = 1;
+        config.admin_chat_id = 2;
+        let policy = Arc::new(PolicyEngine::new(config));
+        let executor = Arc::new(LocalExecutor::new(
+            policy.clone(),
+            PlatformMode::WindowsSafe,
+        ));
+        let tools = Arc::new(ToolRegistry::default(executor, policy.clone()));
+        let store = Arc::new(Store::open_in_memory()?);
+        store.upsert_provider(&hajimi_claw_types::ProviderRecord {
+            config: hajimi_claw_types::ProviderConfig {
+                id: "openai".into(),
+                label: "OpenAI".into(),
+                kind: hajimi_claw_types::ProviderKind::OpenAiCompatible,
+                base_url: "https://example.com/v1".into(),
+                api_key: "secret".into(),
+                model: "gpt-5.1".into(),
+                enabled: true,
+                extra_headers: vec![],
+                created_at: chrono::Utc::now(),
+            },
+            is_default: true,
+        })?;
+        let runtime = Arc::new(AgentRuntime::for_tests(
+            tools,
+            store.clone(),
+            policy.clone(),
+        ));
+        let gateway = InProcessGateway::new(runtime, policy, store);
+
+        let response = gateway
+            .handle(GatewayRequest {
+                actor_user_id: 1,
+                actor_chat_id: 2,
+                raw_text: "/provider current".into(),
+                command: GatewayCommand::ProviderCurrent,
+                current_session_id: None,
+            })
+            .await?;
+        assert!(response.keyboard.is_some());
         Ok(())
     }
 }

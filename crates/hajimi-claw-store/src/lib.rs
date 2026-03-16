@@ -446,6 +446,23 @@ impl Store {
             .map_err(Into::into)
     }
 
+    pub fn get_first_provider(&self) -> Result<Option<ProviderRecord>> {
+        let connection = self.connection.lock().expect("store lock poisoned");
+        connection
+            .query_row(
+                r#"
+                SELECT id, label, kind, base_url, api_key, model, enabled, extra_headers_json, is_default, created_at
+                FROM providers
+                ORDER BY created_at ASC
+                LIMIT 1
+                "#,
+                [],
+                |row| self.row_to_provider(row),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn set_default_provider(&self, provider_id: &str) -> Result<()> {
         let connection = self.connection.lock().expect("store lock poisoned");
         connection.execute("UPDATE providers SET is_default = 0", [])?;
@@ -496,7 +513,10 @@ impl Store {
                 return Ok(Some(record));
             }
         }
-        self.get_default_provider()
+        self.get_default_provider().and_then(|record| match record {
+            Some(record) => Ok(Some(record)),
+            None => self.get_first_provider(),
+        })
     }
 
     pub fn save_onboarding_session(&self, session: &OnboardingSession) -> Result<()> {

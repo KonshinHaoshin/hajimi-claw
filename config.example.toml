@@ -1,6 +1,16 @@
+[channel]
+kind = "telegram"
+
 [telegram]
 bot_token = "123456:replace-me"
 poll_timeout_secs = 30
+
+[feishu]
+# Feishu webhook mode. Expose listen_addr + event_path through your reverse proxy or public host.
+app_id = ""
+app_secret = ""
+listen_addr = "0.0.0.0:8787"
+event_path = "/feishu/events"
 
 [llm]
 # Optional bootstrap provider written into SQLite on first start.

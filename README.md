@@ -1,24 +1,26 @@
 # hajimi-claw
 
-Single-user Telegram-first ops agent in Rust.
+Single-user Telegram/Feishu-first ops agent in Rust.
 
 ## Current scope
 
 - Telegram channel -> gateway -> runtime command flow
+- Feishu webhook channel -> gateway -> runtime command flow
 - Telegram long polling command surface
 - Single active task gate
 - Structured tools for file access, Docker, and systemd
-- Guarded local command execution with approvals and short-lived elevated lease
+- Guarded local command execution with approval mode, short-lived elevated mode, and full elevated mode
 - SQLite audit/task/session persistence
 - Windows-safe execution mode with allowlist checks and Job Object cleanup
-- Telegram onboarding flow for custom providers and chat-level provider binding
+- Channel-aware onboarding for Telegram or Feishu plus provider/model setup
 
 ## Running
 
 1. Run `cargo run -- onboard` or `hajimi onboard`.
-2. `hajimi onboard` verifies the Telegram bot token, can pair the admin user/chat automatically with a one-time pairing code sent to the bot, and interactively guides provider model selection.
+2. `hajimi onboard` lets you choose `telegram` or `feishu`, verifies the channel credentials, and then interactively guides provider model selection.
 3. Start the daemon with `cargo run` or `hajimi`.
-4. In Telegram, use `/onboard` to add or switch providers interactively.
+4. In Telegram, use `/menu` for the main quick-action panel, or just send plain text and let hajimi reply in natural language.
+5. In Feishu mode, configure the app's event subscription URL to point at `http(s)://<your-host><event_path>` for the local webhook listener.
 
 Set `HAJIMI_CLAW_CONFIG` if you want to load a different config path.
 
@@ -59,6 +61,21 @@ The Linux installer copies the binary to `PREFIX/bin/hajimi-claw`, creates the `
 
 The npm package exposes both `hajimi` and `hajimi-claw`, and builds the Rust binary locally during `postinstall`, so `cargo` must already be installed on the target machine.
 
+## Channels
+
+- `telegram`
+- `feishu`
+
+`hajimi onboard` now lets you pick the primary channel:
+
+- `telegram`: verifies the bot token and can auto-pair the admin user/chat
+- `feishu`: asks for `app_id` and `app_secret`, verifies them by requesting a tenant access token, and starts a webhook listener on `listen_addr + event_path`
+
+Current Feishu limitations:
+
+- You still need to configure the Feishu event subscription URL manually in the Feishu developer console
+- The Feishu adapter replies with text only; Telegram inline buttons are flattened into text actions
+
 ## CLI
 
 - `hajimi`
@@ -73,7 +90,7 @@ The npm package exposes both `hajimi` and `hajimi-claw`, and builds the Rust bin
 - `hajimi provider models [provider-id]`
 - `hajimi provider set-model <provider-id> <model>`
 - `hajimi model current`
-- `hajimi model use <model>`
+- `hajimi model use [model]`
 - `hajimi models [provider-id]`
 - `hajimi restart`
 - `hajimi help`
@@ -113,7 +130,7 @@ Use these files for:
 - `/provider models [id]`
 - `/provider set-model <provider-id> <model>`
 - `/model current`
-- `/model use <model>`
+- `/model use [model]`
 - `/persona list`
 - `/persona read <soul|agents|tools|skills>`
 - `/persona write <file> <content>`
@@ -123,8 +140,15 @@ Use these files for:
 - `/shell exec <cmd>`
 - `/shell close`
 - `/status`
+- `/menu`
+- `/elevated on`
+- `/elevated off`
+- `/elevated ask`
+- `/elevated full`
 
-Plain Telegram text now defaults to a natural-language task, so `/ask` is optional for normal requests.
+Plain Telegram text now defaults to a natural-language task, so `/ask` is optional for normal requests. hajimi sends a Telegram `typing` action, posts a short placeholder, and then edits that message with the final answer.
+
+The bot also registers Telegram slash commands with `setMyCommands` on startup and exposes an inline quick-action menu via `/menu` and `/help`. `/provider current` and `/model current` now return inline buttons so you can switch provider/model directly from Telegram without typing full commands.
 
 ## Provider And Model Switching
 
@@ -132,5 +156,6 @@ Plain Telegram text now defaults to a natural-language task, so `/ask` is option
 - List configured providers: `hajimi providers` or Telegram `/provider list`
 - Switch the default provider: `hajimi provider use <provider-id>` or Telegram `/provider use <id>`
 - See the current model: `hajimi model current` or Telegram `/model current`
-- Switch the current model on the active provider: `hajimi model use <model>` or Telegram `/model use <model>`
+- Switch the current model on the active provider: `hajimi model use [model]` or Telegram `/model use [model]`
+- Open the model picker with inline buttons: `hajimi model use` or Telegram `/model use`
 - Switch a specific provider to a specific model: `hajimi provider set-model <provider-id> <model>` or Telegram `/provider set-model <provider-id> <model>`

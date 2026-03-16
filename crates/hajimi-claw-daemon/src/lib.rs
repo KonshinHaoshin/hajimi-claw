@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use hajimi_claw_agent::{AgentRuntime, MarkdownPromptSource, default_system_prompt};
-use hajimi_claw_bot::{TelegramBot, TelegramConfig};
+use hajimi_claw_bot::{FeishuBot, FeishuConfig, TelegramBot, TelegramConfig};
 use hajimi_claw_exec::{LocalExecutor, PlatformMode};
 use hajimi_claw_gateway::InProcessGateway;
 use hajimi_claw_llm::{StaticBackend, StoreBackedBackend, list_models, test_provider};
@@ -25,7 +25,11 @@ const DEFAULT_MASTER_KEY_ENV: &str = "HAJIMI_CLAW_MASTER_KEY";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
+    #[serde(default)]
+    pub channel: ChannelSection,
     pub telegram: TelegramSection,
+    #[serde(default)]
+    pub feishu: FeishuSection,
     pub llm: LlmSection,
     pub storage: StorageSection,
     pub security: SecuritySection,
@@ -36,9 +40,30 @@ pub struct AppConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelSection {
+    pub kind: String,
+}
+
+impl Default for ChannelSection {
+    fn default() -> Self {
+        Self {
+            kind: "telegram".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TelegramSection {
     pub bot_token: String,
     pub poll_timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FeishuSection {
+    pub app_id: String,
+    pub app_secret: String,
+    pub listen_addr: Option<String>,
+    pub event_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,17 +203,44 @@ async fn run_with_context(config: AppConfig, config_path: Option<PathBuf>) -> Re
         policy.clone(),
         store.clone(),
     ));
-    let bot = TelegramBot::new(
-        TelegramConfig {
-            token: config.telegram.bot_token,
-            poll_timeout_secs: config.telegram.poll_timeout_secs.unwrap_or(30),
-            admin_user_id: config.policy.admin_user_id,
-            admin_chat_id: config.policy.admin_chat_id,
-        },
-        gateway,
-    );
+    match config.channel.kind.as_str() {
+        "feishu" => {
+            let bot = Arc::new(FeishuBot::new(
+                FeishuConfig {
+                    app_id: config.feishu.app_id,
+                    app_secret: config.feishu.app_secret,
+                    listen_addr: config
+                        .feishu
+                        .listen_addr
+                        .unwrap_or_else(|| "0.0.0.0:8787".into()),
+                    event_path: normalize_event_path(
+                        config
+                            .feishu
+                            .event_path
+                            .as_deref()
+                            .unwrap_or("/feishu/events"),
+                    ),
+                    admin_user_id: config.policy.admin_user_id,
+                    admin_chat_id: config.policy.admin_chat_id,
+                },
+                gateway,
+            ));
+            bot.run().await
+        }
+        _ => {
+            let bot = TelegramBot::new(
+                TelegramConfig {
+                    token: config.telegram.bot_token,
+                    poll_timeout_secs: config.telegram.poll_timeout_secs.unwrap_or(30),
+                    admin_user_id: config.policy.admin_user_id,
+                    admin_chat_id: config.policy.admin_chat_id,
+                },
+                gateway,
+            );
 
-    bot.run().await
+            bot.run().await
+        }
+    }
 }
 
 pub fn load_config(path: PathBuf) -> Result<AppConfig> {
@@ -557,41 +609,110 @@ async fn interactive_onboard(config_path: PathBuf) -> Result<()> {
     println!("persona dir: {}", persona_dir.display());
 
     println!();
-    println!("Telegram bot channel");
-    if config.telegram.bot_token.trim().is_empty()
-        || config.telegram.bot_token.contains("replace-me")
-    {
-        config.telegram.bot_token = prompt("Telegram bot token")?;
-    }
-    let bot_identity = verify_telegram_bot_token(&config.telegram.bot_token).await?;
-    println!(
-        "verified Telegram bot: {} ({})",
-        bot_identity
-            .username
-            .as_deref()
-            .map(|username| format!("@{username}"))
-            .unwrap_or_else(|| bot_identity.first_name.clone()),
-        bot_identity.id
-    );
+    config.channel.kind =
+        prompt_default("Primary channel (telegram/feishu)", &config.channel.kind)?;
+    match config.channel.kind.trim().to_ascii_lowercase().as_str() {
+        "telegram" => {
+            config.channel.kind = "telegram".into();
+            println!("Telegram bot channel");
+            if config.telegram.bot_token.trim().is_empty()
+                || config.telegram.bot_token.contains("replace-me")
+            {
+                config.telegram.bot_token = prompt("Telegram bot token")?;
+            }
+            let bot_identity = verify_telegram_bot_token(&config.telegram.bot_token).await?;
+            println!(
+                "verified Telegram bot: {} ({})",
+                bot_identity
+                    .username
+                    .as_deref()
+                    .map(|username| format!("@{username}"))
+                    .unwrap_or_else(|| bot_identity.first_name.clone()),
+                bot_identity.id
+            );
 
-    let needs_pairing = config.policy.admin_user_id == 0 || config.policy.admin_chat_id == 0;
-    if prompt_yes_no("Pair Telegram admin automatically now", needs_pairing)? {
-        let pairing =
-            pair_telegram_admin(&config.telegram.bot_token, bot_identity.username.as_deref())
+            let needs_pairing =
+                config.policy.admin_user_id == 0 || config.policy.admin_chat_id == 0;
+            if prompt_yes_no("Pair Telegram admin automatically now", needs_pairing)? {
+                let pairing = pair_telegram_admin(
+                    &config.telegram.bot_token,
+                    bot_identity.username.as_deref(),
+                )
                 .await?;
-        config.policy.admin_user_id = pairing.user_id;
-        config.policy.admin_chat_id = pairing.chat_id;
-        println!(
-            "paired Telegram admin: user_id={} chat_id={}",
-            pairing.user_id, pairing.chat_id
-        );
-    } else {
-        if config.policy.admin_user_id == 0 {
-            config.policy.admin_user_id = prompt("Telegram admin user id")?.parse()?;
+                config.policy.admin_user_id = pairing.user_id;
+                config.policy.admin_chat_id = pairing.chat_id;
+                println!(
+                    "paired Telegram admin: user_id={} chat_id={}",
+                    pairing.user_id, pairing.chat_id
+                );
+            } else {
+                if config.policy.admin_user_id == 0 {
+                    config.policy.admin_user_id = prompt("Telegram admin user id")?.parse()?;
+                }
+                if config.policy.admin_chat_id == 0 {
+                    config.policy.admin_chat_id = prompt("Telegram admin chat id")?.parse()?;
+                }
+            }
         }
-        if config.policy.admin_chat_id == 0 {
-            config.policy.admin_chat_id = prompt("Telegram admin chat id")?.parse()?;
+        "feishu" => {
+            config.channel.kind = "feishu".into();
+            println!("Feishu bot channel");
+            if config.feishu.app_id.trim().is_empty() {
+                config.feishu.app_id = prompt("Feishu app_id")?;
+            }
+            if config.feishu.app_secret.trim().is_empty() {
+                config.feishu.app_secret = prompt("Feishu app_secret")?;
+            }
+            config.feishu.listen_addr = Some(prompt_default(
+                "Feishu listen address",
+                config
+                    .feishu
+                    .listen_addr
+                    .as_deref()
+                    .unwrap_or("0.0.0.0:8787"),
+            )?);
+            config.feishu.event_path = Some(normalize_event_path(&prompt_default(
+                "Feishu event path",
+                config
+                    .feishu
+                    .event_path
+                    .as_deref()
+                    .unwrap_or("/feishu/events"),
+            )?));
+            let token_info =
+                verify_feishu_app(&config.feishu.app_id, &config.feishu.app_secret).await?;
+            println!(
+                "verified Feishu app credentials: tenant_access_token ok (expires_in={}s)",
+                token_info.expire
+            );
+
+            let admin_open_id =
+                prompt_optional("Feishu admin open_id (optional, blank = allow any sender)")?;
+            let admin_chat_id =
+                prompt_optional("Feishu admin chat_id (optional, blank = allow any chat)")?;
+            config.policy.admin_user_id = admin_open_id
+                .as_deref()
+                .map(stable_channel_hash)
+                .unwrap_or(0);
+            config.policy.admin_chat_id = admin_chat_id
+                .as_deref()
+                .map(stable_channel_hash)
+                .unwrap_or(0);
+            println!(
+                "Feishu webhook ready on {}{}",
+                config
+                    .feishu
+                    .listen_addr
+                    .as_deref()
+                    .unwrap_or("0.0.0.0:8787"),
+                config
+                    .feishu
+                    .event_path
+                    .as_deref()
+                    .unwrap_or("/feishu/events")
+            );
         }
+        other => anyhow::bail!("channel must be `telegram` or `feishu`, got `{other}`"),
     }
 
     let master_key_file = config
@@ -1056,9 +1177,16 @@ fn default_app_config(config_path: &Path) -> AppConfig {
     let storage = default_storage_path(config_path);
     let workdirs = default_workdirs(config_path);
     AppConfig {
+        channel: ChannelSection::default(),
         telegram: TelegramSection {
             bot_token: String::new(),
             poll_timeout_secs: Some(30),
+        },
+        feishu: FeishuSection {
+            app_id: String::new(),
+            app_secret: String::new(),
+            listen_addr: Some("0.0.0.0:8787".into()),
+            event_path: Some("/feishu/events".into()),
         },
         llm: LlmSection {
             base_url: None,
@@ -1166,6 +1294,19 @@ fn prompt_default(label: &str, default: &str) -> Result<String> {
     }
 }
 
+fn prompt_optional(label: &str) -> Result<Option<String>> {
+    print!("{label}: ");
+    io::stdout().flush()?;
+    let mut buffer = String::new();
+    io::stdin().read_line(&mut buffer)?;
+    let trimmed = buffer.trim().to_string();
+    if trimmed.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(trimmed))
+    }
+}
+
 async fn prompt_provider_model(provider: &ProviderConfig) -> Result<String> {
     let client = reqwest::Client::new();
     match list_models(&client, provider).await {
@@ -1220,6 +1361,18 @@ fn prompt_yes_no(label: &str, default: bool) -> Result<bool> {
     }
 }
 
+fn normalize_event_path(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "/feishu/events".into();
+    }
+    if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
 async fn verify_telegram_bot_token(token: &str) -> Result<TelegramBotIdentity> {
     let client = reqwest::Client::new();
     let response = client
@@ -1242,6 +1395,41 @@ async fn verify_telegram_bot_token(token: &str) -> Result<TelegramBotIdentity> {
         username: payload.result.username,
         first_name: payload.result.first_name,
     })
+}
+
+async fn verify_feishu_app(app_id: &str, app_secret: &str) -> Result<FeishuTokenResponse> {
+    let client = reqwest::Client::new();
+    let response = client
+        .post("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal")
+        .json(&serde_json::json!({
+            "app_id": app_id,
+            "app_secret": app_secret,
+        }))
+        .send()
+        .await
+        .context("Feishu tenant_access_token request")?;
+    if !response.status().is_success() {
+        anyhow::bail!("Feishu tenant_access_token returned {}", response.status());
+    }
+    let payload: FeishuTokenResponse = response
+        .json()
+        .await
+        .context("decode Feishu tenant_access_token response")?;
+    if payload.code != 0 {
+        anyhow::bail!(
+            "Feishu tenant_access_token failed: {}",
+            payload.msg.as_deref().unwrap_or("unknown error")
+        );
+    }
+    if payload
+        .tenant_access_token
+        .as_deref()
+        .unwrap_or("")
+        .is_empty()
+    {
+        anyhow::bail!("Feishu tenant_access_token response did not include a token");
+    }
+    Ok(payload)
 }
 
 async fn pair_telegram_admin(token: &str, username: Option<&str>) -> Result<TelegramPairing> {
@@ -1331,6 +1519,14 @@ fn telegram_api_url(token: &str, method: &str) -> String {
     format!("https://api.telegram.org/bot{token}/{method}")
 }
 
+fn stable_channel_hash(value: &str) -> i64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    (hasher.finish() & (i64::MAX as u64)) as i64
+}
+
 fn parse_provider_kind(raw: &str) -> Result<ProviderKind> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "openai-compatible" | "openai" => Ok(ProviderKind::OpenAiCompatible),
@@ -1387,6 +1583,14 @@ fn help_text() -> &'static str {
 struct TelegramEnvelope<T> {
     ok: bool,
     result: T,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeishuTokenResponse {
+    code: i64,
+    msg: Option<String>,
+    tenant_access_token: Option<String>,
+    expire: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1494,10 +1698,12 @@ mod tests {
         fs::write(&key_path, "test-master-key").unwrap();
 
         let config = super::AppConfig {
+            channel: super::ChannelSection::default(),
             telegram: super::TelegramSection {
                 bot_token: "token".into(),
                 poll_timeout_secs: Some(30),
             },
+            feishu: super::FeishuSection::default(),
             llm: super::LlmSection {
                 base_url: None,
                 api_key: None,

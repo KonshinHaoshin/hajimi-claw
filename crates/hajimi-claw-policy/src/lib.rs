@@ -68,7 +68,7 @@ pub enum PolicyDecision {
 #[derive(Debug, Clone)]
 pub struct ElevationLease {
     pub reason: String,
-    pub expires_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Default)]
@@ -105,7 +105,13 @@ impl PolicyEngine {
     pub fn current_mode(&self) -> PolicyMode {
         let state = self.state.read().expect("policy state poisoned");
         match &state.elevated_lease {
-            Some(lease) if lease.expires_at > Utc::now() => PolicyMode::ElevatedLease,
+            Some(lease)
+                if lease
+                    .expires_at
+                    .is_none_or(|expires_at| expires_at > Utc::now()) =>
+            {
+                PolicyMode::ElevatedLease
+            }
             _ if !state.approvals.is_empty() => PolicyMode::ApprovalPending,
             _ => PolicyMode::Normal,
         }
@@ -122,7 +128,7 @@ impl PolicyEngine {
             risk_level: RiskLevel::Dangerous,
             command_preview: format!("elevated lease for {} minute(s)", minutes),
             cwd: None,
-            expires_at: Utc::now() + Duration::minutes(10),
+            expires_at: Utc::now() + Duration::minutes(minutes),
         };
         self.state
             .write()
@@ -138,10 +144,30 @@ impl PolicyEngine {
         if request.command_preview.starts_with("elevated lease") {
             state.elevated_lease = Some(ElevationLease {
                 reason: request.reason.clone(),
-                expires_at: Utc::now() + Duration::minutes(10),
+                expires_at: Some(request.expires_at),
             });
         }
         Some(request)
+    }
+
+    pub fn enable_elevation(&self, minutes: i64, reason: String) {
+        self.state
+            .write()
+            .expect("policy state poisoned")
+            .elevated_lease = Some(ElevationLease {
+            reason,
+            expires_at: Some(Utc::now() + Duration::minutes(minutes)),
+        });
+    }
+
+    pub fn enable_full_elevation(&self, reason: String) {
+        self.state
+            .write()
+            .expect("policy state poisoned")
+            .elevated_lease = Some(ElevationLease {
+            reason,
+            expires_at: None,
+        });
     }
 
     pub fn reject(&self, request_id: ApprovalId) -> Option<ApprovalRequest> {
@@ -161,11 +187,11 @@ impl PolicyEngine {
 
     pub fn expire_lease_if_needed(&self) {
         let mut state = self.state.write().expect("policy state poisoned");
-        if state
-            .elevated_lease
-            .as_ref()
-            .is_some_and(|lease| lease.expires_at <= Utc::now())
-        {
+        if state.elevated_lease.as_ref().is_some_and(|lease| {
+            lease
+                .expires_at
+                .is_some_and(|expires_at| expires_at <= Utc::now())
+        }) {
             state.elevated_lease = None;
         }
     }
@@ -369,10 +395,7 @@ mod tests {
         config.allowed_workdirs = vec![std::env::temp_dir()];
         let engine = PolicyEngine::new(config);
         let request = sample_request("sudo", &["shutdown", "-r", "now"]);
-        let approval = match engine.request_elevation(10, "maintenance".into()) {
-            approval => approval,
-        };
-        engine.approve(approval.request_id);
+        engine.enable_elevation(10, "maintenance".into());
         assert!(matches!(
             engine.evaluate_exec(&request),
             PolicyDecision::Allow { .. }
