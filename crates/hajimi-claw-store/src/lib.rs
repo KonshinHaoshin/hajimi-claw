@@ -278,7 +278,7 @@ impl Store {
     ) -> Result<Vec<ConversationMessage>> {
         let connection = self.connection.lock().expect("store lock poisoned");
         let mut stmt = connection.prepare(
-            "SELECT role, content, created_at FROM messages WHERE conversation_id = ? ORDER BY id ASC LIMIT ?",
+            "SELECT role, content, created_at FROM messages WHERE conversation_id = ? ORDER BY id DESC LIMIT ?",
         )?;
         let rows = stmt.query_map(params![conversation_id.to_string(), limit as i64], |row| {
             Ok(ConversationMessage {
@@ -287,8 +287,11 @@ impl Store {
                 created_at: parse_ts(row.get(2)?),
             })
         })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+        let mut messages = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(anyhow::Error::from)?;
+        messages.reverse();
+        Ok(messages)
     }
 
     pub fn upsert_task(&self, task: &TaskStatus) -> Result<()> {

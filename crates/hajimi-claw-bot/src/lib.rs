@@ -8,10 +8,10 @@ use axum::routing::post;
 use axum::{Json, Router};
 use futures::{SinkExt, StreamExt};
 use hajimi_claw_gateway::{
-    Gateway, GatewayPreview, GatewayRequest, InlineKeyboard, SessionDirective,
-    parse_gateway_command,
+    ConversationDirective, Gateway, GatewayPreview, GatewayRequest, InlineKeyboard,
+    SessionDirective, parse_gateway_command,
 };
-use hajimi_claw_types::ClawError;
+use hajimi_claw_types::{ClawError, ConversationId};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
@@ -42,6 +42,7 @@ pub struct TelegramBot {
     config: TelegramConfig,
     gateway: Arc<dyn Gateway>,
     current_session: Mutex<Option<String>>,
+    current_conversation: Mutex<Option<ConversationId>>,
 }
 
 pub struct FeishuBot {
@@ -49,6 +50,7 @@ pub struct FeishuBot {
     config: FeishuConfig,
     gateway: Arc<dyn Gateway>,
     current_session: Mutex<Option<String>>,
+    current_conversation: Mutex<Option<ConversationId>>,
     token_cache: Mutex<Option<CachedTenantToken>>,
     ws_state: Mutex<FeishuWsState>,
 }
@@ -71,6 +73,7 @@ impl TelegramBot {
             config,
             gateway,
             current_session: Mutex::new(None),
+            current_conversation: Mutex::new(None),
         }
     }
 
@@ -120,21 +123,10 @@ impl TelegramBot {
             let actor_chat_id = message.chat.id;
             if is_natural_language(&text) {
                 self.send_chat_action(message.chat.id, "typing").await?;
-                let preview = self
-                    .preview_command(&text, actor_user_id, actor_chat_id)
-                    .await;
-                let placeholder_text = preview
-                    .as_ref()
-                    .map(|item| item.text.as_str())
-                    .unwrap_or("Processing your request...");
-                let placeholder_keyboard = preview.clone().and_then(|item| item.keyboard);
-                let placeholder_id = self
-                    .send_message(message.chat.id, placeholder_text, placeholder_keyboard)
-                    .await?;
                 let reply = self
                     .dispatch_command(&text, actor_user_id, actor_chat_id)
                     .await;
-                self.edit_message(message.chat.id, placeholder_id, &reply.text, reply.keyboard)
+                self.send_message(message.chat.id, &reply.text, reply.keyboard)
                     .await?;
             } else {
                 let reply = self
@@ -182,6 +174,7 @@ impl TelegramBot {
         actor_chat_id: i64,
     ) -> BotReply {
         let current_session_id = self.current_session.lock().await.clone();
+        let current_conversation_id = *self.current_conversation.lock().await;
         match self
             .gateway
             .handle(GatewayRequest {
@@ -190,6 +183,7 @@ impl TelegramBot {
                 raw_text: text.to_string(),
                 command: parse_gateway_command(text),
                 current_session_id,
+                current_conversation_id,
             })
             .await
         {
@@ -203,6 +197,15 @@ impl TelegramBot {
                         *self.current_session.lock().await = None;
                     }
                 }
+                match response.conversation {
+                    ConversationDirective::Keep => {}
+                    ConversationDirective::Set(conversation_id) => {
+                        *self.current_conversation.lock().await = Some(conversation_id);
+                    }
+                    ConversationDirective::Clear => {
+                        *self.current_conversation.lock().await = None;
+                    }
+                }
                 BotReply {
                     text: response.text,
                     keyboard: response.keyboard,
@@ -213,24 +216,6 @@ impl TelegramBot {
                 keyboard: None,
             },
         }
-    }
-
-    async fn preview_command(
-        &self,
-        text: &str,
-        actor_user_id: i64,
-        actor_chat_id: i64,
-    ) -> Option<GatewayPreview> {
-        let current_session_id = self.current_session.lock().await.clone();
-        self.gateway
-            .preview(GatewayRequest {
-                actor_user_id,
-                actor_chat_id,
-                raw_text: text.to_string(),
-                command: parse_gateway_command(text),
-                current_session_id,
-            })
-            .await
     }
 
     async fn get_updates(&self, offset: i64) -> Result<Vec<Update>> {
@@ -416,6 +401,7 @@ impl FeishuBot {
             config,
             gateway,
             current_session: Mutex::new(None),
+            current_conversation: Mutex::new(None),
             token_cache: Mutex::new(None),
             ws_state: Mutex::new(FeishuWsState::default()),
         }
@@ -630,6 +616,7 @@ impl FeishuBot {
         actor_chat_id: i64,
     ) -> BotReply {
         let current_session_id = self.current_session.lock().await.clone();
+        let current_conversation_id = *self.current_conversation.lock().await;
         match self
             .gateway
             .handle(GatewayRequest {
@@ -638,6 +625,7 @@ impl FeishuBot {
                 raw_text: text.to_string(),
                 command: parse_gateway_command(text),
                 current_session_id,
+                current_conversation_id,
             })
             .await
         {
@@ -649,6 +637,15 @@ impl FeishuBot {
                     }
                     SessionDirective::Clear => {
                         *self.current_session.lock().await = None;
+                    }
+                }
+                match response.conversation {
+                    ConversationDirective::Keep => {}
+                    ConversationDirective::Set(conversation_id) => {
+                        *self.current_conversation.lock().await = Some(conversation_id);
+                    }
+                    ConversationDirective::Clear => {
+                        *self.current_conversation.lock().await = None;
                     }
                 }
                 BotReply {
@@ -670,6 +667,7 @@ impl FeishuBot {
         actor_chat_id: i64,
     ) -> Option<GatewayPreview> {
         let current_session_id = self.current_session.lock().await.clone();
+        let current_conversation_id = *self.current_conversation.lock().await;
         self.gateway
             .preview(GatewayRequest {
                 actor_user_id,
@@ -677,6 +675,7 @@ impl FeishuBot {
                 raw_text: text.to_string(),
                 command: parse_gateway_command(text),
                 current_session_id,
+                current_conversation_id,
             })
             .await
     }

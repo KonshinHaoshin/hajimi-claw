@@ -39,6 +39,12 @@ pub struct ShellOpenReply {
     pub message: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct AskReply {
+    pub conversation_id: ConversationId,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MultiAgentPreference {
     Auto,
@@ -145,14 +151,16 @@ impl AgentRuntime {
     }
 
     pub async fn ask(&self, prompt: &str, cwd: Option<PathBuf>) -> ClawResult<String> {
-        self.ask_with_provider_and_preference_and_session(
-            prompt,
-            cwd,
-            None,
-            MultiAgentPreference::Auto,
-            None,
-        )
-        .await
+        Ok(self
+            .ask_with_provider_and_preference_and_session(
+                prompt,
+                cwd,
+                None,
+                MultiAgentPreference::Auto,
+                None,
+            )
+            .await?
+            .message)
     }
 
     pub async fn ask_with_provider(
@@ -161,14 +169,16 @@ impl AgentRuntime {
         cwd: Option<PathBuf>,
         provider_id: Option<String>,
     ) -> ClawResult<String> {
-        self.ask_with_provider_and_preference_and_session(
-            prompt,
-            cwd,
-            provider_id,
-            MultiAgentPreference::Auto,
-            None,
-        )
-        .await
+        Ok(self
+            .ask_with_provider_and_preference_and_session(
+                prompt,
+                cwd,
+                provider_id,
+                MultiAgentPreference::Auto,
+                None,
+            )
+            .await?
+            .message)
     }
 
     pub fn preview_multi_agent_request(
@@ -190,14 +200,16 @@ impl AgentRuntime {
         provider_id: Option<String>,
         preference: MultiAgentPreference,
     ) -> ClawResult<String> {
-        self.ask_with_provider_and_preference_and_session(
-            prompt,
-            cwd,
-            provider_id,
-            preference,
-            None,
-        )
-        .await
+        Ok(self
+            .ask_with_provider_and_preference_and_session(
+                prompt,
+                cwd,
+                provider_id,
+                preference,
+                None,
+            )
+            .await?
+            .message)
     }
 
     pub async fn ask_with_provider_and_preference_and_session(
@@ -207,7 +219,27 @@ impl AgentRuntime {
         provider_id: Option<String>,
         preference: MultiAgentPreference,
         current_session_id: Option<String>,
-    ) -> ClawResult<String> {
+    ) -> ClawResult<AskReply> {
+        self.ask_with_provider_and_preference_and_session_and_conversation(
+            prompt,
+            cwd,
+            provider_id,
+            preference,
+            None,
+            current_session_id,
+        )
+        .await
+    }
+
+    pub async fn ask_with_provider_and_preference_and_session_and_conversation(
+        &self,
+        prompt: &str,
+        cwd: Option<PathBuf>,
+        provider_id: Option<String>,
+        preference: MultiAgentPreference,
+        conversation_id: Option<ConversationId>,
+        current_session_id: Option<String>,
+    ) -> ClawResult<AskReply> {
         let _permit = self
             .task_gate
             .acquire()
@@ -215,7 +247,7 @@ impl AgentRuntime {
             .map_err(|_| ClawError::Backend("task gate closed".into()))?;
 
         let task_id = TaskId::new();
-        let conversation_id = ConversationId::new();
+        let conversation_id = conversation_id.unwrap_or_default();
         let mut status = self.new_task_status(
             task_id,
             conversation_id,
@@ -299,7 +331,10 @@ impl AgentRuntime {
             }
         }
 
-        result
+        result.map(|message| AskReply {
+            conversation_id,
+            message,
+        })
     }
 
     pub async fn shell_open(
@@ -904,14 +939,20 @@ impl AgentRuntime {
                 ));
             }
         }
-        let messages = self
-            .store
-            .list_messages(execution.conversation_id, 200)
-            .map_err(store_error)?;
         let mut tool_history = self.load_completed_tool_history(execution.task_id)?;
         let blocked = self.load_blocked_tool_invocation(execution.task_id)?;
+        let all_messages = self
+            .store
+            .list_messages(execution.conversation_id, 10_000)
+            .map_err(store_error)?;
 
         for _ in 0..8 {
+            let messages = trim_messages_to_context_limit(
+                all_messages.clone(),
+                provider.config.capabilities.max_context_chars,
+                system_prompt.len(),
+                &tool_history,
+            );
             let should_resume_blocked = blocked.as_ref().is_some_and(|blocked_record| {
                 !tool_history.iter().any(|item| {
                     item.call.id == blocked_record.call_id
@@ -1219,6 +1260,56 @@ impl AgentRuntime {
     async fn run_llm_request(&self, request: AgentRequest) -> ClawResult<String> {
         collect_text_response(self.llm.clone(), request).await
     }
+}
+
+fn trim_messages_to_context_limit(
+    messages: Vec<ConversationMessage>,
+    max_context_chars: Option<usize>,
+    system_prompt_chars: usize,
+    tool_history: &[ToolExchange],
+) -> Vec<ConversationMessage> {
+    let Some(max_context_chars) = max_context_chars else {
+        return messages;
+    };
+    let reserved = system_prompt_chars
+        .saturating_add(approx_tool_history_chars(tool_history))
+        .saturating_add(1024);
+    let budget = max_context_chars.saturating_sub(reserved);
+    if budget == 0 {
+        return messages
+            .into_iter()
+            .rev()
+            .take(1)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+    }
+
+    let mut kept = Vec::new();
+    let mut used = 0usize;
+    for message in messages.into_iter().rev() {
+        let message_chars = message.content.chars().count().saturating_add(32);
+        if !kept.is_empty() && used.saturating_add(message_chars) > budget {
+            break;
+        }
+        used = used.saturating_add(message_chars);
+        kept.push(message);
+    }
+    kept.reverse();
+    kept
+}
+
+fn approx_tool_history_chars(tool_history: &[ToolExchange]) -> usize {
+    tool_history
+        .iter()
+        .map(|exchange| {
+            exchange.call.name.chars().count()
+                + exchange.result.content.chars().count()
+                + exchange.call.arguments.to_string().chars().count()
+                + 128
+        })
+        .sum()
 }
 
 async fn collect_text_response(

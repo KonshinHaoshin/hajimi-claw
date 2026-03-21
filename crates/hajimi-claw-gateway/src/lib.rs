@@ -8,8 +8,8 @@ use hajimi_claw_llm::{list_models, test_provider};
 use hajimi_claw_policy::PolicyEngine;
 use hajimi_claw_store::Store;
 use hajimi_claw_types::{
-    ClawError, ClawResult, OnboardingSession, OnboardingStep, ProviderCapabilities, ProviderConfig,
-    ProviderDraft, ProviderKind, ProviderRecord,
+    ClawError, ClawResult, ConversationId, OnboardingSession, OnboardingStep, ProviderCapabilities,
+    ProviderConfig, ProviderDraft, ProviderKind, ProviderRecord,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,7 @@ pub enum GatewayCommand {
     ShellExec(String),
     ShellClose,
     Status,
+    NewConversation,
     Approve(String),
     ElevatedMenu,
     ElevatedOn,
@@ -64,6 +65,7 @@ pub struct GatewayRequest {
     pub raw_text: String,
     pub command: GatewayCommand,
     pub current_session_id: Option<String>,
+    pub current_conversation_id: Option<ConversationId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,10 +75,18 @@ pub enum SessionDirective {
     Clear,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConversationDirective {
+    Keep,
+    Set(ConversationId),
+    Clear,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewayResponse {
     pub text: String,
     pub session: SessionDirective,
+    pub conversation: ConversationDirective,
     pub keyboard: Option<InlineKeyboard>,
 }
 
@@ -194,18 +204,21 @@ impl Gateway for InProcessGateway {
                     .resolve_provider_for_chat(request.actor_chat_id)
                     .map_err(store_error)?
                     .map(|record| record.config.id);
+                let reply = self
+                    .runtime
+                    .ask_with_provider_and_preference_and_session_and_conversation(
+                        &prompt,
+                        None,
+                        provider_id,
+                        preference,
+                        request.current_conversation_id,
+                        request.current_session_id.clone(),
+                    )
+                    .await?;
                 Ok(GatewayResponse {
-                    text: self
-                        .runtime
-                        .ask_with_provider_and_preference_and_session(
-                            &prompt,
-                            None,
-                            provider_id,
-                            preference,
-                            request.current_session_id.clone(),
-                        )
-                        .await?,
+                    text: reply.message,
                     session: SessionDirective::Keep,
+                    conversation: ConversationDirective::Set(reply.conversation_id),
                     keyboard: None,
                 })
             }
@@ -214,6 +227,7 @@ impl Gateway for InProcessGateway {
                 Ok(GatewayResponse {
                     text: reply.message,
                     session: SessionDirective::Set(reply.session_id),
+                    conversation: ConversationDirective::Keep,
                     keyboard: None,
                 })
             }
@@ -224,6 +238,7 @@ impl Gateway for InProcessGateway {
                 Ok(GatewayResponse {
                     text: self.runtime.shell_exec(&session_id, &command).await?,
                     session: SessionDirective::Keep,
+                    conversation: ConversationDirective::Keep,
                     keyboard: None,
                 })
             }
@@ -234,6 +249,7 @@ impl Gateway for InProcessGateway {
                 Ok(GatewayResponse {
                     text: self.runtime.shell_status(&session_id).await?,
                     session: SessionDirective::Keep,
+                    conversation: ConversationDirective::Keep,
                     keyboard: None,
                 })
             }
@@ -244,9 +260,16 @@ impl Gateway for InProcessGateway {
                 Ok(GatewayResponse {
                     text: self.runtime.shell_close(&session_id).await?,
                     session: SessionDirective::Clear,
+                    conversation: ConversationDirective::Keep,
                     keyboard: None,
                 })
             }
+            GatewayCommand::NewConversation => Ok(GatewayResponse {
+                text: "started a new conversation".into(),
+                session: SessionDirective::Keep,
+                conversation: ConversationDirective::Clear,
+                keyboard: None,
+            }),
             GatewayCommand::Status => Ok(text_response(&self.runtime.status()?)),
             GatewayCommand::Approve(request_id) => {
                 Ok(text_response(&self.runtime.approve(&request_id).await?))
@@ -798,6 +821,9 @@ pub fn parse_gateway_command(text: &str) -> GatewayCommand {
     if trimmed == "/shell close" {
         return GatewayCommand::ShellClose;
     }
+    if trimmed == "/new" {
+        return GatewayCommand::NewConversation;
+    }
     if trimmed == "/shell status" {
         return GatewayCommand::ShellStatus;
     }
@@ -848,6 +874,7 @@ pub fn help_text() -> String {
         "/shell status",
         "/shell exec <cmd>",
         "/shell close",
+        "/new",
         "/status",
         "/menu",
         "/approve <request-id>",
@@ -965,6 +992,7 @@ fn text_response(text: &str) -> GatewayResponse {
     GatewayResponse {
         text: text.to_string(),
         session: SessionDirective::Keep,
+        conversation: ConversationDirective::Keep,
         keyboard: None,
     }
 }
@@ -973,6 +1001,7 @@ fn text_response_with_keyboard(text: &str, keyboard: Option<InlineKeyboard>) -> 
     GatewayResponse {
         text: text.to_string(),
         session: SessionDirective::Keep,
+        conversation: ConversationDirective::Keep,
         keyboard,
     }
 }
@@ -1032,6 +1061,10 @@ fn main_menu_keyboard() -> InlineKeyboard {
                 InlineButton {
                     text: "Providers".into(),
                     data: "/provider list".into(),
+                },
+                InlineButton {
+                    text: "New".into(),
+                    data: "/new".into(),
                 },
                 InlineButton {
                     text: "Elevated".into(),
@@ -1374,6 +1407,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parses_new_conversation_command() {
+        assert_eq!(
+            parse_gateway_command("/new"),
+            GatewayCommand::NewConversation
+        );
+    }
+
     #[tokio::test]
     async fn gateway_opens_session_and_sets_channel_state() -> Result<()> {
         let dir = tempdir()?;
@@ -1402,6 +1443,7 @@ mod tests {
                 raw_text: "/shell open ops".into(),
                 command: GatewayCommand::ShellOpen(Some("ops".into())),
                 current_session_id: None,
+                current_conversation_id: None,
             })
             .await?;
         assert!(matches!(response.session, SessionDirective::Set(_)));
@@ -1436,6 +1478,7 @@ mod tests {
                 raw_text: "/onboard".into(),
                 command: GatewayCommand::Onboard,
                 current_session_id: None,
+                current_conversation_id: None,
             })
             .await?;
         assert!(response.text.contains("Step 1/5"));
@@ -1492,6 +1535,7 @@ mod tests {
                 raw_text: "/provider current".into(),
                 command: GatewayCommand::ProviderCurrent,
                 current_session_id: None,
+                current_conversation_id: None,
             })
             .await?;
         assert!(response.keyboard.is_some());
@@ -1526,6 +1570,7 @@ mod tests {
                 raw_text: "/elevated".into(),
                 command: GatewayCommand::ElevatedMenu,
                 current_session_id: None,
+                current_conversation_id: None,
             })
             .await?;
         assert!(response.text.contains("elevated controls"));
@@ -1561,6 +1606,7 @@ mod tests {
                 raw_text: "/agents on".into(),
                 command: GatewayCommand::AgentsOn,
                 current_session_id: None,
+                current_conversation_id: None,
             })
             .await?;
 
@@ -1571,6 +1617,7 @@ mod tests {
                 raw_text: "你好".into(),
                 command: GatewayCommand::Ask("你好".into()),
                 current_session_id: None,
+                current_conversation_id: None,
             })
             .await
             .expect("preview should exist");

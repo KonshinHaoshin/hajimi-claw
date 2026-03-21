@@ -53,7 +53,7 @@ impl ToolRegistry {
             Arc::new(DockerLogsTool::new(executor.clone())),
             Arc::new(DockerRestartTool::new(executor.clone())),
             Arc::new(RunCommandTool::new(executor.clone())),
-            Arc::new(ExecOnceTool::new(executor.clone())),
+            Arc::new(ExecOnceTool::new(executor.clone(), policy.clone())),
             Arc::new(PingHostTool::new(executor.clone())),
             Arc::new(SessionOpenTool::new(executor.clone())),
             Arc::new(SessionStatusTool::new(executor.clone())),
@@ -1238,11 +1238,12 @@ impl Tool for RunCommandTool {
 
 struct ExecOnceTool {
     executor: Arc<dyn Executor>,
+    policy: Arc<PolicyEngine>,
 }
 
 impl ExecOnceTool {
-    fn new(executor: Arc<dyn Executor>) -> Self {
-        Self { executor }
+    fn new(executor: Arc<dyn Executor>, policy: Arc<PolicyEngine>) -> Self {
+        Self { executor, policy }
     }
 }
 
@@ -1289,6 +1290,7 @@ impl Tool for ExecOnceTool {
 
         let input: Input = serde_json::from_value(input)
             .map_err(|err| ClawError::InvalidRequest(err.to_string()))?;
+        let config = self.policy.config();
         let result = self
             .executor
             .run_once(ExecRequest {
@@ -1296,8 +1298,14 @@ impl Tool for ExecOnceTool {
                 args: input.args.unwrap_or_default(),
                 cwd: input.cwd.or(ctx.working_directory),
                 env_allowlist: vec![],
-                timeout_secs: input.timeout_secs.unwrap_or(60).max(1),
-                max_output_bytes: input.max_output_bytes.unwrap_or(24 * 1024).max(256),
+                timeout_secs: input
+                    .timeout_secs
+                    .unwrap_or(60)
+                    .clamp(1, config.max_timeout_secs),
+                max_output_bytes: input
+                    .max_output_bytes
+                    .unwrap_or(24 * 1024)
+                    .clamp(256, config.max_output_bytes),
                 requires_tty: input.requires_tty.unwrap_or(false),
             })
             .await?;
@@ -1929,6 +1937,45 @@ mod tests {
         assert_eq!(request.command, "ping");
         assert!(request.args.iter().any(|arg| arg == "example.com"));
         assert!(output.content.contains("exit_code=0"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exec_once_clamps_output_and_timeout_to_policy_maximums() -> Result<()> {
+        let executor = Arc::new(FakeExecutor {
+            last_request: Mutex::new(None),
+        });
+        let policy = Arc::new(PolicyEngine::new(PolicyConfig {
+            max_timeout_secs: 30,
+            max_output_bytes: 4096,
+            ..PolicyConfig::default()
+        }));
+        let tools = ToolRegistry::default(executor.clone(), policy);
+        let _ = tools
+            .call(
+                "exec_once",
+                ToolContext {
+                    conversation_id: ConversationId::new(),
+                    working_directory: None,
+                    elevated: true,
+                },
+                json!({
+                    "command": "powershell",
+                    "args": ["-Command", "Get-ComputerInfo"],
+                    "timeout_secs": 999,
+                    "max_output_bytes": 65536
+                }),
+            )
+            .await?;
+
+        let request = executor
+            .last_request
+            .lock()
+            .await
+            .clone()
+            .expect("captured request");
+        assert_eq!(request.timeout_secs, 30);
+        assert_eq!(request.max_output_bytes, 4096);
         Ok(())
     }
 
