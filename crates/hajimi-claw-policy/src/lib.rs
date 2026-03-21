@@ -152,6 +152,15 @@ impl PolicyEngine {
         Some(request)
     }
 
+    pub fn get_approval(&self, request_id: ApprovalId) -> Option<ApprovalRequest> {
+        self.state
+            .read()
+            .expect("policy state poisoned")
+            .approvals
+            .get(&request_id)
+            .cloned()
+    }
+
     pub fn enable_elevation(&self, minutes: i64, reason: String) {
         self.state
             .write()
@@ -263,6 +272,12 @@ impl PolicyEngine {
             .iter()
             .any(|pattern| pattern.is_match(&rendered))
         {
+            if self.is_elevated() {
+                return PolicyDecision::Allow {
+                    risk: RiskLevel::Guarded,
+                    mode: PolicyMode::ElevatedLease,
+                };
+            }
             let approval = ApprovalRequest {
                 request_id: ApprovalId::new(),
                 reason: "guarded command requires explicit approval".into(),

@@ -9,7 +9,7 @@ use hajimi_claw_policy::PolicyEngine;
 use hajimi_claw_store::Store;
 use hajimi_claw_types::{
     ClawError, ClawResult, OnboardingSession, OnboardingStep, ProviderConfig, ProviderDraft,
-    ProviderKind, ProviderRecord,
+    ProviderKind, ProviderRecord, ProviderCapabilities,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -196,7 +196,13 @@ impl Gateway for InProcessGateway {
                 Ok(GatewayResponse {
                     text: self
                         .runtime
-                        .ask_with_provider_and_preference(&prompt, None, provider_id, preference)
+                        .ask_with_provider_and_preference_and_session(
+                            &prompt,
+                            None,
+                            provider_id,
+                            preference,
+                            request.current_session_id.clone(),
+                        )
                         .await?,
                     session: SessionDirective::Keep,
                     keyboard: None,
@@ -242,7 +248,7 @@ impl Gateway for InProcessGateway {
             }
             GatewayCommand::Status => Ok(text_response(&self.runtime.status()?)),
             GatewayCommand::Approve(request_id) => {
-                Ok(text_response(&self.runtime.approve(&request_id)?))
+                Ok(text_response(&self.runtime.approve(&request_id).await?))
             }
             GatewayCommand::ElevatedOn => Ok(text_response(&self.runtime.enable_elevated())),
             GatewayCommand::ElevatedOff => Ok(text_response(&self.runtime.stop_elevated())),
@@ -873,6 +879,7 @@ fn finalize_provider(draft: ProviderDraft) -> ClawResult<ProviderConfig> {
         api_key,
         model,
         fallback_models: draft.fallback_models.unwrap_or_default(),
+        capabilities: default_provider_capabilities(),
         enabled: true,
         extra_headers: vec![],
         created_at: Utc::now(),
@@ -886,6 +893,15 @@ fn parse_provider_kind(raw: &str) -> ClawResult<ProviderKind> {
         _ => Err(ClawError::InvalidRequest(
             "provider kind must be `openai-compatible` or `custom-chat-completions`".into(),
         )),
+    }
+}
+
+fn default_provider_capabilities() -> ProviderCapabilities {
+    ProviderCapabilities {
+        tool_calling: true,
+        streaming: false,
+        json_mode: false,
+        max_context_chars: Some(24_000),
     }
 }
 
@@ -1378,6 +1394,12 @@ mod tests {
                 api_key: "secret".into(),
                 model: "gpt-5.1".into(),
                 fallback_models: vec![],
+                capabilities: hajimi_claw_types::ProviderCapabilities {
+                    tool_calling: true,
+                    streaming: false,
+                    json_mode: false,
+                    max_context_chars: Some(24_000),
+                },
                 enabled: true,
                 extra_headers: vec![],
                 created_at: chrono::Utc::now(),

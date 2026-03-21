@@ -142,6 +142,16 @@ Current Feishu limitations:
 ## CLI
 
 - `hajimi`
+- `hajimi ask <prompt>`
+- `hajimi tasks`
+- `hajimi approvals`
+- `hajimi approve <request-id>`
+- `hajimi shell open [name]`
+- `hajimi shell status <session-id>`
+- `hajimi shell exec <session-id> <command>`
+- `hajimi shell close <session-id>`
+- `hajimi profile show`
+- `hajimi profile use <ops-safe|dev-agent|computer-use>`
 - `hajimi daemon`
 - `hajimi launch`
 - `hajimi stop`
@@ -157,6 +167,9 @@ Current Feishu limitations:
 - `hajimi models [provider-id]`
 - `hajimi restart`
 - `hajimi help`
+
+`hajimi ask` now records task state and tool invocations in SQLite. If a guarded command blocks on
+approval, `hajimi approve <request-id>` resumes the blocked task instead of asking you to rerun it.
 
 ## Multi-Agent
 

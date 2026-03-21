@@ -81,9 +81,30 @@ pub struct ProviderConfig {
     pub model: String,
     #[serde(default)]
     pub fallback_models: Vec<String>,
+    #[serde(default)]
+    pub capabilities: ProviderCapabilities,
     pub enabled: bool,
     pub extra_headers: Vec<(String, String)>,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderCapabilities {
+    pub tool_calling: bool,
+    pub streaming: bool,
+    pub json_mode: bool,
+    pub max_context_chars: Option<usize>,
+}
+
+impl Default for ProviderCapabilities {
+    fn default() -> Self {
+        Self {
+            tool_calling: false,
+            streaming: false,
+            json_mode: false,
+            max_context_chars: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -307,15 +328,102 @@ pub enum TaskKind {
     PersistentShellTask,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TaskRunState {
+    Queued,
+    Running,
+    BlockedApproval,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskStatus {
     pub id: TaskId,
+    pub conversation_id: ConversationId,
     pub kind: TaskKind,
     pub description: String,
     pub queued_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
+    pub state: TaskRunState,
     pub running: bool,
+    pub cwd: Option<PathBuf>,
+    pub provider_id: Option<String>,
+    pub current_session_id: Option<String>,
+    pub result_preview: Option<String>,
+    pub error: Option<String>,
+    pub blocked_approval_id: Option<ApprovalId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ToolInvocationStatus {
+    Pending,
+    Running,
+    BlockedApproval,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolInvocationRecord {
+    pub task_id: TaskId,
+    pub conversation_id: ConversationId,
+    pub call_id: Option<String>,
+    pub tool_name: String,
+    pub arguments: Value,
+    pub status: ToolInvocationStatus,
+    pub output_content: Option<String>,
+    pub output_structured: Option<Value>,
+    pub error: Option<String>,
+    pub approval_id: Option<ApprovalId>,
+    pub sequence: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalRecord {
+    pub request: ApprovalRequest,
+    pub approved: Option<bool>,
+    pub task_id: Option<TaskId>,
+    pub tool_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExecutionProfile {
+    OpsSafe,
+    DevAgent,
+    ComputerUse,
+}
+
+impl ExecutionProfile {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::OpsSafe => "ops-safe",
+            Self::DevAgent => "dev-agent",
+            Self::ComputerUse => "computer-use",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "ops-safe" | "ops" => Some(Self::OpsSafe),
+            "dev-agent" | "dev" => Some(Self::DevAgent),
+            "computer-use" | "computer" => Some(Self::ComputerUse),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionBinding {
+    pub task_id: TaskId,
+    pub conversation_id: ConversationId,
+    pub session_id: SessionId,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[async_trait]

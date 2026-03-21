@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use aes_gcm::aead::{Aead, KeyInit, OsRng, rand_core::RngCore};
@@ -8,9 +8,10 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, Utc};
 use hajimi_claw_types::{
-    ApprovalRequest, ConversationId, ConversationMessage, HeartbeatStatus, OnboardingSession,
-    ProviderConfig, ProviderDraft, ProviderKind, ProviderRecord, SessionHandle, SessionSummary,
-    TaskId, TaskKind, TaskStatus,
+    ApprovalId, ApprovalRecord, ApprovalRequest, ConversationId, ConversationMessage,
+    HeartbeatStatus, OnboardingSession, ProviderCapabilities, ProviderConfig, ProviderDraft,
+    ProviderKind, ProviderRecord, SessionHandle, SessionSummary, TaskId, TaskKind, TaskRunState,
+    TaskStatus, ToolInvocationRecord, ToolInvocationStatus,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
@@ -72,12 +73,20 @@ impl Store {
 
             CREATE TABLE IF NOT EXISTS tasks (
                 id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL DEFAULT '',
                 kind TEXT NOT NULL,
                 description TEXT NOT NULL,
                 queued_at TEXT NOT NULL,
                 started_at TEXT,
                 finished_at TEXT,
-                running INTEGER NOT NULL
+                state TEXT NOT NULL DEFAULT 'Queued',
+                running INTEGER NOT NULL,
+                cwd TEXT,
+                provider_id TEXT,
+                current_session_id TEXT,
+                result_preview TEXT,
+                error TEXT,
+                blocked_approval_id TEXT
             );
 
             CREATE TABLE IF NOT EXISTS shell_sessions (
@@ -96,7 +105,26 @@ impl Store {
                 command_preview TEXT NOT NULL,
                 cwd TEXT,
                 expires_at TEXT NOT NULL,
-                approved INTEGER
+                approved INTEGER,
+                task_id TEXT,
+                tool_name TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS tool_invocations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                call_id TEXT,
+                tool_name TEXT NOT NULL,
+                arguments_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                output_content TEXT,
+                output_structured_json TEXT,
+                error TEXT,
+                approval_id TEXT,
+                sequence_no INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS command_audit (
@@ -128,6 +156,7 @@ impl Store {
                 api_key TEXT NOT NULL,
                 model TEXT NOT NULL,
                 fallback_models_json TEXT NOT NULL DEFAULT '[]',
+                capabilities_json TEXT NOT NULL DEFAULT '{"tool_calling":false,"streaming":false,"json_mode":false,"max_context_chars":null}',
                 enabled INTEGER NOT NULL,
                 extra_headers_json TEXT NOT NULL,
                 is_default INTEGER NOT NULL,
@@ -155,6 +184,72 @@ impl Store {
             "fallback_models_json",
             "ALTER TABLE providers ADD COLUMN fallback_models_json TEXT NOT NULL DEFAULT '[]'",
         )?;
+        ensure_column(
+            &connection,
+            "tasks",
+            "conversation_id",
+            "ALTER TABLE tasks ADD COLUMN conversation_id TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &connection,
+            "tasks",
+            "state",
+            "ALTER TABLE tasks ADD COLUMN state TEXT NOT NULL DEFAULT 'Queued'",
+        )?;
+        ensure_column(
+            &connection,
+            "tasks",
+            "cwd",
+            "ALTER TABLE tasks ADD COLUMN cwd TEXT",
+        )?;
+        ensure_column(
+            &connection,
+            "tasks",
+            "provider_id",
+            "ALTER TABLE tasks ADD COLUMN provider_id TEXT",
+        )?;
+        ensure_column(
+            &connection,
+            "tasks",
+            "current_session_id",
+            "ALTER TABLE tasks ADD COLUMN current_session_id TEXT",
+        )?;
+        ensure_column(
+            &connection,
+            "tasks",
+            "result_preview",
+            "ALTER TABLE tasks ADD COLUMN result_preview TEXT",
+        )?;
+        ensure_column(
+            &connection,
+            "tasks",
+            "error",
+            "ALTER TABLE tasks ADD COLUMN error TEXT",
+        )?;
+        ensure_column(
+            &connection,
+            "tasks",
+            "blocked_approval_id",
+            "ALTER TABLE tasks ADD COLUMN blocked_approval_id TEXT",
+        )?;
+        ensure_column(
+            &connection,
+            "approvals",
+            "task_id",
+            "ALTER TABLE approvals ADD COLUMN task_id TEXT",
+        )?;
+        ensure_column(
+            &connection,
+            "approvals",
+            "tool_name",
+            "ALTER TABLE approvals ADD COLUMN tool_name TEXT",
+        )?;
+        ensure_column(
+            &connection,
+            "providers",
+            "capabilities_json",
+            "ALTER TABLE providers ADD COLUMN capabilities_json TEXT NOT NULL DEFAULT '{\"tool_calling\":false,\"streaming\":false,\"json_mode\":false,\"max_context_chars\":null}'",
+        )?;
         Ok(())
     }
 
@@ -176,28 +271,64 @@ impl Store {
         Ok(())
     }
 
+    pub fn list_messages(
+        &self,
+        conversation_id: ConversationId,
+        limit: usize,
+    ) -> Result<Vec<ConversationMessage>> {
+        let connection = self.connection.lock().expect("store lock poisoned");
+        let mut stmt = connection.prepare(
+            "SELECT role, content, created_at FROM messages WHERE conversation_id = ? ORDER BY id ASC LIMIT ?",
+        )?;
+        let rows = stmt.query_map(params![conversation_id.to_string(), limit as i64], |row| {
+            Ok(ConversationMessage {
+                role: parse_message_role(row.get::<_, String>(0)?),
+                content: row.get(1)?,
+                created_at: parse_ts(row.get(2)?),
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn upsert_task(&self, task: &TaskStatus) -> Result<()> {
         let connection = self.connection.lock().expect("store lock poisoned");
         connection.execute(
             r#"
-            INSERT INTO tasks (id, kind, description, queued_at, started_at, finished_at, running)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO tasks (id, conversation_id, kind, description, queued_at, started_at, finished_at, state, running, cwd, provider_id, current_session_id, result_preview, error, blocked_approval_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
+                conversation_id=excluded.conversation_id,
                 kind=excluded.kind,
                 description=excluded.description,
                 queued_at=excluded.queued_at,
                 started_at=excluded.started_at,
                 finished_at=excluded.finished_at,
-                running=excluded.running
+                state=excluded.state,
+                running=excluded.running,
+                cwd=excluded.cwd,
+                provider_id=excluded.provider_id,
+                current_session_id=excluded.current_session_id,
+                result_preview=excluded.result_preview,
+                error=excluded.error,
+                blocked_approval_id=excluded.blocked_approval_id
             "#,
             params![
                 task.id.to_string(),
+                task.conversation_id.to_string(),
                 format!("{:?}", task.kind),
                 task.description,
                 task.queued_at.to_rfc3339(),
                 task.started_at.map(|ts| ts.to_rfc3339()),
                 task.finished_at.map(|ts| ts.to_rfc3339()),
+                format!("{:?}", task.state),
                 i64::from(task.running),
+                task.cwd.as_ref().map(|cwd| cwd.display().to_string()),
+                task.provider_id,
+                task.current_session_id,
+                task.result_preview,
+                task.error,
+                task.blocked_approval_id.map(|id| id.to_string()),
             ],
         )?;
         Ok(())
@@ -206,24 +337,75 @@ impl Store {
     pub fn list_tasks(&self) -> Result<Vec<TaskStatus>> {
         let connection = self.connection.lock().expect("store lock poisoned");
         let mut stmt = connection.prepare(
-            "SELECT id, kind, description, queued_at, started_at, finished_at, running FROM tasks ORDER BY queued_at DESC",
+            "SELECT id, conversation_id, kind, description, queued_at, started_at, finished_at, state, running, cwd, provider_id, current_session_id, result_preview, error, blocked_approval_id FROM tasks ORDER BY queued_at DESC",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(TaskStatus {
                 id: TaskId(uuid::Uuid::parse_str(row.get::<_, String>(0)?.as_str()).unwrap()),
-                kind: match row.get::<_, String>(1)?.as_str() {
+                conversation_id: parse_conversation_id(row.get::<_, String>(1)?),
+                kind: match row.get::<_, String>(2)?.as_str() {
                     "PersistentShellTask" => TaskKind::PersistentShellTask,
                     _ => TaskKind::EphemeralAgentTask,
                 },
-                description: row.get(2)?,
-                queued_at: parse_ts(row.get::<_, String>(3)?),
-                started_at: row.get::<_, Option<String>>(4)?.map(parse_ts),
-                finished_at: row.get::<_, Option<String>>(5)?.map(parse_ts),
-                running: row.get::<_, i64>(6)? != 0,
+                description: row.get(3)?,
+                queued_at: parse_ts(row.get::<_, String>(4)?),
+                started_at: row.get::<_, Option<String>>(5)?.map(parse_ts),
+                finished_at: row.get::<_, Option<String>>(6)?.map(parse_ts),
+                state: parse_task_state(row.get::<_, String>(7)?),
+                running: row.get::<_, i64>(8)? != 0,
+                cwd: row
+                    .get::<_, Option<String>>(9)?
+                    .map(|value| PathBuf::from(value)),
+                provider_id: row.get(10)?,
+                current_session_id: row.get(11)?,
+                result_preview: row.get(12)?,
+                error: row.get(13)?,
+                blocked_approval_id: row
+                    .get::<_, Option<String>>(14)?
+                    .and_then(|value| uuid::Uuid::parse_str(&value).ok())
+                    .map(ApprovalId),
             })
         })?;
 
         rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn get_task(&self, task_id: TaskId) -> Result<Option<TaskStatus>> {
+        let connection = self.connection.lock().expect("store lock poisoned");
+        connection
+            .query_row(
+                "SELECT id, conversation_id, kind, description, queued_at, started_at, finished_at, state, running, cwd, provider_id, current_session_id, result_preview, error, blocked_approval_id FROM tasks WHERE id = ?",
+                params![task_id.to_string()],
+                |row| {
+                    Ok(TaskStatus {
+                        id: TaskId(uuid::Uuid::parse_str(row.get::<_, String>(0)?.as_str()).unwrap()),
+                        conversation_id: parse_conversation_id(row.get::<_, String>(1)?),
+                        kind: match row.get::<_, String>(2)?.as_str() {
+                            "PersistentShellTask" => TaskKind::PersistentShellTask,
+                            _ => TaskKind::EphemeralAgentTask,
+                        },
+                        description: row.get(3)?,
+                        queued_at: parse_ts(row.get::<_, String>(4)?),
+                        started_at: row.get::<_, Option<String>>(5)?.map(parse_ts),
+                        finished_at: row.get::<_, Option<String>>(6)?.map(parse_ts),
+                        state: parse_task_state(row.get::<_, String>(7)?),
+                        running: row.get::<_, i64>(8)? != 0,
+                        cwd: row
+                            .get::<_, Option<String>>(9)?
+                            .map(PathBuf::from),
+                        provider_id: row.get(10)?,
+                        current_session_id: row.get(11)?,
+                        result_preview: row.get(12)?,
+                        error: row.get(13)?,
+                        blocked_approval_id: row
+                            .get::<_, Option<String>>(14)?
+                            .and_then(|value| uuid::Uuid::parse_str(&value).ok())
+                            .map(ApprovalId),
+                    })
+                },
+            )
+            .optional()
             .map_err(Into::into)
     }
 
@@ -252,31 +434,111 @@ impl Store {
         Ok(())
     }
 
-    pub fn save_approval(&self, approval: &ApprovalRequest, approved: Option<bool>) -> Result<()> {
+    pub fn save_approval_record(&self, approval: &ApprovalRecord) -> Result<()> {
         let connection = self.connection.lock().expect("store lock poisoned");
         connection.execute(
             r#"
-            INSERT INTO approvals (id, reason, risk_level, command_preview, cwd, expires_at, approved)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO approvals (id, reason, risk_level, command_preview, cwd, expires_at, approved, task_id, tool_name)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 reason=excluded.reason,
                 risk_level=excluded.risk_level,
                 command_preview=excluded.command_preview,
                 cwd=excluded.cwd,
                 expires_at=excluded.expires_at,
-                approved=excluded.approved
+                approved=excluded.approved,
+                task_id=excluded.task_id,
+                tool_name=excluded.tool_name
             "#,
             params![
-                approval.request_id.to_string(),
-                approval.reason,
-                format!("{:?}", approval.risk_level),
-                approval.command_preview,
-                approval.cwd.as_ref().map(|cwd| cwd.display().to_string()),
-                approval.expires_at.to_rfc3339(),
-                approved.map(i64::from),
+                approval.request.request_id.to_string(),
+                approval.request.reason,
+                format!("{:?}", approval.request.risk_level),
+                approval.request.command_preview,
+                approval
+                    .request
+                    .cwd
+                    .as_ref()
+                    .map(|cwd| cwd.display().to_string()),
+                approval.request.expires_at.to_rfc3339(),
+                approval.approved.map(i64::from),
+                approval.task_id.map(|id| id.to_string()),
+                approval.tool_name,
             ],
         )?;
         Ok(())
+    }
+
+    pub fn save_approval(&self, approval: &ApprovalRequest, approved: Option<bool>) -> Result<()> {
+        self.save_approval_record(&ApprovalRecord {
+            request: approval.clone(),
+            approved,
+            task_id: None,
+            tool_name: None,
+        })
+    }
+
+    pub fn get_approval_record(&self, request_id: &str) -> Result<Option<ApprovalRecord>> {
+        let connection = self.connection.lock().expect("store lock poisoned");
+        connection
+            .query_row(
+                "SELECT reason, risk_level, command_preview, cwd, expires_at, approved, task_id, tool_name FROM approvals WHERE id = ?",
+                params![request_id],
+                |row| {
+                    let request_uuid = uuid::Uuid::parse_str(request_id).map_err(to_sql_uuid_err)?;
+                    Ok(ApprovalRecord {
+                        request: ApprovalRequest {
+                            request_id: ApprovalId(request_uuid),
+                            reason: row.get(0)?,
+                            risk_level: parse_risk_level(row.get::<_, String>(1)?),
+                            command_preview: row.get(2)?,
+                            cwd: row
+                                .get::<_, Option<String>>(3)?
+                                .map(PathBuf::from),
+                            expires_at: parse_ts(row.get(4)?),
+                        },
+                        approved: row
+                            .get::<_, Option<i64>>(5)?
+                            .map(|value| value != 0),
+                        task_id: row
+                            .get::<_, Option<String>>(6)?
+                            .and_then(|value| uuid::Uuid::parse_str(&value).ok())
+                            .map(TaskId),
+                        tool_name: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_pending_approvals(&self) -> Result<Vec<ApprovalRecord>> {
+        let connection = self.connection.lock().expect("store lock poisoned");
+        let mut stmt = connection.prepare(
+            "SELECT id, reason, risk_level, command_preview, cwd, expires_at, approved, task_id, tool_name FROM approvals WHERE approved IS NULL ORDER BY expires_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let request_id = row.get::<_, String>(0)?;
+            let request_uuid = uuid::Uuid::parse_str(&request_id).map_err(to_sql_uuid_err)?;
+            Ok(ApprovalRecord {
+                request: ApprovalRequest {
+                    request_id: ApprovalId(request_uuid),
+                    reason: row.get(1)?,
+                    risk_level: parse_risk_level(row.get::<_, String>(2)?),
+                    command_preview: row.get(3)?,
+                    cwd: row.get::<_, Option<String>>(4)?.map(PathBuf::from),
+                    expires_at: parse_ts(row.get(5)?),
+                },
+                approved: row.get::<_, Option<i64>>(6)?.map(|value| value != 0),
+                task_id: row
+                    .get::<_, Option<String>>(7)?
+                    .and_then(|value| uuid::Uuid::parse_str(&value).ok())
+                    .map(TaskId),
+                tool_name: row.get(8)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     pub fn get_approval_state(&self, request_id: &str) -> Result<Option<Option<bool>>> {
@@ -315,6 +577,92 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn save_tool_invocation(&self, record: &ToolInvocationRecord) -> Result<()> {
+        let connection = self.connection.lock().expect("store lock poisoned");
+        connection.execute(
+            r#"
+            INSERT INTO tool_invocations (task_id, conversation_id, call_id, tool_name, arguments_json, status, output_content, output_structured_json, error, approval_id, sequence_no, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+            params![
+                record.task_id.to_string(),
+                record.conversation_id.to_string(),
+                record.call_id,
+                record.tool_name,
+                serde_json::to_string(&record.arguments)?,
+                format!("{:?}", record.status),
+                record.output_content,
+                record
+                    .output_structured
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
+                record.error,
+                record.approval_id.map(|id| id.to_string()),
+                record.sequence,
+                record.created_at.to_rfc3339(),
+                record.updated_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_tool_invocations(&self, task_id: TaskId) -> Result<Vec<ToolInvocationRecord>> {
+        let connection = self.connection.lock().expect("store lock poisoned");
+        let mut stmt = connection.prepare(
+            "SELECT task_id, conversation_id, call_id, tool_name, arguments_json, status, output_content, output_structured_json, error, approval_id, sequence_no, created_at, updated_at FROM tool_invocations WHERE task_id = ? ORDER BY sequence_no ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![task_id.to_string()], |row| {
+            let task_id_raw = row.get::<_, String>(0)?;
+            let conversation_id_raw = row.get::<_, String>(1)?;
+            let arguments_json: String = row.get(4)?;
+            let output_structured_json: Option<String> = row.get(7)?;
+            Ok(ToolInvocationRecord {
+                task_id: TaskId(uuid::Uuid::parse_str(&task_id_raw).map_err(to_sql_uuid_err)?),
+                conversation_id: parse_conversation_id(conversation_id_raw),
+                call_id: row.get(2)?,
+                tool_name: row.get(3)?,
+                arguments: serde_json::from_str(&arguments_json).map_err(to_sql_err)?,
+                status: parse_tool_status(row.get::<_, String>(5)?),
+                output_content: row.get(6)?,
+                output_structured: output_structured_json
+                    .map(|json| serde_json::from_str(&json).map_err(to_sql_err))
+                    .transpose()?,
+                error: row.get(8)?,
+                approval_id: row
+                    .get::<_, Option<String>>(9)?
+                    .and_then(|value| uuid::Uuid::parse_str(&value).ok())
+                    .map(ApprovalId),
+                sequence: row.get(10)?,
+                created_at: parse_ts(row.get(11)?),
+                updated_at: parse_ts(row.get(12)?),
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn list_active_sessions(&self) -> Result<Vec<SessionHandle>> {
+        let connection = self.connection.lock().expect("store lock poisoned");
+        let mut stmt = connection.prepare(
+            "SELECT id, name, cwd, created_at, last_used_at FROM shell_sessions WHERE active = 1 ORDER BY last_used_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let session_id = row.get::<_, String>(0)?;
+            Ok(SessionHandle {
+                id: hajimi_claw_types::SessionId(
+                    uuid::Uuid::parse_str(&session_id).map_err(to_sql_uuid_err)?,
+                ),
+                name: row.get(1)?,
+                cwd: Path::new(&row.get::<_, String>(2)?).to_path_buf(),
+                created_at: parse_ts(row.get(3)?),
+                last_used_at: parse_ts(row.get(4)?),
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     pub fn save_summary(&self, summary: &SessionSummary) -> Result<()> {
@@ -416,8 +764,8 @@ impl Store {
         let encrypted_api_key = self.encrypt_secret(&record.config.api_key)?;
         connection.execute(
             r#"
-            INSERT INTO providers (id, label, kind, base_url, api_key, model, fallback_models_json, enabled, extra_headers_json, is_default, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO providers (id, label, kind, base_url, api_key, model, fallback_models_json, capabilities_json, enabled, extra_headers_json, is_default, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 label=excluded.label,
                 kind=excluded.kind,
@@ -425,6 +773,7 @@ impl Store {
                 api_key=excluded.api_key,
                 model=excluded.model,
                 fallback_models_json=excluded.fallback_models_json,
+                capabilities_json=excluded.capabilities_json,
                 enabled=excluded.enabled,
                 extra_headers_json=excluded.extra_headers_json,
                 is_default=excluded.is_default,
@@ -438,6 +787,7 @@ impl Store {
                 encrypted_api_key,
                 record.config.model,
                 serde_json::to_string(&record.config.fallback_models)?,
+                serde_json::to_string(&record.config.capabilities)?,
                 i64::from(record.config.enabled),
                 serde_json::to_string(&record.config.extra_headers)?,
                 i64::from(record.is_default),
@@ -451,7 +801,7 @@ impl Store {
         let connection = self.connection.lock().expect("store lock poisoned");
         let mut stmt = connection.prepare(
             r#"
-            SELECT id, label, kind, base_url, api_key, model, fallback_models_json, enabled, extra_headers_json, is_default, created_at
+            SELECT id, label, kind, base_url, api_key, model, fallback_models_json, capabilities_json, enabled, extra_headers_json, is_default, created_at
             FROM providers
             ORDER BY is_default DESC, created_at ASC
             "#,
@@ -466,7 +816,7 @@ impl Store {
         connection
             .query_row(
                 r#"
-                SELECT id, label, kind, base_url, api_key, model, fallback_models_json, enabled, extra_headers_json, is_default, created_at
+                SELECT id, label, kind, base_url, api_key, model, fallback_models_json, capabilities_json, enabled, extra_headers_json, is_default, created_at
                 FROM providers WHERE id = ?
                 "#,
                 params![provider_id],
@@ -481,7 +831,7 @@ impl Store {
         connection
             .query_row(
                 r#"
-                SELECT id, label, kind, base_url, api_key, model, fallback_models_json, enabled, extra_headers_json, is_default, created_at
+                SELECT id, label, kind, base_url, api_key, model, fallback_models_json, capabilities_json, enabled, extra_headers_json, is_default, created_at
                 FROM providers WHERE is_default = 1 LIMIT 1
                 "#,
                 [],
@@ -496,7 +846,7 @@ impl Store {
         connection
             .query_row(
                 r#"
-                SELECT id, label, kind, base_url, api_key, model, fallback_models_json, enabled, extra_headers_json, is_default, created_at
+                SELECT id, label, kind, base_url, api_key, model, fallback_models_json, capabilities_json, enabled, extra_headers_json, is_default, created_at
                 FROM providers
                 ORDER BY created_at ASC
                 LIMIT 1
@@ -630,7 +980,11 @@ impl Store {
         };
         let fallback_models_json: String = row.get(6)?;
         let fallback_models = serde_json::from_str(&fallback_models_json).map_err(to_sql_err)?;
-        let headers_json: String = row.get(8)?;
+        let capabilities_json: String = row.get(7)?;
+        let capabilities = serde_json::from_str(&capabilities_json).unwrap_or_else(|_| {
+            ProviderCapabilities::default()
+        });
+        let headers_json: String = row.get(9)?;
         let extra_headers = serde_json::from_str(&headers_json).map_err(to_sql_err)?;
         let api_key_raw: String = row.get(4)?;
         let api_key = self
@@ -645,11 +999,12 @@ impl Store {
                 api_key,
                 model: row.get(5)?,
                 fallback_models,
-                enabled: row.get::<_, i64>(7)? != 0,
+                capabilities,
+                enabled: row.get::<_, i64>(8)? != 0,
                 extra_headers,
-                created_at: parse_ts(row.get(10)?),
+                created_at: parse_ts(row.get(11)?),
             },
-            is_default: row.get::<_, i64>(9)? != 0,
+            is_default: row.get::<_, i64>(10)? != 0,
         })
     }
 
@@ -718,6 +1073,51 @@ fn parse_ts(ts: String) -> DateTime<Utc> {
         .with_timezone(&Utc)
 }
 
+fn parse_message_role(raw: String) -> hajimi_claw_types::MessageRole {
+    match raw.as_str() {
+        "System" => hajimi_claw_types::MessageRole::System,
+        "Assistant" => hajimi_claw_types::MessageRole::Assistant,
+        "Tool" => hajimi_claw_types::MessageRole::Tool,
+        _ => hajimi_claw_types::MessageRole::User,
+    }
+}
+
+fn parse_conversation_id(raw: String) -> ConversationId {
+    uuid::Uuid::parse_str(&raw)
+        .map(ConversationId)
+        .unwrap_or_default()
+}
+
+fn parse_task_state(raw: String) -> TaskRunState {
+    match raw.as_str() {
+        "Running" => TaskRunState::Running,
+        "BlockedApproval" => TaskRunState::BlockedApproval,
+        "Completed" => TaskRunState::Completed,
+        "Failed" => TaskRunState::Failed,
+        "Cancelled" => TaskRunState::Cancelled,
+        _ => TaskRunState::Queued,
+    }
+}
+
+fn parse_tool_status(raw: String) -> ToolInvocationStatus {
+    match raw.as_str() {
+        "Running" => ToolInvocationStatus::Running,
+        "BlockedApproval" => ToolInvocationStatus::BlockedApproval,
+        "Completed" => ToolInvocationStatus::Completed,
+        "Failed" => ToolInvocationStatus::Failed,
+        "Cancelled" => ToolInvocationStatus::Cancelled,
+        _ => ToolInvocationStatus::Pending,
+    }
+}
+
+fn parse_risk_level(raw: String) -> hajimi_claw_types::RiskLevel {
+    match raw.as_str() {
+        "Dangerous" => hajimi_claw_types::RiskLevel::Dangerous,
+        "Guarded" => hajimi_claw_types::RiskLevel::Guarded,
+        _ => hajimi_claw_types::RiskLevel::Safe,
+    }
+}
+
 fn parse_onboarding_step(step: String) -> hajimi_claw_types::OnboardingStep {
     match step.as_str() {
         "ProviderKind" => hajimi_claw_types::OnboardingStep::ProviderKind,
@@ -754,14 +1154,18 @@ fn to_sql_anyhow_err(err: anyhow::Error) -> rusqlite::Error {
     )
 }
 
+fn to_sql_uuid_err(err: uuid::Error) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use chrono::Utc;
     use hajimi_claw_types::{
-        ConversationMessage, HeartbeatStatus, MessageRole, ProviderConfig, ProviderKind,
-        ProviderRecord,
+        ConversationMessage, HeartbeatStatus, MessageRole, ProviderCapabilities, ProviderConfig,
+        ProviderKind, ProviderRecord,
     };
 
     use super::{SecretCipher, Store};
@@ -783,12 +1187,20 @@ mod tests {
 
         let task = hajimi_claw_types::TaskStatus {
             id: hajimi_claw_types::TaskId::new(),
+            conversation_id: hajimi_claw_types::ConversationId::new(),
             kind: hajimi_claw_types::TaskKind::EphemeralAgentTask,
             description: "test".into(),
             queued_at: Utc::now(),
             started_at: None,
             finished_at: None,
+            state: hajimi_claw_types::TaskRunState::Completed,
             running: false,
+            cwd: None,
+            provider_id: None,
+            current_session_id: None,
+            result_preview: None,
+            error: None,
+            blocked_approval_id: None,
         };
         store.upsert_task(&task).unwrap();
         let tasks = store.list_tasks().unwrap();
@@ -809,6 +1221,12 @@ mod tests {
                     api_key: "top-secret".into(),
                     model: "gpt-demo".into(),
                     fallback_models: vec![],
+                    capabilities: ProviderCapabilities {
+                        tool_calling: true,
+                        streaming: false,
+                        json_mode: false,
+                        max_context_chars: Some(24_000),
+                    },
                     enabled: true,
                     extra_headers: vec![],
                     created_at: Utc::now(),

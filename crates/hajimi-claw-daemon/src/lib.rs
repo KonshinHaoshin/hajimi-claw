@@ -18,7 +18,10 @@ use hajimi_claw_llm::{StaticBackend, StoreBackedBackend, list_models, test_provi
 use hajimi_claw_policy::{PolicyConfig, PolicyEngine};
 use hajimi_claw_store::{SecretCipher, Store};
 use hajimi_claw_tools::ToolRegistry;
-use hajimi_claw_types::{HeartbeatStatus, ProviderConfig, ProviderKind, ProviderRecord};
+use hajimi_claw_types::{
+    ExecutionProfile, HeartbeatStatus, ProviderCapabilities, ProviderConfig, ProviderKind,
+    ProviderRecord,
+};
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -94,6 +97,9 @@ pub struct SecuritySection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionSection {
     pub mode: Option<String>,
+    pub profile: Option<String>,
+    pub browser_enabled: Option<bool>,
+    pub computer_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,6 +156,15 @@ pub async fn entry_from_env() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     match args.first().map(String::as_str) {
         None => run_from_env().await,
+        Some("ask") => cli_ask(&args[1..]).await,
+        Some("tasks") => cli_tasks().await,
+        Some("approvals") => cli_approvals().await,
+        Some("approve") => {
+            let request_id = args.get(1).context("usage: hajimi approve <request-id>")?;
+            cli_approve(request_id).await
+        }
+        Some("shell") => cli_shell_command(&args[1..]).await,
+        Some("profile") => cli_profile_command(&args[1..]).await,
         Some("daemon" | "run" | "start") => run_from_env().await,
         Some("launch") => cli_launch(),
         Some("stop") => cli_stop(),
@@ -194,52 +209,13 @@ async fn run_with_context(config: AppConfig, config_path: Option<PathBuf>) -> Re
         fs::create_dir_all(parent)
             .with_context(|| format!("create storage directory {}", parent.display()))?;
     }
-    let policy = Arc::new(PolicyEngine::new(config.policy.clone()));
-    let store = open_store(&config)?;
-    let executor = Arc::new(LocalExecutor::new(
-        policy.clone(),
-        select_platform_mode(config.execution.mode.as_deref()),
-    ));
-    let tools = Arc::new(ToolRegistry::default(executor, policy.clone()));
-    let fallback = Arc::new(StaticBackend::new(
-        config
-            .llm
-            .static_fallback_response
-            .clone()
-            .unwrap_or_else(|| "LLM backend not configured.".into()),
-    ));
-    bootstrap_provider_if_configured(&store, &config)?;
-    let llm: Arc<dyn hajimi_claw_types::LlmBackend> =
-        Arc::new(StoreBackedBackend::new(store.clone(), Some(fallback)));
-    let persona_dir = resolve_persona_directory(&config);
-    ensure_persona_files(&persona_dir)?;
-    let prompt_files = resolve_persona_paths(config_path.as_deref(), &config.persona)?;
-    let prompt_source = Arc::new(MarkdownPromptSource::new(
-        default_system_prompt(),
-        prompt_files,
-    ));
-
-    let runtime = Arc::new(AgentRuntime::new(
-        llm,
-        tools,
-        store.clone(),
-        policy.clone(),
-        prompt_source,
-        persona_dir.clone(),
-        MultiAgentConfig {
-            enabled: config.multi_agent.enabled,
-            auto_delegate: config.multi_agent.auto_delegate,
-            default_workers: config.multi_agent.default_workers,
-            max_workers: config.multi_agent.max_workers,
-            worker_timeout_secs: config.multi_agent.worker_timeout_secs,
-            max_context_chars_per_worker: config.multi_agent.max_context_chars_per_worker,
-        },
-    ));
+    let (runtime, store, policy, _) = build_runtime_components(&config, config_path.as_deref()).await?;
     let gateway = Arc::new(InProcessGateway::new(
         runtime,
         policy.clone(),
         store.clone(),
     ));
+    let persona_dir = resolve_persona_directory(&config);
     start_heartbeat_task(
         store.clone(),
         config.channel.kind.clone(),
@@ -300,6 +276,65 @@ async fn run_with_context(config: AppConfig, config_path: Option<PathBuf>) -> Re
             bot.run().await
         }
     }
+}
+
+async fn build_runtime_components(
+    config: &AppConfig,
+    config_path: Option<&Path>,
+) -> Result<(
+    Arc<AgentRuntime>,
+    Arc<Store>,
+    Arc<PolicyEngine>,
+    Arc<LocalExecutor>,
+)> {
+    let policy = Arc::new(PolicyEngine::new(config.policy.clone()));
+    let store = open_store(config)?;
+    bootstrap_provider_if_configured(&store, config)?;
+    let executor = Arc::new(LocalExecutor::new(
+        policy.clone(),
+        select_platform_mode(config.execution.mode.as_deref()),
+    ));
+    for session in store.list_active_sessions()? {
+        executor
+            .restore_session(session, vec![], vec![])
+            .await
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    }
+    let tools = Arc::new(ToolRegistry::default(executor.clone(), policy.clone()));
+    let fallback = Arc::new(StaticBackend::new(
+        config
+            .llm
+            .static_fallback_response
+            .clone()
+            .unwrap_or_else(|| "LLM backend not configured.".into()),
+    ));
+    let llm: Arc<dyn hajimi_claw_types::LlmBackend> =
+        Arc::new(StoreBackedBackend::new(store.clone(), Some(fallback)));
+    let persona_dir = resolve_persona_directory(config);
+    ensure_persona_files(&persona_dir)?;
+    let prompt_files = resolve_persona_paths(config_path, &config.persona)?;
+    let prompt_source = Arc::new(MarkdownPromptSource::new(
+        default_system_prompt(),
+        prompt_files,
+    ));
+
+    let runtime = Arc::new(AgentRuntime::new(
+        llm,
+        tools,
+        store.clone(),
+        policy.clone(),
+        prompt_source,
+        persona_dir,
+        MultiAgentConfig {
+            enabled: config.multi_agent.enabled,
+            auto_delegate: config.multi_agent.auto_delegate,
+            default_workers: config.multi_agent.default_workers,
+            max_workers: config.multi_agent.max_workers,
+            worker_timeout_secs: config.multi_agent.worker_timeout_secs,
+            max_context_chars_per_worker: config.multi_agent.max_context_chars_per_worker,
+        },
+    ));
+    Ok((runtime, store, policy, executor))
 }
 
 pub fn load_config(path: PathBuf) -> Result<AppConfig> {
@@ -442,6 +477,7 @@ fn bootstrap_provider_if_configured(store: &Store, config: &AppConfig) -> Result
                 api_key,
                 model,
                 fallback_models: vec![],
+                capabilities: default_provider_capabilities(),
                 enabled: true,
                 extra_headers: vec![],
                 created_at: Utc::now(),
@@ -858,6 +894,7 @@ async fn interactive_onboard(config_path: PathBuf) -> Result<()> {
         api_key: api_key.clone(),
         model: String::new(),
         fallback_models: vec![],
+        capabilities: default_provider_capabilities(),
         enabled: true,
         extra_headers: vec![],
         created_at: Utc::now(),
@@ -876,6 +913,7 @@ async fn interactive_onboard(config_path: PathBuf) -> Result<()> {
             api_key,
             model,
             fallback_models,
+            capabilities: default_provider_capabilities(),
             enabled: true,
             extra_headers: vec![],
             created_at: Utc::now(),
@@ -1062,6 +1100,145 @@ async fn cli_model_use(model: &str) -> Result<()> {
         provider.config.id, model
     );
     Ok(())
+}
+
+async fn cli_ask(args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        anyhow::bail!("usage: hajimi ask <prompt>");
+    }
+    let loaded = load_config_from_env_or_default()?;
+    let (runtime, _, _, _) = build_runtime_components(&loaded.config, Some(&loaded.path)).await?;
+    let prompt = args.join(" ");
+    let response = runtime.ask(&prompt, None).await?;
+    println!("{response}");
+    Ok(())
+}
+
+async fn cli_tasks() -> Result<()> {
+    let loaded = load_config_from_env_or_default()?;
+    let (runtime, _, _, _) = build_runtime_components(&loaded.config, Some(&loaded.path)).await?;
+    let tasks = runtime.list_tasks()?;
+    if tasks.is_empty() {
+        println!("no tasks");
+        return Ok(());
+    }
+    for task in tasks {
+        println!(
+            "{}\tstate={:?}\trunning={}\tprovider={}\tsession={}\tdescription={}",
+            task.id,
+            task.state,
+            task.running,
+            task.provider_id.unwrap_or_else(|| "-".into()),
+            task.current_session_id.unwrap_or_else(|| "-".into()),
+            task.description
+        );
+    }
+    Ok(())
+}
+
+async fn cli_approvals() -> Result<()> {
+    let loaded = load_config_from_env_or_default()?;
+    let (runtime, _, _, _) = build_runtime_components(&loaded.config, Some(&loaded.path)).await?;
+    let approvals = runtime.list_pending_approvals()?;
+    if approvals.is_empty() {
+        println!("no pending approvals");
+        return Ok(());
+    }
+    for approval in approvals {
+        println!(
+            "{}\trisk={:?}\ttask={}\ttool={}\tcommand={}",
+            approval.request.request_id,
+            approval.request.risk_level,
+            approval
+                .task_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "-".into()),
+            approval.tool_name.unwrap_or_else(|| "-".into()),
+            approval.request.command_preview
+        );
+    }
+    Ok(())
+}
+
+async fn cli_approve(request_id: &str) -> Result<()> {
+    let loaded = load_config_from_env_or_default()?;
+    let (runtime, _, _, _) = build_runtime_components(&loaded.config, Some(&loaded.path)).await?;
+    println!("{}", runtime.approve(request_id).await?);
+    Ok(())
+}
+
+async fn cli_shell_command(args: &[String]) -> Result<()> {
+    let loaded = load_config_from_env_or_default()?;
+    let (runtime, _, _, _) = build_runtime_components(&loaded.config, Some(&loaded.path)).await?;
+    match args.first().map(String::as_str) {
+        Some("open") => {
+            let name = args.get(1).cloned();
+            let reply = runtime.shell_open(name, None).await?;
+            println!("{}\nsession_id={}", reply.message, reply.session_id);
+            Ok(())
+        }
+        Some("status") => {
+            let session_id = args.get(1).context("usage: hajimi shell status <session-id>")?;
+            println!("{}", runtime.shell_status(session_id).await?);
+            Ok(())
+        }
+        Some("exec") => {
+            let session_id = args.get(1).context("usage: hajimi shell exec <session-id> <command>")?;
+            if args.len() < 3 {
+                anyhow::bail!("usage: hajimi shell exec <session-id> <command>");
+            }
+            let command = args[2..].join(" ");
+            println!("{}", runtime.shell_exec(session_id, &command).await?);
+            Ok(())
+        }
+        Some("close") => {
+            let session_id = args.get(1).context("usage: hajimi shell close <session-id>")?;
+            println!("{}", runtime.shell_close(session_id).await?);
+            Ok(())
+        }
+        _ => {
+            println!("usage:");
+            println!("  hajimi shell open [name]");
+            println!("  hajimi shell status <session-id>");
+            println!("  hajimi shell exec <session-id> <command>");
+            println!("  hajimi shell close <session-id>");
+            Ok(())
+        }
+    }
+}
+
+async fn cli_profile_command(args: &[String]) -> Result<()> {
+    let loaded = load_config_from_env_or_default()?;
+    let mut config = loaded.config.clone();
+    match args.first().map(String::as_str) {
+        None | Some("show") => {
+            println!(
+                "profile={}\nbrowser_enabled={}\ncomputer_enabled={}",
+                config
+                    .execution
+                    .profile
+                    .clone()
+                    .unwrap_or_else(|| ExecutionProfile::OpsSafe.as_str().into()),
+                config.execution.browser_enabled.unwrap_or(false),
+                config.execution.computer_enabled.unwrap_or(false),
+            );
+            Ok(())
+        }
+        Some("use") => {
+            let profile = args.get(1).context("usage: hajimi profile use <ops-safe|dev-agent|computer-use>")?;
+            let parsed = ExecutionProfile::parse(profile).context("profile must be ops-safe, dev-agent, or computer-use")?;
+            config.execution.profile = Some(parsed.as_str().into());
+            save_config(&loaded.path, &config)?;
+            println!("active profile set to `{}`", parsed.as_str());
+            Ok(())
+        }
+        _ => {
+            println!("usage:");
+            println!("  hajimi profile show");
+            println!("  hajimi profile use <ops-safe|dev-agent|computer-use>");
+            Ok(())
+        }
+    }
 }
 
 fn cli_launch() -> Result<()> {
@@ -1455,6 +1632,9 @@ fn default_app_config(config_path: &Path) -> AppConfig {
         },
         execution: ExecutionSection {
             mode: Some("auto".into()),
+            profile: Some(ExecutionProfile::OpsSafe.as_str().into()),
+            browser_enabled: Some(false),
+            computer_enabled: Some(false),
         },
         multi_agent: MultiAgentSection::default(),
         persona: PersonaSection {
@@ -1787,6 +1967,15 @@ fn parse_provider_kind(raw: &str) -> Result<ProviderKind> {
     }
 }
 
+fn default_provider_capabilities() -> ProviderCapabilities {
+    ProviderCapabilities {
+        tool_calling: true,
+        streaming: false,
+        json_mode: false,
+        max_context_chars: Some(24_000),
+    }
+}
+
 fn slugify(value: &str) -> String {
     let mut slug = value
         .chars()
@@ -1828,6 +2017,12 @@ fn help_text() -> &'static str {
     "Usage:
   hajimi                 Run the daemon
   hajimi daemon          Run the daemon
+  hajimi ask <prompt>    Run one local agent task
+  hajimi tasks           List recorded task runs
+  hajimi approvals       List pending approvals
+  hajimi approve <id>    Approve and resume a blocked task
+  hajimi shell ...       Manage persisted shell sessions
+  hajimi profile ...     Show or change the active execution profile
   hajimi launch          Launch the daemon in background
   hajimi stop            Stop the background daemon
   hajimi status          Show background daemon status
@@ -2013,7 +2208,12 @@ mod tests {
                 master_key_file: Some(key_path),
             },
             policy: hajimi_claw_policy::PolicyConfig::default(),
-            execution: super::ExecutionSection { mode: None },
+            execution: super::ExecutionSection {
+                mode: None,
+                profile: None,
+                browser_enabled: None,
+                computer_enabled: None,
+            },
             multi_agent: super::MultiAgentSection::default(),
             persona: super::PersonaSection::default(),
         };

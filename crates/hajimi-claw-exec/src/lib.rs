@@ -48,6 +48,23 @@ impl LocalExecutor {
         &self.policy
     }
 
+    pub async fn restore_session(
+        &self,
+        handle: SessionHandle,
+        env_allowlist: Vec<String>,
+        history: Vec<String>,
+    ) -> ClawResult<()> {
+        self.sessions.lock().await.insert(
+            handle.id,
+            SessionState {
+                handle,
+                env_allowlist,
+                history,
+            },
+        );
+        Ok(())
+    }
+
     async fn run_checked(&self, req: ExecRequest) -> ClawResult<ExecResult> {
         match self.policy.evaluate_exec(&req) {
             PolicyDecision::Allow { .. } => self.spawn(req).await,
