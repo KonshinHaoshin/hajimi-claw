@@ -112,9 +112,17 @@ impl TelegramBot {
             let Some(text) = message.text else {
                 return Ok(());
             };
+            let actor_user_id = message
+                .from
+                .as_ref()
+                .map(|user| user.id)
+                .unwrap_or_default();
+            let actor_chat_id = message.chat.id;
             if is_natural_language(&text) {
                 self.send_chat_action(message.chat.id, "typing").await?;
-                let preview = self.preview_command(&text).await;
+                let preview = self
+                    .preview_command(&text, actor_user_id, actor_chat_id)
+                    .await;
                 let placeholder_text = preview
                     .as_ref()
                     .map(|item| item.text.as_str())
@@ -123,11 +131,15 @@ impl TelegramBot {
                 let placeholder_id = self
                     .send_message(message.chat.id, placeholder_text, placeholder_keyboard)
                     .await?;
-                let reply = self.dispatch_command(&text).await;
+                let reply = self
+                    .dispatch_command(&text, actor_user_id, actor_chat_id)
+                    .await;
                 self.edit_message(message.chat.id, placeholder_id, &reply.text, reply.keyboard)
                     .await?;
             } else {
-                let reply = self.dispatch_command(&text).await;
+                let reply = self
+                    .dispatch_command(&text, actor_user_id, actor_chat_id)
+                    .await;
                 self.send_message(message.chat.id, &reply.text, reply.keyboard)
                     .await?;
             }
@@ -146,7 +158,9 @@ impl TelegramBot {
             }
 
             if let Some(data) = callback_query.data {
-                let reply = self.dispatch_command(&data).await;
+                let reply = self
+                    .dispatch_command(&data, callback_query.from.id, chat_id)
+                    .await;
                 if let Some(message) = callback_query.message {
                     self.edit_message(chat_id, message.message_id, &reply.text, reply.keyboard)
                         .await?;
@@ -161,13 +175,18 @@ impl TelegramBot {
         Ok(())
     }
 
-    async fn dispatch_command(&self, text: &str) -> BotReply {
+    async fn dispatch_command(
+        &self,
+        text: &str,
+        actor_user_id: i64,
+        actor_chat_id: i64,
+    ) -> BotReply {
         let current_session_id = self.current_session.lock().await.clone();
         match self
             .gateway
             .handle(GatewayRequest {
-                actor_user_id: self.config.admin_user_id,
-                actor_chat_id: self.config.admin_chat_id,
+                actor_user_id,
+                actor_chat_id,
                 raw_text: text.to_string(),
                 command: parse_gateway_command(text),
                 current_session_id,
@@ -196,12 +215,17 @@ impl TelegramBot {
         }
     }
 
-    async fn preview_command(&self, text: &str) -> Option<GatewayPreview> {
+    async fn preview_command(
+        &self,
+        text: &str,
+        actor_user_id: i64,
+        actor_chat_id: i64,
+    ) -> Option<GatewayPreview> {
         let current_session_id = self.current_session.lock().await.clone();
         self.gateway
             .preview(GatewayRequest {
-                actor_user_id: self.config.admin_user_id,
-                actor_chat_id: self.config.admin_chat_id,
+                actor_user_id,
+                actor_chat_id,
                 raw_text: text.to_string(),
                 command: parse_gateway_command(text),
                 current_session_id,
@@ -375,8 +399,14 @@ impl TelegramBot {
     }
 
     fn is_authorized(&self, chat_id: i64, user_id: i64) -> bool {
-        chat_id == self.config.admin_chat_id && user_id == self.config.admin_user_id
+        let chat_allowed = actor_matches(self.config.admin_chat_id, chat_id);
+        let user_allowed = actor_matches(self.config.admin_user_id, user_id);
+        chat_allowed && user_allowed
     }
+}
+
+fn actor_matches(configured: i64, actual: i64) -> bool {
+    configured == 0 || configured == actual
 }
 
 impl FeishuBot {
@@ -990,8 +1020,11 @@ fn is_natural_language(text: &str) -> bool {
 
 fn render_user_error(err: &ClawError) -> String {
     match err {
-        ClawError::AccessDenied(_) => {
+        ClawError::AccessDenied(message) if message.contains("telegram actor is not authorized") => {
             "This Telegram chat is not allowed to control hajimi.".to_string()
+        }
+        ClawError::AccessDenied(message) => {
+            format!("Access denied.\n{}", message.trim())
         }
         ClawError::ApprovalRequired(reason) => format!(
             "This action needs approval before it can run.\n{}",
@@ -1333,6 +1366,9 @@ fn to_reply_markup(keyboard: InlineKeyboard) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    use crate::{actor_matches, render_user_error};
+    use hajimi_claw_types::ClawError;
+
     use hajimi_claw_gateway::{GatewayCommand, parse_gateway_command};
 
     #[test]
@@ -1341,5 +1377,21 @@ mod tests {
             parse_gateway_command("/elevated on"),
             GatewayCommand::ElevatedOn
         );
+    }
+
+    #[test]
+    fn access_denied_renders_actual_reason_for_non_auth_failures() {
+        let rendered = render_user_error(&ClawError::AccessDenied(
+            "working directory is not allowed: C:/Windows/System32".into(),
+        ));
+        assert!(rendered.contains("Access denied."));
+        assert!(rendered.contains("working directory is not allowed"));
+    }
+
+    #[test]
+    fn zero_actor_config_is_treated_as_wildcard() {
+        assert!(actor_matches(0, 123));
+        assert!(actor_matches(456, 456));
+        assert!(!actor_matches(456, 123));
     }
 }

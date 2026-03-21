@@ -266,8 +266,7 @@ impl AgentRuntime {
             self.run_multi_agent(conversation_id, prompt, provider_id, preference)
                 .await
         } else {
-            self.run_llm(execution)
-                .await
+            self.run_llm(execution).await
         };
 
         match &result {
@@ -348,8 +347,7 @@ impl AgentRuntime {
                 },
                 json!({ "session_id": session_id, "command": command }),
             )
-            .await
-            ?;
+            .await?;
         let handle = self.fetch_session_handle(session_id).await?;
         self.store
             .upsert_session(&handle, true)
@@ -386,8 +384,7 @@ impl AgentRuntime {
                 },
                 json!({ "session_id": session_id }),
             )
-            .await
-            ?;
+            .await?;
         let handle = self.fetch_session_handle(session_id).await?;
         self.store
             .upsert_session(&handle, true)
@@ -408,8 +405,7 @@ impl AgentRuntime {
                 },
                 json!({ "session_id": session_id }),
             )
-            .await
-            ?;
+            .await?;
         self.store
             .upsert_session(&handle, false)
             .map_err(store_error)?;
@@ -717,20 +713,23 @@ impl AgentRuntime {
             }
             Err(err @ ClawError::ApprovalRequired(_)) => {
                 let approval_id = extract_approval_id(&err);
-                let approval_record = approval_id
-                    .and_then(|id| self.policy.get_approval(id))
-                    .map(|request| ApprovalRecord {
-                        request,
-                        approved: None,
-                        task_id: Some(execution.task_id),
-                        tool_name: Some(tool_name.into()),
-                    });
+                let approval_record =
+                    approval_id
+                        .and_then(|id| self.policy.get_approval(id))
+                        .map(|request| ApprovalRecord {
+                            request,
+                            approved: None,
+                            task_id: Some(execution.task_id),
+                            tool_name: Some(tool_name.into()),
+                        });
                 if let Some(approval_record) = approval_record.clone() {
                     self.store
                         .save_approval_record(&approval_record)
                         .map_err(store_error)?;
                 }
-                let blocked_approval_id = approval_record.as_ref().map(|record| record.request.request_id);
+                let blocked_approval_id = approval_record
+                    .as_ref()
+                    .map(|record| record.request.request_id);
                 self.store
                     .save_tool_invocation(&ToolInvocationRecord {
                         task_id: execution.task_id,
@@ -752,7 +751,9 @@ impl AgentRuntime {
                     .store
                     .get_task(execution.task_id)
                     .map_err(store_error)?
-                    .ok_or_else(|| ClawError::NotFound(format!("task not found: {}", execution.task_id)))?;
+                    .ok_or_else(|| {
+                        ClawError::NotFound(format!("task not found: {}", execution.task_id))
+                    })?;
                 status.running = false;
                 status.state = TaskRunState::BlockedApproval;
                 status.finished_at = None;
@@ -838,7 +839,10 @@ impl AgentRuntime {
         Ok(())
     }
 
-    async fn fetch_session_handle(&self, session_id: &str) -> ClawResult<hajimi_claw_types::SessionHandle> {
+    async fn fetch_session_handle(
+        &self,
+        session_id: &str,
+    ) -> ClawResult<hajimi_claw_types::SessionHandle> {
         let output = self
             .tools
             .call(
@@ -888,10 +892,7 @@ impl AgentRuntime {
         })
     }
 
-    async fn run_llm(
-        &self,
-        execution: TaskExecution,
-    ) -> ClawResult<String> {
+    async fn run_llm(&self, execution: TaskExecution) -> ClawResult<String> {
         let provider = self.ensure_tool_capable_provider(execution.provider_id.as_deref())?;
         let mut system_prompt = self.prompt_source.load()?;
         if let Some(session_id) = &execution.current_session_id {
@@ -1030,10 +1031,13 @@ impl AgentRuntime {
             current_session_id: task.current_session_id.clone(),
         };
 
-        let result = if execution.provider_id.is_none() && select_tool(&execution.prompt).is_some() {
-            let blocked = self
-                .load_blocked_tool_invocation(task_id)?
-                .ok_or_else(|| ClawError::NotFound(format!("blocked tool invocation not found for task {task_id}")))?;
+        let result = if execution.provider_id.is_none() && select_tool(&execution.prompt).is_some()
+        {
+            let blocked = self.load_blocked_tool_invocation(task_id)?.ok_or_else(|| {
+                ClawError::NotFound(format!(
+                    "blocked tool invocation not found for task {task_id}"
+                ))
+            })?;
             match self
                 .execute_tool_call(
                     &execution,
@@ -1280,7 +1284,9 @@ fn extract_approval_id(err: &ClawError) -> Option<ApprovalId> {
     if end <= start {
         return None;
     }
-    uuid::Uuid::parse_str(&message[start..end]).ok().map(ApprovalId)
+    uuid::Uuid::parse_str(&message[start..end])
+        .ok()
+        .map(ApprovalId)
 }
 
 fn render_command_preview(tool_name: &str, arguments: &serde_json::Value) -> String {

@@ -981,9 +981,8 @@ impl Store {
         let fallback_models_json: String = row.get(6)?;
         let fallback_models = serde_json::from_str(&fallback_models_json).map_err(to_sql_err)?;
         let capabilities_json: String = row.get(7)?;
-        let capabilities = serde_json::from_str(&capabilities_json).unwrap_or_else(|_| {
-            ProviderCapabilities::default()
-        });
+        let capabilities = serde_json::from_str(&capabilities_json)
+            .unwrap_or_else(|_| ProviderCapabilities::default());
         let headers_json: String = row.get(9)?;
         let extra_headers = serde_json::from_str(&headers_json).map_err(to_sql_err)?;
         let api_key_raw: String = row.get(4)?;

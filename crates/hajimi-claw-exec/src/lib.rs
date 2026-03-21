@@ -110,6 +110,9 @@ impl LocalExecutor {
     }
 
     fn validate_windows_safe_request(&self, req: &ExecRequest) -> ClawResult<()> {
+        if self.policy.is_full_elevated() {
+            return Ok(());
+        }
         if !self.policy.windows_command_allowed(&req.command) {
             return Err(ClawError::AccessDenied(format!(
                 "command is not in the Windows safe allowlist: {}",
@@ -440,5 +443,26 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains(&dir.path().display().to_string().to_ascii_lowercase())
         );
+    }
+
+    #[tokio::test]
+    async fn full_elevation_bypasses_windows_safe_allowlist() {
+        let mut config = PolicyConfig::default();
+        config.allowed_workdirs = vec![std::env::temp_dir()];
+        let policy = Arc::new(PolicyEngine::new(config));
+        policy.enable_full_elevation("full access".into());
+        let executor = LocalExecutor::new(policy, PlatformMode::WindowsSafe);
+
+        let req = ExecRequest {
+            command: "not-in-allowlist".into(),
+            args: vec![],
+            cwd: Some(std::env::temp_dir()),
+            env_allowlist: vec![],
+            timeout_secs: 10,
+            max_output_bytes: 128,
+            requires_tty: false,
+        };
+
+        assert!(executor.validate_windows_safe_request(&req).is_ok());
     }
 }

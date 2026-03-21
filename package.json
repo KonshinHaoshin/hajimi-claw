@@ -12,10 +12,10 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "hajimi-claw-linux-arm64-gnu": "0.1.2",
-    "hajimi-claw-linux-x64-gnu": "0.1.2",
-    "hajimi-claw-win32-arm64-msvc": "0.1.2",
-    "hajimi-claw-win32-x64-msvc": "0.1.2"
+    "hajimi-claw-linux-arm64-gnu": "0.1.3",
+    "hajimi-claw-linux-x64-gnu": "0.1.3",
+    "hajimi-claw-win32-arm64-msvc": "0.1.3",
+    "hajimi-claw-win32-x64-msvc": "0.1.3"
   },
   "files": [
     "bin",

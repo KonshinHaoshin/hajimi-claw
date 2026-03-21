@@ -444,8 +444,8 @@ mod tests {
     use futures::TryStreamExt;
     use hajimi_claw_store::Store;
     use hajimi_claw_types::{
-        AgentRequest, ConversationId, ConversationMessage, LlmBackend, MessageRole, ProviderConfig,
-        ProviderKind, ProviderRecord, ProviderCapabilities,
+        AgentRequest, ConversationId, ConversationMessage, LlmBackend, MessageRole,
+        ProviderCapabilities, ProviderConfig, ProviderKind, ProviderRecord,
     };
 
     use super::{StaticBackend, StoreBackedBackend};

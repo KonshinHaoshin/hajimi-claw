@@ -8,8 +8,8 @@ use hajimi_claw_llm::{list_models, test_provider};
 use hajimi_claw_policy::PolicyEngine;
 use hajimi_claw_store::Store;
 use hajimi_claw_types::{
-    ClawError, ClawResult, OnboardingSession, OnboardingStep, ProviderConfig, ProviderDraft,
-    ProviderKind, ProviderRecord, ProviderCapabilities,
+    ClawError, ClawResult, OnboardingSession, OnboardingStep, ProviderCapabilities, ProviderConfig,
+    ProviderDraft, ProviderKind, ProviderRecord,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,7 @@ pub enum GatewayCommand {
     ShellClose,
     Status,
     Approve(String),
+    ElevatedMenu,
     ElevatedOn,
     ElevatedOff,
     ElevatedAsk,
@@ -250,10 +251,26 @@ impl Gateway for InProcessGateway {
             GatewayCommand::Approve(request_id) => {
                 Ok(text_response(&self.runtime.approve(&request_id).await?))
             }
-            GatewayCommand::ElevatedOn => Ok(text_response(&self.runtime.enable_elevated())),
-            GatewayCommand::ElevatedOff => Ok(text_response(&self.runtime.stop_elevated())),
-            GatewayCommand::ElevatedAsk => Ok(text_response(&self.runtime.enable_approval_mode())),
-            GatewayCommand::ElevatedFull => Ok(text_response(&self.runtime.enable_full_elevated())),
+            GatewayCommand::ElevatedMenu => Ok(text_response_with_keyboard(
+                &elevated_menu_text(),
+                Some(elevated_keyboard()),
+            )),
+            GatewayCommand::ElevatedOn => Ok(text_response_with_keyboard(
+                &self.runtime.enable_elevated(),
+                Some(elevated_keyboard()),
+            )),
+            GatewayCommand::ElevatedOff => Ok(text_response_with_keyboard(
+                &self.runtime.stop_elevated(),
+                Some(elevated_keyboard()),
+            )),
+            GatewayCommand::ElevatedAsk => Ok(text_response_with_keyboard(
+                &self.runtime.enable_approval_mode(),
+                Some(elevated_keyboard()),
+            )),
+            GatewayCommand::ElevatedFull => Ok(text_response_with_keyboard(
+                &self.runtime.enable_full_elevated(),
+                Some(elevated_keyboard()),
+            )),
             GatewayCommand::Cancel(task_id) => Ok(text_response(&format!(
                 "cancel is not implemented yet for task {task_id}"
             ))),
@@ -763,6 +780,9 @@ pub fn parse_gateway_command(text: &str) -> GatewayCommand {
     if let Some(rest) = trimmed.strip_prefix("/approve ") {
         return GatewayCommand::Approve(rest.trim().into());
     }
+    if trimmed == "/elevated" {
+        return GatewayCommand::ElevatedMenu;
+    }
     if trimmed == "/elevated on" {
         return GatewayCommand::ElevatedOn;
     }
@@ -831,6 +851,7 @@ pub fn help_text() -> String {
         "/status",
         "/menu",
         "/approve <request-id>",
+        "/elevated",
         "/elevated on",
         "/elevated off",
         "/elevated ask",
@@ -1013,8 +1034,51 @@ fn main_menu_keyboard() -> InlineKeyboard {
                     data: "/provider list".into(),
                 },
                 InlineButton {
+                    text: "Elevated".into(),
+                    data: "/elevated".into(),
+                },
+                InlineButton {
                     text: "Persona".into(),
                     data: "/persona guide".into(),
+                },
+            ],
+        ],
+    }
+}
+
+fn elevated_menu_text() -> String {
+    [
+        "elevated controls",
+        "",
+        "`/elevated ask` = default guarded mode. Sensitive actions stop for approval.",
+        "`/elevated on` = temporary elevated lease for guarded and dangerous commands.",
+        "`/elevated full` = full local bypass for workdir, writable path, Windows safe allowlist, and sensitive env checks.",
+        "`/elevated off` = disable any active elevated lease.",
+    ]
+    .join("\n")
+}
+
+fn elevated_keyboard() -> InlineKeyboard {
+    InlineKeyboard {
+        rows: vec![
+            vec![
+                InlineButton {
+                    text: "Ask".into(),
+                    data: "/elevated ask".into(),
+                },
+                InlineButton {
+                    text: "On".into(),
+                    data: "/elevated on".into(),
+                },
+            ],
+            vec![
+                InlineButton {
+                    text: "Full".into(),
+                    data: "/elevated full".into(),
+                },
+                InlineButton {
+                    text: "Off".into(),
+                    data: "/elevated off".into(),
                 },
             ],
         ],
@@ -1302,6 +1366,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parses_elevated_menu_command() {
+        assert_eq!(
+            parse_gateway_command("/elevated"),
+            GatewayCommand::ElevatedMenu
+        );
+    }
+
     #[tokio::test]
     async fn gateway_opens_session_and_sets_channel_state() -> Result<()> {
         let dir = tempdir()?;
@@ -1422,6 +1494,41 @@ mod tests {
                 current_session_id: None,
             })
             .await?;
+        assert!(response.keyboard.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn elevated_menu_returns_keyboard() -> Result<()> {
+        let dir = tempdir()?;
+        let mut config = hajimi_claw_policy::PolicyConfig::default();
+        config.allowed_workdirs = vec![dir.path().to_path_buf(), std::env::current_dir()?];
+        config.admin_user_id = 1;
+        config.admin_chat_id = 2;
+        let policy = Arc::new(PolicyEngine::new(config));
+        let executor = Arc::new(LocalExecutor::new(
+            policy.clone(),
+            PlatformMode::WindowsSafe,
+        ));
+        let tools = Arc::new(ToolRegistry::default(executor, policy.clone()));
+        let store = Arc::new(Store::open_in_memory()?);
+        let runtime = Arc::new(AgentRuntime::for_tests(
+            tools,
+            store.clone(),
+            policy.clone(),
+        ));
+        let gateway = InProcessGateway::new(runtime, policy, store);
+
+        let response = gateway
+            .handle(GatewayRequest {
+                actor_user_id: 1,
+                actor_chat_id: 2,
+                raw_text: "/elevated".into(),
+                command: GatewayCommand::ElevatedMenu,
+                current_session_id: None,
+            })
+            .await?;
+        assert!(response.text.contains("elevated controls"));
         assert!(response.keyboard.is_some());
         Ok(())
     }

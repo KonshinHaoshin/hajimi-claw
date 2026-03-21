@@ -4,6 +4,7 @@ use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -153,6 +154,7 @@ struct TelegramPairing {
 
 pub async fn entry_from_env() -> Result<()> {
     init_tracing();
+    install_rustls_crypto_provider()?;
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     match args.first().map(String::as_str) {
         None => run_from_env().await,
@@ -209,7 +211,8 @@ async fn run_with_context(config: AppConfig, config_path: Option<PathBuf>) -> Re
         fs::create_dir_all(parent)
             .with_context(|| format!("create storage directory {}", parent.display()))?;
     }
-    let (runtime, store, policy, _) = build_runtime_components(&config, config_path.as_deref()).await?;
+    let (runtime, store, policy, _) =
+        build_runtime_components(&config, config_path.as_deref()).await?;
     let gateway = Arc::new(InProcessGateway::new(
         runtime,
         policy.clone(),
@@ -378,6 +381,20 @@ fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .try_init();
+}
+
+fn install_rustls_crypto_provider() -> Result<()> {
+    static RUSTLS_PROVIDER: OnceLock<()> = OnceLock::new();
+    if RUSTLS_PROVIDER.get().is_some() || rustls::crypto::CryptoProvider::get_default().is_some() {
+        let _ = RUSTLS_PROVIDER.set(());
+        return Ok(());
+    }
+    let provider = rustls::crypto::ring::default_provider();
+    provider
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("failed to install rustls crypto provider"))?;
+    let _ = RUSTLS_PROVIDER.set(());
+    Ok(())
 }
 
 fn select_platform_mode(mode: Option<&str>) -> PlatformMode {
@@ -1178,12 +1195,16 @@ async fn cli_shell_command(args: &[String]) -> Result<()> {
             Ok(())
         }
         Some("status") => {
-            let session_id = args.get(1).context("usage: hajimi shell status <session-id>")?;
+            let session_id = args
+                .get(1)
+                .context("usage: hajimi shell status <session-id>")?;
             println!("{}", runtime.shell_status(session_id).await?);
             Ok(())
         }
         Some("exec") => {
-            let session_id = args.get(1).context("usage: hajimi shell exec <session-id> <command>")?;
+            let session_id = args
+                .get(1)
+                .context("usage: hajimi shell exec <session-id> <command>")?;
             if args.len() < 3 {
                 anyhow::bail!("usage: hajimi shell exec <session-id> <command>");
             }
@@ -1192,7 +1213,9 @@ async fn cli_shell_command(args: &[String]) -> Result<()> {
             Ok(())
         }
         Some("close") => {
-            let session_id = args.get(1).context("usage: hajimi shell close <session-id>")?;
+            let session_id = args
+                .get(1)
+                .context("usage: hajimi shell close <session-id>")?;
             println!("{}", runtime.shell_close(session_id).await?);
             Ok(())
         }
@@ -1225,8 +1248,11 @@ async fn cli_profile_command(args: &[String]) -> Result<()> {
             Ok(())
         }
         Some("use") => {
-            let profile = args.get(1).context("usage: hajimi profile use <ops-safe|dev-agent|computer-use>")?;
-            let parsed = ExecutionProfile::parse(profile).context("profile must be ops-safe, dev-agent, or computer-use")?;
+            let profile = args
+                .get(1)
+                .context("usage: hajimi profile use <ops-safe|dev-agent|computer-use>")?;
+            let parsed = ExecutionProfile::parse(profile)
+                .context("profile must be ops-safe, dev-agent, or computer-use")?;
             config.execution.profile = Some(parsed.as_str().into());
             save_config(&loaded.path, &config)?;
             println!("active profile set to `{}`", parsed.as_str());
