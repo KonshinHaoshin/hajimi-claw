@@ -4,6 +4,8 @@ kind = "telegram"
 [telegram]
 bot_token = "123456:replace-me"
 poll_timeout_secs = 30
+# When bot_token is configured, hajimi also registers a native `telegram_api` tool.
+# Set `use_default_chat_id = true` in tool input to reuse policy.admin_chat_id.
 
 [feishu]
 # `mode = "webhook"`: expose listen_addr + event_path through your reverse proxy or public host.

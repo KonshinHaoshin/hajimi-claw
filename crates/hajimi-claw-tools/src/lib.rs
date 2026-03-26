@@ -26,6 +26,29 @@ use url::Url;
 
 pub use mcp::{McpBootstrapResult, bootstrap_mcp_servers};
 
+#[derive(Debug, Clone)]
+pub struct TelegramToolConfig {
+    pub bot_token: String,
+    pub default_chat_id: Option<i64>,
+    api_base_url: Option<String>,
+}
+
+impl TelegramToolConfig {
+    pub fn new(bot_token: impl Into<String>, default_chat_id: Option<i64>) -> Self {
+        Self {
+            bot_token: bot_token.into(),
+            default_chat_id,
+            api_base_url: None,
+        }
+    }
+
+    fn api_base_url(&self) -> &str {
+        self.api_base_url
+            .as_deref()
+            .unwrap_or("https://api.telegram.org")
+    }
+}
+
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
     mcp_servers: Vec<McpServerStatus>,
@@ -56,7 +79,15 @@ impl ToolRegistry {
         executor: Arc<dyn Executor>,
         policy: Arc<PolicyEngine>,
     ) -> Vec<Arc<dyn Tool>> {
-        vec![
+        Self::builtin_tools_with_telegram(executor, policy, None)
+    }
+
+    pub fn builtin_tools_with_telegram(
+        executor: Arc<dyn Executor>,
+        policy: Arc<PolicyEngine>,
+        telegram: Option<TelegramToolConfig>,
+    ) -> Vec<Arc<dyn Tool>> {
+        let mut tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(ReadFileTool::new(policy.clone())),
             Arc::new(TailFileTool::new(policy.clone())),
             Arc::new(ListDirTool::new(policy.clone())),
@@ -80,7 +111,11 @@ impl ToolRegistry {
             Arc::new(SessionStatusTool::new(executor.clone())),
             Arc::new(SessionExecTool::new(executor.clone())),
             Arc::new(SessionCloseTool::new(executor)),
-        ]
+        ];
+        if let Some(config) = telegram.filter(|config| !config.bot_token.trim().is_empty()) {
+            tools.push(Arc::new(TelegramApiTool::new(config)));
+        }
+        tools
     }
 
     pub fn from_parts(tools: Vec<Arc<dyn Tool>>, mcp_servers: Vec<McpServerStatus>) -> Self {
@@ -92,7 +127,16 @@ impl ToolRegistry {
         policy: Arc<PolicyEngine>,
         skills: Vec<ExecutableSkillConfig>,
     ) -> Vec<Arc<dyn Tool>> {
-        let mut tools = Self::builtin_tools(executor.clone(), policy);
+        Self::tools_with_skill_configs_and_telegram(executor, policy, skills, None)
+    }
+
+    pub fn tools_with_skill_configs_and_telegram(
+        executor: Arc<dyn Executor>,
+        policy: Arc<PolicyEngine>,
+        skills: Vec<ExecutableSkillConfig>,
+        telegram: Option<TelegramToolConfig>,
+    ) -> Vec<Arc<dyn Tool>> {
+        let mut tools = Self::builtin_tools_with_telegram(executor.clone(), policy, telegram);
         tools.extend(skills.into_iter().map(|skill| {
             Arc::new(ExecutableSkillTool::new(executor.clone(), skill)) as Arc<dyn Tool>
         }));
@@ -210,6 +254,13 @@ fn string_map_schema(description: &str) -> Value {
     })
 }
 
+fn freeform_object_schema(description: &str) -> Value {
+    json!({
+        "type": "object",
+        "description": description,
+    })
+}
+
 struct ExecutableSkillTool {
     executor: Arc<dyn Executor>,
     config: ExecutableSkillConfig,
@@ -219,6 +270,190 @@ impl ExecutableSkillTool {
     fn new(executor: Arc<dyn Executor>, config: ExecutableSkillConfig) -> Self {
         Self { executor, config }
     }
+}
+
+struct TelegramApiTool {
+    client: reqwest::Client,
+    config: TelegramToolConfig,
+}
+
+impl TelegramApiTool {
+    fn new(config: TelegramToolConfig) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            config,
+        }
+    }
+
+    fn api_url(&self, method: &str) -> String {
+        format!(
+            "{}/bot{}/{}",
+            self.config.api_base_url().trim_end_matches('/'),
+            self.config.bot_token,
+            method
+        )
+    }
+}
+
+#[async_trait]
+impl Tool for TelegramApiTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "telegram_api".into(),
+            description: "Call the configured Telegram Bot API and optionally inject the configured admin chat_id.".into(),
+            requires_approval: true,
+            input_schema: object_schema(
+                vec![
+                    (
+                        "method",
+                        string_schema("Telegram Bot API method name, for example sendMessage or getChat."),
+                    ),
+                    (
+                        "params",
+                        freeform_object_schema("Optional JSON request body sent to the Telegram method."),
+                    ),
+                    (
+                        "use_default_chat_id",
+                        bool_schema("When true, inject the configured admin chat_id if params.chat_id is absent."),
+                    ),
+                ],
+                &["method"],
+            ),
+        }
+    }
+
+    async fn call(&self, _ctx: ToolContext, input: Value) -> ClawResult<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Input {
+            method: String,
+            #[serde(default)]
+            params: Option<Value>,
+            use_default_chat_id: Option<bool>,
+        }
+
+        let input: Input = serde_json::from_value(input)
+            .map_err(|err| ClawError::InvalidRequest(err.to_string()))?;
+        let method = input.method.trim();
+        if !is_valid_telegram_method(method) {
+            return Err(ClawError::InvalidRequest(format!(
+                "invalid Telegram method `{}`",
+                input.method
+            )));
+        }
+
+        let mut params = normalize_telegram_params(input.params)?;
+        maybe_inject_default_chat_id(
+            &mut params,
+            self.config.default_chat_id,
+            input.use_default_chat_id.unwrap_or(false),
+        )?;
+
+        let response = self
+            .client
+            .post(self.api_url(method))
+            .json(&params)
+            .send()
+            .await
+            .map_err(|err| {
+                ClawError::Backend(format!("telegram `{method}` request failed: {err}"))
+            })?;
+        let status = response.status();
+        let body = response.text().await.map_err(|err| {
+            ClawError::Backend(format!("telegram `{method}` response read failed: {err}"))
+        })?;
+        let payload =
+            serde_json::from_str::<Value>(&body).unwrap_or_else(|_| json!({ "raw_body": body }));
+
+        if !status.is_success() {
+            return Err(ClawError::Backend(format_telegram_http_error(
+                method,
+                status.as_u16(),
+                &payload,
+            )));
+        }
+        if payload.get("ok").and_then(Value::as_bool) == Some(false) {
+            return Err(ClawError::Backend(format_telegram_api_error(
+                method, &payload,
+            )));
+        }
+
+        Ok(ToolOutput {
+            content: summarize_telegram_success(method, &payload),
+            structured: Some(payload),
+        })
+    }
+}
+
+fn is_valid_telegram_method(method: &str) -> bool {
+    !method.is_empty() && method.chars().all(|ch| ch.is_ascii_alphanumeric())
+}
+
+fn normalize_telegram_params(params: Option<Value>) -> ClawResult<Value> {
+    let params = params.unwrap_or_else(|| json!({}));
+    if params.is_object() {
+        Ok(params)
+    } else {
+        Err(ClawError::InvalidRequest(
+            "`params` must be a JSON object when provided".into(),
+        ))
+    }
+}
+
+fn maybe_inject_default_chat_id(
+    params: &mut Value,
+    default_chat_id: Option<i64>,
+    use_default_chat_id: bool,
+) -> ClawResult<()> {
+    if !use_default_chat_id {
+        return Ok(());
+    }
+    let params = params
+        .as_object_mut()
+        .ok_or_else(|| ClawError::InvalidRequest("`params` must be a JSON object".into()))?;
+    if params.contains_key("chat_id") {
+        return Ok(());
+    }
+    let chat_id = default_chat_id.ok_or_else(|| {
+        ClawError::InvalidRequest(
+            "no default Telegram chat_id is configured; pass params.chat_id explicitly".into(),
+        )
+    })?;
+    params.insert("chat_id".into(), json!(chat_id));
+    Ok(())
+}
+
+fn summarize_telegram_success(method: &str, payload: &Value) -> String {
+    if let Some(message_id) = payload
+        .get("result")
+        .and_then(|result| result.get("message_id"))
+        .and_then(Value::as_i64)
+    {
+        format!("telegram `{method}` ok message_id={message_id}")
+    } else {
+        format!("telegram `{method}` ok")
+    }
+}
+
+fn format_telegram_http_error(method: &str, status: u16, payload: &Value) -> String {
+    let description = payload
+        .get("description")
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("raw_body").and_then(Value::as_str))
+        .unwrap_or("unknown error");
+    format!("telegram `{method}` failed with HTTP {status}: {description}")
+}
+
+fn format_telegram_api_error(method: &str, payload: &Value) -> String {
+    let error_code = payload
+        .get("error_code")
+        .and_then(Value::as_i64)
+        .map(|code| format!(" error_code={code}"))
+        .unwrap_or_default();
+    let description = payload
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown Telegram API error");
+    format!("telegram `{method}` failed{error_code}: {description}")
 }
 
 #[async_trait]
@@ -1880,7 +2115,10 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::Mutex;
 
-    use super::ToolRegistry;
+    use super::{
+        TelegramApiTool, TelegramToolConfig, ToolRegistry, is_valid_telegram_method,
+        maybe_inject_default_chat_id, normalize_telegram_params,
+    };
 
     struct StubTool {
         spec: ToolSpec,
@@ -2263,6 +2501,95 @@ mod tests {
         assert!(stdin.contains("\"elevated\":true"));
         assert_eq!(output.content, "skill pong");
         assert_eq!(output.structured, Some(json!({ "ok": true })));
+        Ok(())
+    }
+
+    #[test]
+    fn builtin_tools_include_telegram_api_when_token_is_configured() {
+        let executor = Arc::new(FakeExecutor::new());
+        let policy = Arc::new(PolicyEngine::new(PolicyConfig::default()));
+        let tools = ToolRegistry::builtin_tools_with_telegram(
+            executor,
+            policy,
+            Some(TelegramToolConfig::new("telegram-token", Some(123456))),
+        );
+        assert!(tools.iter().any(|tool| tool.spec().name == "telegram_api"));
+    }
+
+    #[test]
+    fn telegram_method_validation_rejects_invalid_names() {
+        assert!(is_valid_telegram_method("sendMessage"));
+        assert!(!is_valid_telegram_method("sendMessage/evil"));
+        assert!(!is_valid_telegram_method("send-message"));
+        assert!(!is_valid_telegram_method(""));
+    }
+
+    #[test]
+    fn telegram_default_chat_id_injection_is_optional_and_safe() {
+        let mut params =
+            normalize_telegram_params(Some(json!({ "text": "hi" }))).expect("params normalization");
+        maybe_inject_default_chat_id(&mut params, Some(42), true).expect("inject chat id");
+        assert_eq!(params["chat_id"], 42);
+        assert_eq!(params["text"], "hi");
+
+        let mut prefilled =
+            normalize_telegram_params(Some(json!({ "chat_id": 7 }))).expect("prefilled params");
+        maybe_inject_default_chat_id(&mut prefilled, Some(42), true).expect("preserve existing");
+        assert_eq!(prefilled["chat_id"], 7);
+    }
+
+    #[tokio::test]
+    async fn telegram_api_tool_posts_to_bot_api_and_returns_structured_payload() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buffer = [0_u8; 4096];
+            let read = stream.read(&mut buffer).await.expect("read request");
+            let request = String::from_utf8_lossy(&buffer[..read]);
+            assert!(request.contains("POST /bottelegram-token/sendMessage HTTP/1.1"));
+            assert!(request.contains("\"chat_id\":99"));
+            assert!(request.contains("\"text\":\"hello\""));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 51\r\nContent-Type: application/json\r\n\r\n{\"ok\":true,\"result\":{\"message_id\":321,\"text\":\"hi\"}}",
+                )
+                .await
+                .expect("write response");
+        });
+
+        let tool = TelegramApiTool::new(TelegramToolConfig {
+            bot_token: "telegram-token".into(),
+            default_chat_id: Some(99),
+            api_base_url: Some(format!("http://{addr}")),
+        });
+        let output = tool
+            .call(
+                ToolContext {
+                    conversation_id: ConversationId::new(),
+                    working_directory: None,
+                    elevated: false,
+                },
+                json!({
+                    "method": "sendMessage",
+                    "params": { "text": "hello" },
+                    "use_default_chat_id": true
+                }),
+            )
+            .await?;
+
+        server.await?;
+        assert!(output.content.contains("telegram `sendMessage` ok"));
+        assert_eq!(
+            output.structured,
+            Some(json!({
+                "ok": true,
+                "result": {
+                    "message_id": 321,
+                    "text": "hi"
+                }
+            }))
+        );
         Ok(())
     }
 

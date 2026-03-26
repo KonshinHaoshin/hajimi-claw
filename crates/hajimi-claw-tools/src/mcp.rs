@@ -141,6 +141,8 @@ struct McpToolCallResult {
     content: Vec<Value>,
     #[serde(rename = "structuredContent")]
     structured_content: Option<Value>,
+    #[serde(rename = "isError", default)]
+    is_error: bool,
 }
 
 #[async_trait]
@@ -249,6 +251,7 @@ impl StdioMcpClient {
         if let Some(cwd) = &config.cwd {
             command.current_dir(cwd);
         }
+        command.kill_on_drop(true);
         command.stdin(Stdio::piped());
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
@@ -258,6 +261,7 @@ impl StdioMcpClient {
                 command.env(key, value);
             }
         }
+        command.env("PATH", std::env::var("PATH").unwrap_or_default());
 
         let mut child = command.spawn().map_err(|err| {
             ClawError::Backend(format!("mcp server `{}` spawn failed: {err}", config.name))
@@ -416,11 +420,33 @@ impl McpInvoker for StdioMcpClient {
                 self.inner.server_name
             ))
         })?;
-        Ok(ToolOutput {
-            content: flatten_content_blocks(&output.content),
-            structured: output.structured_content,
-        })
+        tool_output_from_call_result(&self.inner.server_name, tool_name, output)
     }
+}
+
+fn tool_output_from_call_result(
+    server_name: &str,
+    tool_name: &str,
+    output: McpToolCallResult,
+) -> ClawResult<ToolOutput> {
+    let content = flatten_content_blocks(&output.content);
+    if output.is_error {
+        let detail = if !content.is_empty() {
+            content
+        } else if let Some(structured) = &output.structured_content {
+            serde_json::to_string(structured).unwrap_or_else(|_| String::from("null"))
+        } else {
+            String::from("remote tool returned isError=true")
+        };
+        return Err(ClawError::Backend(format!(
+            "mcp server `{server_name}` tool `{tool_name}` failed: {detail}"
+        )));
+    }
+
+    Ok(ToolOutput {
+        content,
+        structured: output.structured_content,
+    })
 }
 
 fn flatten_content_blocks(blocks: &[Value]) -> String {
@@ -622,9 +648,10 @@ mod tests {
 
     use super::{
         JsonRpcTransport, McpConnectedServer, McpRemoteTool, bootstrap_mcp_servers_with_connector,
-        flatten_content_blocks, read_message, register_server_tools, write_message,
+        flatten_content_blocks, read_message, register_server_tools, tool_output_from_call_result,
+        write_message,
     };
-    use super::{McpConnector, McpInvoker, McpToolAdapter, McpToolsListResult};
+    use super::{McpConnector, McpInvoker, McpToolAdapter, McpToolCallResult, McpToolsListResult};
     use async_trait::async_trait;
     use hajimi_claw_types::{
         CapabilityKind, ClawError, ClawResult, McpServerConfig, Tool, ToolContext, ToolOutput,
@@ -835,6 +862,36 @@ mod tests {
             content,
             "hello\n{\"type\":\"json\",\"value\":{\"ok\":true}}"
         );
+    }
+
+    #[test]
+    fn tools_call_is_error_is_reported_as_backend_error() {
+        let err = tool_output_from_call_result(
+            "deploy",
+            "run",
+            McpToolCallResult {
+                content: vec![json!({ "type": "text", "text": "permission denied" })],
+                structured_content: Some(json!({ "code": "EACCES" })),
+                is_error: true,
+            },
+        )
+        .expect_err("isError payload must fail");
+        assert!(
+            err.to_string()
+                .contains("mcp server `deploy` tool `run` failed: permission denied")
+        );
+    }
+
+    #[test]
+    fn tools_call_deserializes_is_error_field() {
+        let output: McpToolCallResult = serde_json::from_value(json!({
+            "content": [],
+            "structuredContent": { "ok": false },
+            "isError": true
+        }))
+        .expect("parse tool call result");
+        assert!(output.is_error);
+        assert_eq!(output.structured_content, Some(json!({ "ok": false })));
     }
 
     #[tokio::test]

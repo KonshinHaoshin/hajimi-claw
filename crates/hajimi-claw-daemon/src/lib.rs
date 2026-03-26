@@ -19,7 +19,9 @@ use hajimi_claw_gateway::InProcessGateway;
 use hajimi_claw_llm::{StaticBackend, StoreBackedBackend, list_models, test_provider};
 use hajimi_claw_policy::{PolicyConfig, PolicyEngine};
 use hajimi_claw_store::{SecretCipher, Store};
-use hajimi_claw_tools::{McpBootstrapResult, ToolRegistry, bootstrap_mcp_servers};
+use hajimi_claw_tools::{
+    McpBootstrapResult, TelegramToolConfig, ToolRegistry, bootstrap_mcp_servers,
+};
 use hajimi_claw_types::{
     ExecutableSkillConfig, ExecutionProfile, HeartbeatStatus, McpServerConfig,
     ProviderCapabilities, ProviderConfig, ProviderKind, ProviderRecord,
@@ -352,8 +354,22 @@ async fn build_runtime_components(
             .map_err(|err| anyhow::anyhow!(err.to_string()))?;
     }
     let skill_configs = load_skill_configs(config)?;
-    let mut tools =
-        ToolRegistry::tools_with_skill_configs(executor.clone(), policy.clone(), skill_configs);
+    let telegram_tools = if config.telegram.bot_token.trim().is_empty()
+        || config.telegram.bot_token.contains("replace-me")
+    {
+        None
+    } else {
+        Some(TelegramToolConfig::new(
+            config.telegram.bot_token.clone(),
+            (config.policy.admin_chat_id != 0).then_some(config.policy.admin_chat_id),
+        ))
+    };
+    let mut tools = ToolRegistry::tools_with_skill_configs_and_telegram(
+        executor.clone(),
+        policy.clone(),
+        skill_configs,
+        telegram_tools,
+    );
     let McpBootstrapResult {
         tools: mcp_tools,
         statuses: mcp_servers,

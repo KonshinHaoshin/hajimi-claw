@@ -179,6 +179,7 @@ Hajimi now treats native tools, executable skills, and MCP-discovered tools as o
 surface.
 
 - Native tools keep their existing names such as `read_file` or `exec_once`
+- When `[telegram].bot_token` is configured, a native `telegram_api` tool is also registered
 - Executable skills are configured in `[skills]` and are registered as tool names like
   `skill.deploy`
 - MCP tools will be exposed as namespaced tool names like `mcp.<server>.<tool>`
@@ -221,6 +222,19 @@ Relative paths in skill manifests, `skills.directory`, `skills.manifest_paths`, 
 
 Natural-language requests stay primary. Once a skill or MCP tool is registered in the runtime, the
 model can choose it during normal `/ask` or plain-text requests just like built-in tools.
+
+`telegram_api` calls the configured Telegram Bot API token directly from the native tool layer. A
+typical invocation looks like:
+
+```json
+{
+  "method": "sendMessage",
+  "params": {
+    "text": "deploy finished"
+  },
+  "use_default_chat_id": true
+}
+```
 
 ## Multi-Agent
 
