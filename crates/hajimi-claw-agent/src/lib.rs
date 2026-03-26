@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,9 +11,11 @@ use hajimi_claw_policy::PolicyEngine;
 use hajimi_claw_store::Store;
 use hajimi_claw_tools::ToolRegistry;
 use hajimi_claw_types::{
-    AgentEvent, AgentRequest, ApprovalId, ClawError, ClawResult, ConversationId,
-    ConversationMessage, LlmBackend, MessageRole, PolicyMode, TaskId, TaskKind, TaskStatus,
-    ToolCallRecord, ToolContext, ToolExchange, ToolResultRecord,
+    AgentEvent, AgentRequest, ApprovalId, ApprovalRecord, CapabilityKind, CapabilitySummary,
+    ClawError, ClawResult, ConversationId, ConversationMessage, LlmBackend, McpServerStatus,
+    MessageRole, PolicyMode, ProviderRecord, TaskId, TaskKind, TaskRunState, TaskStatus,
+    ToolCallRecord, ToolContext, ToolExchange, ToolInvocationRecord, ToolInvocationStatus,
+    ToolResultRecord,
 };
 use regex::Regex;
 use serde_json::json;
@@ -34,6 +37,18 @@ pub struct AgentRuntime {
 #[derive(Debug, Clone)]
 pub struct ShellOpenReply {
     pub session_id: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AskReply {
+    pub conversation_id: ConversationId,
+    pub message: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CapabilityInvokeReply {
+    pub conversation_id: ConversationId,
     pub message: String,
 }
 
@@ -70,6 +85,21 @@ impl Default for MultiAgentConfig {
             max_context_chars_per_worker: 24_000,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct TaskExecution {
+    task_id: TaskId,
+    conversation_id: ConversationId,
+    prompt: String,
+    cwd: Option<PathBuf>,
+    provider_id: Option<String>,
+    current_session_id: Option<String>,
+}
+
+enum ToolCallOutcome {
+    Completed(ToolExchange),
+    Blocked(ClawError),
 }
 
 impl MultiAgentConfig {
@@ -128,8 +158,16 @@ impl AgentRuntime {
     }
 
     pub async fn ask(&self, prompt: &str, cwd: Option<PathBuf>) -> ClawResult<String> {
-        self.ask_with_provider_and_preference(prompt, cwd, None, MultiAgentPreference::Auto)
-            .await
+        Ok(self
+            .ask_with_provider_and_preference_and_session(
+                prompt,
+                cwd,
+                None,
+                MultiAgentPreference::Auto,
+                None,
+            )
+            .await?
+            .message)
     }
 
     pub async fn ask_with_provider(
@@ -138,8 +176,16 @@ impl AgentRuntime {
         cwd: Option<PathBuf>,
         provider_id: Option<String>,
     ) -> ClawResult<String> {
-        self.ask_with_provider_and_preference(prompt, cwd, provider_id, MultiAgentPreference::Auto)
-            .await
+        Ok(self
+            .ask_with_provider_and_preference_and_session(
+                prompt,
+                cwd,
+                provider_id,
+                MultiAgentPreference::Auto,
+                None,
+            )
+            .await?
+            .message)
     }
 
     pub fn preview_multi_agent_request(
@@ -161,6 +207,46 @@ impl AgentRuntime {
         provider_id: Option<String>,
         preference: MultiAgentPreference,
     ) -> ClawResult<String> {
+        Ok(self
+            .ask_with_provider_and_preference_and_session(
+                prompt,
+                cwd,
+                provider_id,
+                preference,
+                None,
+            )
+            .await?
+            .message)
+    }
+
+    pub async fn ask_with_provider_and_preference_and_session(
+        &self,
+        prompt: &str,
+        cwd: Option<PathBuf>,
+        provider_id: Option<String>,
+        preference: MultiAgentPreference,
+        current_session_id: Option<String>,
+    ) -> ClawResult<AskReply> {
+        self.ask_with_provider_and_preference_and_session_and_conversation(
+            prompt,
+            cwd,
+            provider_id,
+            preference,
+            None,
+            current_session_id,
+        )
+        .await
+    }
+
+    pub async fn ask_with_provider_and_preference_and_session_and_conversation(
+        &self,
+        prompt: &str,
+        cwd: Option<PathBuf>,
+        provider_id: Option<String>,
+        preference: MultiAgentPreference,
+        conversation_id: Option<ConversationId>,
+        current_session_id: Option<String>,
+    ) -> ClawResult<AskReply> {
         let _permit = self
             .task_gate
             .acquire()
@@ -168,16 +254,16 @@ impl AgentRuntime {
             .map_err(|_| ClawError::Backend("task gate closed".into()))?;
 
         let task_id = TaskId::new();
-        let conversation_id = ConversationId::new();
-        let mut status = TaskStatus {
-            id: task_id,
-            kind: TaskKind::EphemeralAgentTask,
-            description: prompt.into(),
-            queued_at: Utc::now(),
-            started_at: Some(Utc::now()),
-            finished_at: None,
-            running: true,
-        };
+        let conversation_id = conversation_id.unwrap_or_default();
+        let mut status = self.new_task_status(
+            task_id,
+            conversation_id,
+            TaskKind::EphemeralAgentTask,
+            prompt,
+            cwd.clone(),
+            provider_id.clone(),
+            current_session_id.clone(),
+        );
         self.store.upsert_task(&status).map_err(store_error)?;
 
         self.store
@@ -191,45 +277,71 @@ impl AgentRuntime {
             )
             .map_err(store_error)?;
 
+        let execution = TaskExecution {
+            task_id,
+            conversation_id,
+            prompt: prompt.into(),
+            cwd: cwd.clone(),
+            provider_id: provider_id.clone(),
+            current_session_id,
+        };
+
         let result = if let Some((tool, input)) = select_tool(prompt) {
-            self.tools
-                .call(
+            match self
+                .execute_tool_call(
+                    &execution,
+                    None,
                     tool,
-                    ToolContext {
-                        conversation_id,
-                        working_directory: cwd,
-                        elevated: self.policy.is_elevated(),
-                    },
                     input,
+                    status.current_session_id.clone(),
+                    1,
                 )
-                .await
-                .map(|output| output.content)
+                .await?
+            {
+                ToolCallOutcome::Completed(exchange) => Ok(exchange.result.content),
+                ToolCallOutcome::Blocked(err) => Err(err),
+            }
         } else if should_delegate_multi_agent(prompt, &self.multi_agent, preference) {
             self.run_multi_agent(conversation_id, prompt, provider_id, preference)
                 .await
         } else {
-            self.run_llm(conversation_id, prompt, cwd, provider_id)
-                .await
+            self.run_llm(execution).await
         };
 
-        status.running = false;
-        status.finished_at = Some(Utc::now());
-        self.store.upsert_task(&status).map_err(store_error)?;
-
-        if let Ok(content) = &result {
-            self.store
-                .save_message(
-                    conversation_id,
-                    &ConversationMessage {
-                        role: MessageRole::Assistant,
-                        content: content.clone(),
-                        created_at: Utc::now(),
-                    },
-                )
-                .map_err(store_error)?;
+        match &result {
+            Ok(content) => {
+                status.running = false;
+                status.state = TaskRunState::Completed;
+                status.finished_at = Some(Utc::now());
+                status.result_preview = Some(clamp_chars(content, 400));
+                status.error = None;
+                status.blocked_approval_id = None;
+                self.store.upsert_task(&status).map_err(store_error)?;
+                self.store
+                    .save_message(
+                        conversation_id,
+                        &ConversationMessage {
+                            role: MessageRole::Assistant,
+                            content: content.clone(),
+                            created_at: Utc::now(),
+                        },
+                    )
+                    .map_err(store_error)?;
+            }
+            Err(ClawError::ApprovalRequired(_)) => {}
+            Err(err) => {
+                status.running = false;
+                status.state = TaskRunState::Failed;
+                status.finished_at = Some(Utc::now());
+                status.error = Some(err.to_string());
+                self.store.upsert_task(&status).map_err(store_error)?;
+            }
         }
 
-        result
+        result.map(|message| AskReply {
+            conversation_id,
+            message,
+        })
     }
 
     pub async fn shell_open(
@@ -255,6 +367,10 @@ impl AgentRuntime {
             .and_then(|value| value.get("session_id"))
             .and_then(|value| value.as_str())
             .ok_or_else(|| ClawError::Backend("session_open did not return session_id".into()))?;
+        let handle = self.fetch_session_handle(session_id).await?;
+        self.store
+            .upsert_session(&handle, true)
+            .map_err(store_error)?;
         Ok(ShellOpenReply {
             session_id: session_id.to_string(),
             message: output.content,
@@ -262,7 +378,8 @@ impl AgentRuntime {
     }
 
     pub async fn shell_exec(&self, session_id: &str, command: &str) -> ClawResult<String> {
-        self.tools
+        let output = self
+            .tools
             .call(
                 "session_exec",
                 ToolContext {
@@ -272,12 +389,34 @@ impl AgentRuntime {
                 },
                 json!({ "session_id": session_id, "command": command }),
             )
-            .await
-            .map(|output| output.content)
+            .await?;
+        let handle = self.fetch_session_handle(session_id).await?;
+        self.store
+            .upsert_session(&handle, true)
+            .map_err(store_error)?;
+        if let Some(structured) = &output.structured {
+            self.store
+                .append_command_audit(
+                    None,
+                    Some(session_id.to_string()),
+                    command,
+                    structured
+                        .get("exit_code")
+                        .and_then(|value| value.as_i64())
+                        .map(|value| value as i32),
+                    structured
+                        .get("duration_ms")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or_default() as u128,
+                )
+                .map_err(store_error)?;
+        }
+        Ok(output.content)
     }
 
     pub async fn shell_status(&self, session_id: &str) -> ClawResult<String> {
-        self.tools
+        let output = self
+            .tools
             .call(
                 "session_status",
                 ToolContext {
@@ -287,12 +426,18 @@ impl AgentRuntime {
                 },
                 json!({ "session_id": session_id }),
             )
-            .await
-            .map(|output| output.content)
+            .await?;
+        let handle = self.fetch_session_handle(session_id).await?;
+        self.store
+            .upsert_session(&handle, true)
+            .map_err(store_error)?;
+        Ok(output.content)
     }
 
     pub async fn shell_close(&self, session_id: &str) -> ClawResult<String> {
-        self.tools
+        let handle = self.fetch_session_handle(session_id).await?;
+        let output = self
+            .tools
             .call(
                 "session_close",
                 ToolContext {
@@ -302,11 +447,21 @@ impl AgentRuntime {
                 },
                 json!({ "session_id": session_id }),
             )
-            .await
-            .map(|output| output.content)
+            .await?;
+        self.store
+            .upsert_session(&handle, false)
+            .map_err(store_error)?;
+        Ok(output.content)
     }
 
     pub async fn persona_list(&self) -> ClawResult<String> {
+        if let Some(report) = self.prompt_source.describe()? {
+            let heartbeat_path = self.persona_dir.join("heartbeat.md");
+            return Ok(report
+                .with_runtime_entry(heartbeat_path)
+                .render_persona_list());
+        }
+
         let mut lines = Vec::new();
         for file in persona_file_names() {
             let path = self.persona_dir.join(file);
@@ -385,7 +540,7 @@ impl AgentRuntime {
         "approval mode enabled. Guarded and dangerous commands will ask before running.".into()
     }
 
-    pub fn approve(&self, request_id: &str) -> ClawResult<String> {
+    pub async fn approve(&self, request_id: &str) -> ClawResult<String> {
         let approval_id = ApprovalId(
             uuid::Uuid::parse_str(request_id)
                 .map_err(|err| ClawError::InvalidRequest(err.to_string()))?,
@@ -393,17 +548,270 @@ impl AgentRuntime {
         let approval = self
             .policy
             .approve(approval_id)
+            .map(|request| ApprovalRecord {
+                request,
+                approved: Some(true),
+                task_id: None,
+                tool_name: None,
+            })
+            .or_else(|| self.store.get_approval_record(request_id).ok().flatten())
             .ok_or_else(|| ClawError::NotFound(format!("approval not found: {request_id}")))?;
-        let _ = self.store.save_approval(&approval, Some(true));
-        Ok(format!(
+        let approval = ApprovalRecord {
+            approved: Some(true),
+            ..approval
+        };
+        self.store
+            .save_approval_record(&approval)
+            .map_err(store_error)?;
+        self.policy
+            .enable_elevation(1, format!("approved {}", approval.request.request_id));
+        let resumed = if let Some(task_id) = approval.task_id {
+            Some(self.resume_task(task_id).await?)
+        } else {
+            None
+        };
+        self.policy.stop_elevation();
+        let mut response = format!(
             "approved {} ({})",
-            approval.command_preview, approval.request_id
-        ))
+            approval.request.command_preview, approval.request.request_id
+        );
+        if let Some(resumed) = resumed {
+            response.push_str("\n\nresumed task result:\n");
+            response.push_str(&resumed);
+        }
+        Ok(response)
     }
 
     pub fn stop_elevated(&self) -> String {
         self.policy.stop_elevation();
         "elevated mode disabled".into()
+    }
+
+    pub fn list_tasks(&self) -> ClawResult<Vec<TaskStatus>> {
+        self.store.list_tasks().map_err(store_error)
+    }
+
+    pub fn list_pending_approvals(&self) -> ClawResult<Vec<ApprovalRecord>> {
+        self.store.list_pending_approvals().map_err(store_error)
+    }
+
+    pub fn list_capabilities(&self) -> Vec<CapabilitySummary> {
+        self.tools.capability_summaries()
+    }
+
+    pub fn list_skill_capabilities(&self) -> Vec<CapabilitySummary> {
+        self.list_capabilities()
+            .into_iter()
+            .filter(|capability| matches!(capability.id.kind, CapabilityKind::Skill))
+            .collect()
+    }
+
+    pub fn list_mcp_server_statuses(&self) -> Vec<McpServerStatus> {
+        self.tools.mcp_server_statuses().to_vec()
+    }
+
+    pub fn list_mcp_capabilities(&self, server: Option<&str>) -> Vec<CapabilitySummary> {
+        self.list_capabilities()
+            .into_iter()
+            .filter(|capability| matches!(capability.id.kind, CapabilityKind::McpTool))
+            .filter(|capability| {
+                server
+                    .is_none_or(|server_name| capability.id.source.as_deref() == Some(server_name))
+            })
+            .collect()
+    }
+
+    pub fn render_capability_inventory(&self) -> String {
+        let capabilities = self.list_capabilities();
+        let mut lines = vec!["capability inventory".to_string()];
+        lines.extend(render_capability_section(
+            "native tools",
+            capabilities
+                .iter()
+                .filter(|capability| matches!(capability.id.kind, CapabilityKind::NativeTool)),
+        ));
+        lines.extend(render_capability_section(
+            "skills",
+            capabilities
+                .iter()
+                .filter(|capability| matches!(capability.id.kind, CapabilityKind::Skill)),
+        ));
+        lines.extend(render_capability_section(
+            "mcp tools",
+            capabilities
+                .iter()
+                .filter(|capability| matches!(capability.id.kind, CapabilityKind::McpTool)),
+        ));
+        lines.join("\n")
+    }
+
+    pub fn render_skill_inventory(&self) -> String {
+        let skills = self.list_skill_capabilities();
+        if skills.is_empty() {
+            return "skills\n(no executable skills configured)".into();
+        }
+        let mut lines = vec!["skills".to_string()];
+        lines.extend(render_capability_lines(&skills));
+        lines.join("\n")
+    }
+
+    pub fn render_mcp_inventory(&self) -> String {
+        let servers = self.list_mcp_server_statuses();
+        if servers.is_empty() {
+            return "mcp servers\n(no mcp servers configured)".into();
+        }
+
+        let mut lines = vec!["mcp servers".to_string()];
+        for server in servers {
+            let status = if server.connected {
+                "connected"
+            } else {
+                "disconnected"
+            };
+            lines.push(format!(
+                "- {} [{}] tools={} {}",
+                server.name, status, server.tool_count, server.message
+            ));
+        }
+        lines.join("\n")
+    }
+
+    pub fn render_mcp_tool_inventory(&self, server: Option<&str>) -> String {
+        let tools = self.list_mcp_capabilities(server);
+        let heading = match server {
+            Some(server) => format!("mcp tools for `{server}`"),
+            None => "mcp tools".into(),
+        };
+        if tools.is_empty() {
+            return format!("{heading}\n(no mcp tools available)");
+        }
+        let mut lines = vec![heading];
+        lines.extend(render_capability_lines(&tools));
+        lines.join("\n")
+    }
+
+    pub async fn invoke_skill(
+        &self,
+        skill_name: &str,
+        input: serde_json::Value,
+        cwd: Option<PathBuf>,
+        conversation_id: Option<ConversationId>,
+        current_session_id: Option<String>,
+    ) -> ClawResult<CapabilityInvokeReply> {
+        if !self
+            .list_skill_capabilities()
+            .iter()
+            .any(|capability| capability.id.name == skill_name)
+        {
+            return Err(ClawError::NotFound(format!(
+                "skill not found: {skill_name}"
+            )));
+        }
+        self.invoke_capability(skill_name, input, cwd, conversation_id, current_session_id)
+            .await
+    }
+
+    pub async fn invoke_capability(
+        &self,
+        capability_name: &str,
+        input: serde_json::Value,
+        cwd: Option<PathBuf>,
+        conversation_id: Option<ConversationId>,
+        current_session_id: Option<String>,
+    ) -> ClawResult<CapabilityInvokeReply> {
+        let _permit = self
+            .task_gate
+            .acquire()
+            .await
+            .map_err(|_| ClawError::Backend("task gate closed".into()))?;
+
+        let capability = self
+            .list_capabilities()
+            .into_iter()
+            .find(|entry| entry.id.name == capability_name)
+            .ok_or_else(|| {
+                ClawError::NotFound(format!("capability not found: {capability_name}"))
+            })?;
+
+        let task_id = TaskId::new();
+        let conversation_id = conversation_id.unwrap_or_default();
+        let serialized_input =
+            serde_json::to_string(&input).unwrap_or_else(|_| "<invalid-json>".into());
+        let request_preview = if serialized_input == "{}" {
+            format!("invoke {}", capability.id.name)
+        } else {
+            format!("invoke {} {}", capability.id.name, serialized_input)
+        };
+        let description = format!("invoke {}", capability.id.name);
+        let mut status = self.new_task_status(
+            task_id,
+            conversation_id,
+            TaskKind::DirectToolTask,
+            &description,
+            cwd.clone(),
+            None,
+            current_session_id.clone(),
+        );
+        self.store.upsert_task(&status).map_err(store_error)?;
+
+        let execution = TaskExecution {
+            task_id,
+            conversation_id,
+            prompt: request_preview,
+            cwd,
+            provider_id: None,
+            current_session_id,
+        };
+
+        let result = match self
+            .execute_tool_call(
+                &execution,
+                None,
+                &capability.id.name,
+                input,
+                status.current_session_id.clone(),
+                1,
+            )
+            .await?
+        {
+            ToolCallOutcome::Completed(exchange) => Ok(exchange.result.content),
+            ToolCallOutcome::Blocked(err) => Err(err),
+        };
+
+        match &result {
+            Ok(content) => {
+                status.running = false;
+                status.state = TaskRunState::Completed;
+                status.finished_at = Some(Utc::now());
+                status.result_preview = Some(clamp_chars(content, 400));
+                status.error = None;
+                status.blocked_approval_id = None;
+                self.store.upsert_task(&status).map_err(store_error)?;
+                self.store
+                    .save_message(
+                        conversation_id,
+                        &ConversationMessage {
+                            role: MessageRole::Assistant,
+                            content: content.clone(),
+                            created_at: Utc::now(),
+                        },
+                    )
+                    .map_err(store_error)?;
+            }
+            Err(ClawError::ApprovalRequired(_)) => {}
+            Err(err) => {
+                status.running = false;
+                status.state = TaskRunState::Failed;
+                status.finished_at = Some(Utc::now());
+                status.error = Some(err.to_string());
+                self.store.upsert_task(&status).map_err(store_error)?;
+            }
+        }
+
+        result.map(|message| CapabilityInvokeReply {
+            conversation_id,
+            message,
+        })
     }
 
     pub fn status(&self) -> ClawResult<String> {
@@ -416,8 +824,8 @@ impl AgentRuntime {
                 .take(5)
                 .map(|task| {
                     format!(
-                        "{} [{}] running={} queued_at={}",
-                        task.id, task.description, task.running, task.queued_at
+                        "{} [{}] state={:?} running={} queued_at={}",
+                        task.id, task.description, task.state, task.running, task.queued_at
                     )
                 })
                 .collect::<Vec<_>>()
@@ -451,25 +859,361 @@ impl AgentRuntime {
         ))
     }
 
-    async fn run_llm(
+    fn new_task_status(
         &self,
+        task_id: TaskId,
         conversation_id: ConversationId,
-        prompt: &str,
+        kind: TaskKind,
+        description: &str,
         cwd: Option<PathBuf>,
         provider_id: Option<String>,
-    ) -> ClawResult<String> {
-        let system_prompt = self.prompt_source.load()?;
-        let messages = vec![ConversationMessage {
-            role: MessageRole::User,
-            content: prompt.into(),
-            created_at: Utc::now(),
-        }];
-        let mut tool_history = Vec::new();
+        current_session_id: Option<String>,
+    ) -> TaskStatus {
+        TaskStatus {
+            id: task_id,
+            conversation_id,
+            kind,
+            description: description.into(),
+            queued_at: Utc::now(),
+            started_at: Some(Utc::now()),
+            finished_at: None,
+            state: TaskRunState::Running,
+            running: true,
+            cwd,
+            provider_id,
+            current_session_id,
+            result_preview: None,
+            error: None,
+            blocked_approval_id: None,
+        }
+    }
+
+    fn ensure_tool_capable_provider(
+        &self,
+        provider_id: Option<&str>,
+    ) -> ClawResult<ProviderRecord> {
+        let provider = match provider_id {
+            Some(provider_id) => self
+                .store
+                .get_provider(provider_id)
+                .map_err(store_error)?
+                .ok_or_else(|| ClawError::NotFound(format!("provider not found: {provider_id}")))?,
+            None => self
+                .store
+                .get_default_provider()
+                .map_err(store_error)?
+                .or_else(|| self.store.get_first_provider().ok().flatten())
+                .ok_or_else(|| ClawError::NotFound("no provider configured".into()))?,
+        };
+        if !provider.config.capabilities.tool_calling {
+            return Err(ClawError::Backend(format!(
+                "provider `{}` does not declare tool_calling capability; update the provider capabilities before using agent execution",
+                provider.config.id
+            )));
+        }
+        Ok(provider)
+    }
+
+    async fn execute_tool_call(
+        &self,
+        execution: &TaskExecution,
+        call_id: Option<String>,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        working_session_id: Option<String>,
+        sequence: i64,
+    ) -> ClawResult<ToolCallOutcome> {
+        let started_at = Utc::now();
+        let tool_result = self
+            .tools
+            .call(
+                tool_name,
+                ToolContext {
+                    conversation_id: execution.conversation_id,
+                    working_directory: execution.cwd.clone(),
+                    elevated: self.policy.is_elevated(),
+                },
+                arguments.clone(),
+            )
+            .await;
+
+        match tool_result {
+            Ok(result) => {
+                let exchange = ToolExchange {
+                    call: ToolCallRecord {
+                        id: call_id.clone(),
+                        name: tool_name.into(),
+                        arguments: arguments.clone(),
+                    },
+                    result: ToolResultRecord {
+                        call_id: call_id.clone(),
+                        name: tool_name.into(),
+                        content: render_tool_output(&result),
+                        structured: result.structured.clone(),
+                    },
+                };
+                self.store
+                    .save_tool_invocation(&ToolInvocationRecord {
+                        task_id: execution.task_id,
+                        conversation_id: execution.conversation_id,
+                        call_id,
+                        tool_name: tool_name.into(),
+                        arguments: arguments.clone(),
+                        status: ToolInvocationStatus::Completed,
+                        output_content: Some(exchange.result.content.clone()),
+                        output_structured: result.structured.clone(),
+                        error: None,
+                        approval_id: None,
+                        sequence,
+                        created_at: started_at,
+                        updated_at: Utc::now(),
+                    })
+                    .map_err(store_error)?;
+                self.persist_session_and_audit(
+                    execution.task_id,
+                    tool_name,
+                    &arguments,
+                    &result,
+                    working_session_id,
+                )
+                .await?;
+                Ok(ToolCallOutcome::Completed(exchange))
+            }
+            Err(err @ ClawError::ApprovalRequired(_)) => {
+                let approval_id = extract_approval_id(&err);
+                let approval_record =
+                    approval_id
+                        .and_then(|id| self.policy.get_approval(id))
+                        .map(|request| ApprovalRecord {
+                            request,
+                            approved: None,
+                            task_id: Some(execution.task_id),
+                            tool_name: Some(tool_name.into()),
+                        });
+                if let Some(approval_record) = approval_record.clone() {
+                    self.store
+                        .save_approval_record(&approval_record)
+                        .map_err(store_error)?;
+                }
+                let blocked_approval_id = approval_record
+                    .as_ref()
+                    .map(|record| record.request.request_id);
+                self.store
+                    .save_tool_invocation(&ToolInvocationRecord {
+                        task_id: execution.task_id,
+                        conversation_id: execution.conversation_id,
+                        call_id,
+                        tool_name: tool_name.into(),
+                        arguments,
+                        status: ToolInvocationStatus::BlockedApproval,
+                        output_content: None,
+                        output_structured: None,
+                        error: Some(err.to_string()),
+                        approval_id: blocked_approval_id,
+                        sequence,
+                        created_at: started_at,
+                        updated_at: Utc::now(),
+                    })
+                    .map_err(store_error)?;
+                let mut status = self
+                    .store
+                    .get_task(execution.task_id)
+                    .map_err(store_error)?
+                    .ok_or_else(|| {
+                        ClawError::NotFound(format!("task not found: {}", execution.task_id))
+                    })?;
+                status.running = false;
+                status.state = TaskRunState::BlockedApproval;
+                status.finished_at = None;
+                status.blocked_approval_id = blocked_approval_id;
+                status.error = None;
+                self.store.upsert_task(&status).map_err(store_error)?;
+                Ok(ToolCallOutcome::Blocked(err))
+            }
+            Err(err) => {
+                self.store
+                    .save_tool_invocation(&ToolInvocationRecord {
+                        task_id: execution.task_id,
+                        conversation_id: execution.conversation_id,
+                        call_id,
+                        tool_name: tool_name.into(),
+                        arguments,
+                        status: ToolInvocationStatus::Failed,
+                        output_content: None,
+                        output_structured: None,
+                        error: Some(err.to_string()),
+                        approval_id: None,
+                        sequence,
+                        created_at: started_at,
+                        updated_at: Utc::now(),
+                    })
+                    .map_err(store_error)?;
+                Err(err)
+            }
+        }
+    }
+
+    async fn persist_session_and_audit(
+        &self,
+        task_id: TaskId,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+        result: &hajimi_claw_types::ToolOutput,
+        session_id_hint: Option<String>,
+    ) -> ClawResult<()> {
+        if let Some(session_id) = result
+            .structured
+            .as_ref()
+            .and_then(|value| value.get("session_id"))
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .or(session_id_hint)
+        {
+            if let Ok(handle) = self.fetch_session_handle(&session_id).await {
+                self.store
+                    .upsert_session(&handle, true)
+                    .map_err(store_error)?;
+                let mut task = self
+                    .store
+                    .get_task(task_id)
+                    .map_err(store_error)?
+                    .ok_or_else(|| ClawError::NotFound(format!("task not found: {task_id}")))?;
+                task.current_session_id = Some(session_id);
+                task.cwd = Some(handle.cwd);
+                self.store.upsert_task(&task).map_err(store_error)?;
+            }
+        }
+
+        if let Some(structured) = &result.structured {
+            if let Some(exit_code) = structured.get("exit_code").and_then(|value| value.as_i64()) {
+                let duration_ms = structured
+                    .get("duration_ms")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or_default() as u128;
+                self.store
+                    .append_command_audit(
+                        Some(task_id),
+                        structured
+                            .get("session_id")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string),
+                        &render_command_preview(tool_name, arguments),
+                        Some(exit_code as i32),
+                        duration_ms,
+                    )
+                    .map_err(store_error)?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn fetch_session_handle(
+        &self,
+        session_id: &str,
+    ) -> ClawResult<hajimi_claw_types::SessionHandle> {
+        let output = self
+            .tools
+            .call(
+                "session_status",
+                ToolContext {
+                    conversation_id: ConversationId::new(),
+                    working_directory: None,
+                    elevated: self.policy.is_elevated(),
+                },
+                json!({ "session_id": session_id }),
+            )
+            .await?;
+        let structured = output
+            .structured
+            .ok_or_else(|| ClawError::Backend("session_status missing structured data".into()))?;
+        let session_uuid = structured
+            .get("session_id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| ClawError::Backend("session_status missing session_id".into()))?;
+        Ok(hajimi_claw_types::SessionHandle {
+            id: hajimi_claw_types::SessionId(
+                uuid::Uuid::parse_str(session_uuid)
+                    .map_err(|err| ClawError::Backend(err.to_string()))?,
+            ),
+            name: structured
+                .get("name")
+                .and_then(|value| value.as_str())
+                .unwrap_or("shell")
+                .to_string(),
+            cwd: structured
+                .get("cwd")
+                .and_then(|value| value.as_str())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(".")),
+            created_at: structured
+                .get("created_at")
+                .and_then(|value| value.as_str())
+                .map(parse_rfc3339)
+                .transpose()?
+                .unwrap_or_else(Utc::now),
+            last_used_at: structured
+                .get("last_used_at")
+                .and_then(|value| value.as_str())
+                .map(parse_rfc3339)
+                .transpose()?
+                .unwrap_or_else(Utc::now),
+        })
+    }
+
+    async fn run_llm(&self, execution: TaskExecution) -> ClawResult<String> {
+        let provider = self.ensure_tool_capable_provider(execution.provider_id.as_deref())?;
+        let mut system_prompt = self.prompt_source.load()?;
+        if let Some(session_id) = &execution.current_session_id {
+            if let Ok(handle) = self.fetch_session_handle(session_id).await {
+                system_prompt.push_str(&format!(
+                    "\n\nCurrent shell session:\n- session_id={}\n- cwd={}",
+                    session_id,
+                    handle.cwd.display()
+                ));
+            }
+        }
+        let mut tool_history = self.load_completed_tool_history(execution.task_id)?;
+        let blocked = self.load_blocked_tool_invocation(execution.task_id)?;
+        let all_messages = self
+            .store
+            .list_messages(execution.conversation_id, 10_000)
+            .map_err(store_error)?;
 
         for _ in 0..8 {
+            let messages = trim_messages_to_context_limit(
+                all_messages.clone(),
+                provider.config.capabilities.max_context_chars,
+                system_prompt.len(),
+                &tool_history,
+            );
+            let should_resume_blocked = blocked.as_ref().is_some_and(|blocked_record| {
+                !tool_history.iter().any(|item| {
+                    item.call.id == blocked_record.call_id
+                        && item.call.name == blocked_record.tool_name
+                })
+            });
+            if let Some(blocked) = blocked.as_ref().filter(|_| should_resume_blocked) {
+                match self
+                    .execute_tool_call(
+                        &execution,
+                        blocked.call_id.clone(),
+                        &blocked.tool_name,
+                        blocked.arguments.clone(),
+                        execution.current_session_id.clone(),
+                        blocked.sequence,
+                    )
+                    .await?
+                {
+                    ToolCallOutcome::Completed(exchange) => {
+                        tool_history.push(exchange);
+                        continue;
+                    }
+                    ToolCallOutcome::Blocked(err) => return Err(err),
+                }
+            }
             let request = AgentRequest {
-                conversation_id,
-                provider_id: provider_id.clone(),
+                conversation_id: execution.conversation_id,
+                provider_id: Some(provider.config.id.clone()),
                 system_prompt: system_prompt.clone(),
                 messages: messages.clone(),
                 tool_specs: self.tools.specs(),
@@ -481,39 +1225,141 @@ impl AgentRuntime {
             }
 
             for call in llm_output.tool_calls {
-                let result = self
-                    .tools
-                    .call(
+                match self
+                    .execute_tool_call(
+                        &execution,
+                        call.id.clone(),
                         &call.tool,
-                        ToolContext {
-                            conversation_id,
-                            working_directory: cwd.clone(),
-                            elevated: self.policy.is_elevated(),
-                        },
                         call.input.clone(),
+                        execution.current_session_id.clone(),
+                        tool_history.len() as i64 + 1,
                     )
-                    .await?;
-                let tool_name = call.tool.clone();
-                let tool_call_id = call.id.clone();
-                tool_history.push(ToolExchange {
-                    call: ToolCallRecord {
-                        id: tool_call_id.clone(),
-                        name: tool_name.clone(),
-                        arguments: call.input,
-                    },
-                    result: ToolResultRecord {
-                        call_id: tool_call_id,
-                        name: tool_name,
-                        content: render_tool_output(&result),
-                        structured: result.structured,
-                    },
-                });
+                    .await?
+                {
+                    ToolCallOutcome::Completed(exchange) => tool_history.push(exchange),
+                    ToolCallOutcome::Blocked(err) => return Err(err),
+                }
             }
         }
 
         Err(ClawError::Backend(
             "agent exceeded tool-calling iteration limit".into(),
         ))
+    }
+
+    fn load_completed_tool_history(&self, task_id: TaskId) -> ClawResult<Vec<ToolExchange>> {
+        let invocations = self
+            .store
+            .list_tool_invocations(task_id)
+            .map_err(store_error)?;
+        let latest = latest_tool_invocations(invocations);
+        Ok(latest
+            .into_iter()
+            .filter(|record| matches!(record.status, ToolInvocationStatus::Completed))
+            .map(|record| ToolExchange {
+                call: ToolCallRecord {
+                    id: record.call_id.clone(),
+                    name: record.tool_name.clone(),
+                    arguments: record.arguments.clone(),
+                },
+                result: ToolResultRecord {
+                    call_id: record.call_id.clone(),
+                    name: record.tool_name,
+                    content: record.output_content.unwrap_or_default(),
+                    structured: record.output_structured,
+                },
+            })
+            .collect())
+    }
+
+    fn load_blocked_tool_invocation(
+        &self,
+        task_id: TaskId,
+    ) -> ClawResult<Option<ToolInvocationRecord>> {
+        let invocations = self
+            .store
+            .list_tool_invocations(task_id)
+            .map_err(store_error)?;
+        Ok(latest_tool_invocations(invocations)
+            .into_iter()
+            .find(|record| matches!(record.status, ToolInvocationStatus::BlockedApproval)))
+    }
+
+    async fn resume_task(&self, task_id: TaskId) -> ClawResult<String> {
+        let mut task = self
+            .store
+            .get_task(task_id)
+            .map_err(store_error)?
+            .ok_or_else(|| ClawError::NotFound(format!("task not found: {task_id}")))?;
+        task.running = true;
+        task.state = TaskRunState::Running;
+        task.error = None;
+        task.blocked_approval_id = None;
+        self.store.upsert_task(&task).map_err(store_error)?;
+        let execution = TaskExecution {
+            task_id: task.id,
+            conversation_id: task.conversation_id,
+            prompt: task.description.clone(),
+            cwd: task.cwd.clone(),
+            provider_id: task.provider_id.clone(),
+            current_session_id: task.current_session_id.clone(),
+        };
+
+        let result = if matches!(task.kind, TaskKind::DirectToolTask)
+            || (execution.provider_id.is_none() && select_tool(&execution.prompt).is_some())
+        {
+            let blocked = self.load_blocked_tool_invocation(task_id)?.ok_or_else(|| {
+                ClawError::NotFound(format!(
+                    "blocked tool invocation not found for task {task_id}"
+                ))
+            })?;
+            match self
+                .execute_tool_call(
+                    &execution,
+                    blocked.call_id.clone(),
+                    &blocked.tool_name,
+                    blocked.arguments.clone(),
+                    execution.current_session_id.clone(),
+                    blocked.sequence,
+                )
+                .await?
+            {
+                ToolCallOutcome::Completed(exchange) => Ok(exchange.result.content),
+                ToolCallOutcome::Blocked(err) => Err(err),
+            }
+        } else {
+            self.run_llm(execution).await
+        };
+
+        match &result {
+            Ok(content) => {
+                task.running = false;
+                task.state = TaskRunState::Completed;
+                task.finished_at = Some(Utc::now());
+                task.result_preview = Some(clamp_chars(content, 400));
+                task.error = None;
+                task.blocked_approval_id = None;
+                self.store.upsert_task(&task).map_err(store_error)?;
+                self.store
+                    .save_message(
+                        task.conversation_id,
+                        &ConversationMessage {
+                            role: MessageRole::Assistant,
+                            content: content.clone(),
+                            created_at: Utc::now(),
+                        },
+                    )
+                    .map_err(store_error)?;
+            }
+            Err(err) => {
+                task.running = false;
+                task.state = TaskRunState::Failed;
+                task.finished_at = Some(Utc::now());
+                task.error = Some(err.to_string());
+                self.store.upsert_task(&task).map_err(store_error)?;
+            }
+        }
+        result
     }
 
     async fn run_multi_agent(
@@ -571,8 +1417,7 @@ impl AgentRuntime {
                     messages: vec![ConversationMessage {
                         role: MessageRole::User,
                         content: format!(
-                            "Original user request:\n{}\n\nCoordinator assignment:\n{}",
-                            original_prompt, brief
+                            "Original user request:\n{original_prompt}\n\nCoordinator assignment:\n{brief}"
                         ),
                         created_at: Utc::now(),
                     }],
@@ -639,8 +1484,7 @@ impl AgentRuntime {
         {
             Ok(text) if !text.trim().is_empty() => Ok(text),
             Ok(_) | Err(_) => Ok(format!(
-                "I used {} sub-agents for this request.\n\nCoordinator plan:\n{}\n\n{}",
-                worker_count, coordinator_plan, summary_block
+                "I used {worker_count} sub-agents for this request.\n\nCoordinator plan:\n{coordinator_plan}\n\n{summary_block}"
             )),
         }
     }
@@ -648,6 +1492,56 @@ impl AgentRuntime {
     async fn run_llm_request(&self, request: AgentRequest) -> ClawResult<String> {
         collect_text_response(self.llm.clone(), request).await
     }
+}
+
+fn trim_messages_to_context_limit(
+    messages: Vec<ConversationMessage>,
+    max_context_chars: Option<usize>,
+    system_prompt_chars: usize,
+    tool_history: &[ToolExchange],
+) -> Vec<ConversationMessage> {
+    let Some(max_context_chars) = max_context_chars else {
+        return messages;
+    };
+    let reserved = system_prompt_chars
+        .saturating_add(approx_tool_history_chars(tool_history))
+        .saturating_add(1024);
+    let budget = max_context_chars.saturating_sub(reserved);
+    if budget == 0 {
+        return messages
+            .into_iter()
+            .rev()
+            .take(1)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+    }
+
+    let mut kept = Vec::new();
+    let mut used = 0usize;
+    for message in messages.into_iter().rev() {
+        let message_chars = message.content.chars().count().saturating_add(32);
+        if !kept.is_empty() && used.saturating_add(message_chars) > budget {
+            break;
+        }
+        used = used.saturating_add(message_chars);
+        kept.push(message);
+    }
+    kept.reverse();
+    kept
+}
+
+fn approx_tool_history_chars(tool_history: &[ToolExchange]) -> usize {
+    tool_history
+        .iter()
+        .map(|exchange| {
+            exchange.call.name.chars().count()
+                + exchange.result.content.chars().count()
+                + exchange.call.arguments.to_string().chars().count()
+                + 128
+        })
+        .sum()
 }
 
 async fn collect_text_response(
@@ -696,6 +1590,84 @@ fn render_tool_output(output: &hajimi_claw_types::ToolOutput) -> String {
         .unwrap_or_else(|| output.content.clone())
 }
 
+fn render_capability_section<'a>(
+    heading: &str,
+    capabilities: impl Iterator<Item = &'a CapabilitySummary>,
+) -> Vec<String> {
+    let collected = capabilities.cloned().collect::<Vec<_>>();
+    let mut lines = vec![format!("{heading}:")];
+    if collected.is_empty() {
+        lines.push("- (none)".into());
+    } else {
+        lines.extend(render_capability_lines(&collected));
+    }
+    lines
+}
+
+fn render_capability_lines(capabilities: &[CapabilitySummary]) -> Vec<String> {
+    capabilities
+        .iter()
+        .map(|capability| {
+            let approval = if capability.requires_approval {
+                " approval=required"
+            } else {
+                ""
+            };
+            let source = capability
+                .id
+                .source
+                .as_deref()
+                .map(|source| format!(" source={source}"))
+                .unwrap_or_default();
+            format!(
+                "- `{}`{}{} — {}",
+                capability.id.name, source, approval, capability.description
+            )
+        })
+        .collect()
+}
+
+fn latest_tool_invocations(records: Vec<ToolInvocationRecord>) -> Vec<ToolInvocationRecord> {
+    let mut latest = BTreeMap::new();
+    for record in records {
+        latest.insert(record.sequence, record);
+    }
+    latest.into_values().collect()
+}
+
+fn extract_approval_id(err: &ClawError) -> Option<ApprovalId> {
+    let ClawError::ApprovalRequired(message) = err else {
+        return None;
+    };
+    let start = message.rfind('[')? + 1;
+    let end = message.rfind(']')?;
+    if end <= start {
+        return None;
+    }
+    uuid::Uuid::parse_str(&message[start..end])
+        .ok()
+        .map(ApprovalId)
+}
+
+fn render_command_preview(tool_name: &str, arguments: &serde_json::Value) -> String {
+    if let Some(command) = arguments.get("command").and_then(|value| value.as_str()) {
+        return command.to_string();
+    }
+    if let Some(command) = arguments.get("service").and_then(|value| value.as_str()) {
+        return format!("{tool_name} {command}");
+    }
+    if let Some(command) = arguments.get("container").and_then(|value| value.as_str()) {
+        return format!("{tool_name} {command}");
+    }
+    tool_name.to_string()
+}
+
+fn parse_rfc3339(raw: &str) -> ClawResult<chrono::DateTime<Utc>> {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|value| value.with_timezone(&Utc))
+        .map_err(|err| ClawError::Backend(err.to_string()))
+}
+
 fn store_error(err: anyhow::Error) -> ClawError {
     ClawError::Backend(err.to_string())
 }
@@ -736,6 +1708,173 @@ Rules:
 
 pub trait SystemPromptSource: Send + Sync {
     fn load(&self) -> ClawResult<String>;
+
+    fn describe(&self) -> ClawResult<Option<PromptSourceReport>> {
+        Ok(None)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptSourceMode {
+    AutoDiscovery,
+    ExplicitList,
+}
+
+impl PromptSourceMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::AutoDiscovery => "auto-discovery",
+            Self::ExplicitList => "explicit [persona].prompt_files",
+        }
+    }
+
+    fn precedence_label(self) -> &'static str {
+        match self {
+            Self::AutoDiscovery => {
+                "persona.directory -> config directory -> current working directory"
+            }
+            Self::ExplicitList => "uses the configured prompt_files order",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PromptLayer {
+    Identity,
+    Soul,
+    OperationalExtensions,
+    RuntimeConfig,
+}
+
+impl PromptLayer {
+    fn heading(self) -> &'static str {
+        match self {
+            Self::Identity => "identity layer",
+            Self::Soul => "soul layer",
+            Self::OperationalExtensions => "operational extensions",
+            Self::RuntimeConfig => "runtime config",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptParseMode {
+    Structured,
+    Legacy,
+    Markdown,
+    Missing,
+    Empty,
+    RuntimeOnly,
+}
+
+impl PromptParseMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Structured => "structured",
+            Self::Legacy => "legacy",
+            Self::Markdown => "markdown",
+            Self::Missing => "missing",
+            Self::Empty => "empty",
+            Self::RuntimeOnly => "runtime-only",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PromptSourceEntry {
+    pub path: PathBuf,
+    pub layer: PromptLayer,
+    pub label: String,
+    pub included: bool,
+    pub parse_mode: PromptParseMode,
+}
+
+impl PromptSourceEntry {
+    fn new(
+        path: PathBuf,
+        layer: PromptLayer,
+        label: String,
+        included: bool,
+        parse_mode: PromptParseMode,
+    ) -> Self {
+        Self {
+            path,
+            layer,
+            label,
+            included,
+            parse_mode,
+        }
+    }
+
+    fn runtime_only(path: PathBuf) -> Self {
+        Self::new(
+            path.clone(),
+            PromptLayer::RuntimeConfig,
+            file_label(&path),
+            false,
+            PromptParseMode::RuntimeOnly,
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PromptSourceReport {
+    pub mode: PromptSourceMode,
+    pub entries: Vec<PromptSourceEntry>,
+}
+
+impl PromptSourceReport {
+    pub fn contains_path(&self, path: &Path) -> bool {
+        self.entries.iter().any(|entry| entry.path == path)
+    }
+
+    pub fn with_runtime_entry(mut self, path: PathBuf) -> Self {
+        if !self.contains_path(&path) {
+            self.entries.push(PromptSourceEntry::runtime_only(path));
+        }
+        self
+    }
+
+    pub fn render_persona_list(&self) -> String {
+        let mut lines = vec![
+            "persona effective view".to_string(),
+            format!("source mode: {}", self.mode.label()),
+            format!("precedence: {}", self.mode.precedence_label()),
+            "prompt order: base system prompt -> identity layer -> soul layer -> operational extensions -> runtime overlays".to_string(),
+        ];
+        for layer in [
+            PromptLayer::Identity,
+            PromptLayer::Soul,
+            PromptLayer::OperationalExtensions,
+            PromptLayer::RuntimeConfig,
+        ] {
+            let entries = self
+                .entries
+                .iter()
+                .filter(|entry| entry.layer == layer)
+                .collect::<Vec<_>>();
+            if entries.is_empty() {
+                continue;
+            }
+            lines.push(String::new());
+            lines.push(format!("[{}]", layer.heading()));
+            for entry in entries {
+                let status = if entry.included {
+                    "included"
+                } else {
+                    "excluded"
+                };
+                lines.push(format!(
+                    "{}\t{}\t{}\t{}",
+                    status,
+                    entry.label,
+                    entry.parse_mode.label(),
+                    entry.path.display()
+                ));
+            }
+        }
+        lines.join("\n")
+    }
 }
 
 pub struct StaticSystemPrompt {
@@ -756,48 +1895,498 @@ impl SystemPromptSource for StaticSystemPrompt {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersonaFileKind {
+    Identity,
+    Soul,
+    Agents,
+    Tools,
+    Skills,
+    Heartbeat,
+    Additional,
+}
+
+impl PersonaFileKind {
+    fn layer(self) -> PromptLayer {
+        match self {
+            Self::Identity => PromptLayer::Identity,
+            Self::Soul => PromptLayer::Soul,
+            Self::Heartbeat => PromptLayer::RuntimeConfig,
+            Self::Agents | Self::Tools | Self::Skills | Self::Additional => {
+                PromptLayer::OperationalExtensions
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct StructuredPersonaLayer {
+    fields: BTreeMap<String, Vec<String>>,
+    notes: Vec<String>,
+}
+
+impl StructuredPersonaLayer {
+    fn is_empty(&self) -> bool {
+        self.fields.values().all(Vec::is_empty) && self.notes.is_empty()
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ParsedPersonaLayer {
+    Structured {
+        fields: BTreeMap<String, Vec<String>>,
+        body: String,
+    },
+    Legacy(String),
+}
+
+#[derive(Debug, Clone)]
+struct ExtensionBlock {
+    title: &'static str,
+    content: String,
+}
+
+impl ExtensionBlock {
+    fn new(kind: PersonaFileKind, content: String) -> Self {
+        let title = match kind {
+            PersonaFileKind::Agents => "Agents and delegation",
+            PersonaFileKind::Tools => "Tools and safety",
+            PersonaFileKind::Skills => "Skills and workflows",
+            PersonaFileKind::Additional => "Additional guidance",
+            _ => "Additional guidance",
+        };
+        Self { title, content }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CompiledPromptSource {
+    report: PromptSourceReport,
+    identity: StructuredPersonaLayer,
+    soul: StructuredPersonaLayer,
+    extensions: Vec<ExtensionBlock>,
+}
+
 pub struct MarkdownPromptSource {
     base_prompt: String,
     files: Vec<PathBuf>,
+    mode: PromptSourceMode,
 }
 
 impl MarkdownPromptSource {
     pub fn new(base_prompt: impl Into<String>, files: Vec<PathBuf>) -> Self {
+        Self::with_mode(base_prompt, files, PromptSourceMode::AutoDiscovery)
+    }
+
+    pub fn with_mode(
+        base_prompt: impl Into<String>,
+        files: Vec<PathBuf>,
+        mode: PromptSourceMode,
+    ) -> Self {
         Self {
             base_prompt: base_prompt.into(),
             files,
+            mode,
         }
+    }
+
+    fn compile(&self) -> ClawResult<CompiledPromptSource> {
+        let mut entries = Vec::new();
+        let mut identity = StructuredPersonaLayer::default();
+        let mut soul = StructuredPersonaLayer::default();
+        let mut extensions = Vec::new();
+
+        for path in &self.files {
+            let label = file_label(path);
+            let kind = classify_persona_file(path);
+            if matches!(kind, PersonaFileKind::Heartbeat) {
+                entries.push(PromptSourceEntry::new(
+                    path.clone(),
+                    kind.layer(),
+                    label,
+                    false,
+                    PromptParseMode::RuntimeOnly,
+                ));
+                continue;
+            }
+
+            let content = match fs::read_to_string(path) {
+                Ok(content) => content,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    entries.push(PromptSourceEntry::new(
+                        path.clone(),
+                        kind.layer(),
+                        label,
+                        false,
+                        PromptParseMode::Missing,
+                    ));
+                    continue;
+                }
+                Err(err) => return Err(ClawError::Backend(err.to_string())),
+            };
+            let trimmed = content.trim();
+            if trimmed.is_empty() {
+                entries.push(PromptSourceEntry::new(
+                    path.clone(),
+                    kind.layer(),
+                    label,
+                    false,
+                    PromptParseMode::Empty,
+                ));
+                continue;
+            }
+
+            match kind {
+                PersonaFileKind::Identity => {
+                    let parse_mode =
+                        merge_structured_layer(&mut identity, parse_persona_layer(trimmed));
+                    entries.push(PromptSourceEntry::new(
+                        path.clone(),
+                        kind.layer(),
+                        label,
+                        true,
+                        parse_mode,
+                    ));
+                }
+                PersonaFileKind::Soul => {
+                    let parse_mode =
+                        merge_structured_layer(&mut soul, parse_persona_layer(trimmed));
+                    entries.push(PromptSourceEntry::new(
+                        path.clone(),
+                        kind.layer(),
+                        label,
+                        true,
+                        parse_mode,
+                    ));
+                }
+                PersonaFileKind::Agents
+                | PersonaFileKind::Tools
+                | PersonaFileKind::Skills
+                | PersonaFileKind::Additional => {
+                    extensions.push(ExtensionBlock::new(kind, clamp_prompt_content(trimmed)));
+                    entries.push(PromptSourceEntry::new(
+                        path.clone(),
+                        kind.layer(),
+                        label,
+                        true,
+                        PromptParseMode::Markdown,
+                    ));
+                }
+                PersonaFileKind::Heartbeat => unreachable!(),
+            }
+        }
+
+        Ok(CompiledPromptSource {
+            report: PromptSourceReport {
+                mode: self.mode,
+                entries,
+            },
+            identity,
+            soul,
+            extensions,
+        })
     }
 }
 
 impl SystemPromptSource for MarkdownPromptSource {
     fn load(&self) -> ClawResult<String> {
+        let compiled = self.compile()?;
         let mut prompt = self.base_prompt.clone();
         let mut sections = Vec::new();
-        for path in &self.files {
-            let content = match fs::read_to_string(path) {
-                Ok(content) => content,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => return Err(ClawError::Backend(err.to_string())),
-            };
-            let trimmed = content.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            sections.push(format!(
-                "[{}]\n{}",
-                file_label(path),
-                clamp_prompt_content(trimmed)
-            ));
+        if let Some(section) = render_structured_persona_layer(
+            "Identity layer",
+            &[
+                "summary",
+                "owned_systems",
+                "environments",
+                "standing_preferences",
+                "hard_constraints",
+            ],
+            &compiled.identity,
+        ) {
+            sections.push(section);
+        }
+        if let Some(section) = render_structured_persona_layer(
+            "Soul layer",
+            &[
+                "name",
+                "role",
+                "tone",
+                "style",
+                "non_goals",
+                "behavioral_rules",
+            ],
+            &compiled.soul,
+        ) {
+            sections.push(section);
+        }
+        if let Some(section) = render_operational_extensions(&compiled.extensions) {
+            sections.push(section);
         }
         if !sections.is_empty() {
             prompt.push_str(
-                "\n\nLocal markdown guidance is attached below. Treat it as repo-specific operating guidance and persona shaping context.\n\n",
+                "\n\nApply the layered persona context below after the base system rules. Identity captures the user and durable environment. Soul defines Hajimi's stable character. Operational extensions add workflow, delegation, and tool guidance.\n\n",
             );
             prompt.push_str(&sections.join("\n\n"));
         }
         Ok(prompt)
     }
+
+    fn describe(&self) -> ClawResult<Option<PromptSourceReport>> {
+        Ok(Some(self.compile()?.report))
+    }
+}
+
+fn classify_persona_file(path: &Path) -> PersonaFileKind {
+    match file_label(path).to_ascii_lowercase().as_str() {
+        "identity.md" => PersonaFileKind::Identity,
+        "soul.md" => PersonaFileKind::Soul,
+        "agents.md" => PersonaFileKind::Agents,
+        "tools.md" => PersonaFileKind::Tools,
+        "skills.md" => PersonaFileKind::Skills,
+        "heartbeat.md" => PersonaFileKind::Heartbeat,
+        _ => PersonaFileKind::Additional,
+    }
+}
+
+fn merge_structured_layer(
+    target: &mut StructuredPersonaLayer,
+    parsed: ParsedPersonaLayer,
+) -> PromptParseMode {
+    match parsed {
+        ParsedPersonaLayer::Structured { fields, body } => {
+            for (key, value) in fields {
+                target.fields.insert(key, value);
+            }
+            let body = clamp_prompt_content(body.trim());
+            if !body.is_empty() {
+                target.notes.push(body);
+            }
+            PromptParseMode::Structured
+        }
+        ParsedPersonaLayer::Legacy(body) => {
+            let body = clamp_prompt_content(body.trim());
+            if !body.is_empty() {
+                target.notes.push(body);
+            }
+            PromptParseMode::Legacy
+        }
+    }
+}
+
+fn parse_persona_layer(content: &str) -> ParsedPersonaLayer {
+    let trimmed = content.trim();
+    let Some((front_matter, body)) = split_front_matter(trimmed) else {
+        return ParsedPersonaLayer::Legacy(trimmed.to_string());
+    };
+    let Some(fields) = parse_front_matter_map(front_matter) else {
+        return ParsedPersonaLayer::Legacy(trimmed.to_string());
+    };
+    ParsedPersonaLayer::Structured {
+        fields,
+        body: body.trim().to_string(),
+    }
+}
+
+fn split_front_matter(content: &str) -> Option<(&str, &str)> {
+    static FRONT_MATTER_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let regex = FRONT_MATTER_RE.get_or_init(|| {
+        Regex::new(r"\A---\r?\n(?P<front>[\s\S]*?)\r?\n---(?:\r?\n(?P<body>[\s\S]*))?\z")
+            .expect("valid front matter regex")
+    });
+    let captures = regex.captures(content)?;
+    Some((
+        captures.name("front")?.as_str(),
+        captures
+            .name("body")
+            .map(|value| value.as_str())
+            .unwrap_or(""),
+    ))
+}
+
+fn parse_front_matter_map(front_matter: &str) -> Option<BTreeMap<String, Vec<String>>> {
+    let lines = front_matter.lines().collect::<Vec<_>>();
+    let mut index = 0usize;
+    let mut fields = BTreeMap::new();
+    while index < lines.len() {
+        let line = lines[index].trim_end();
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            index += 1;
+            continue;
+        }
+        if line.starts_with(' ') || line.starts_with('\t') {
+            return None;
+        }
+        let (raw_key, raw_value) = trimmed.split_once(':')?;
+        let key = normalize_front_matter_key(raw_key);
+        if key.is_empty() {
+            return None;
+        }
+        let value = raw_value.trim();
+        if !value.is_empty() {
+            fields.insert(key, vec![normalize_front_matter_value(value)]);
+            index += 1;
+            continue;
+        }
+
+        index += 1;
+        let mut values = Vec::new();
+        while index < lines.len() {
+            let next = lines[index];
+            let next_trimmed = next.trim();
+            if next_trimmed.is_empty() {
+                index += 1;
+                continue;
+            }
+            if !next.starts_with(' ') && !next.starts_with('\t') {
+                break;
+            }
+            if let Some(item) = next_trimmed.strip_prefix("- ") {
+                values.push(normalize_front_matter_value(item.trim()));
+            } else {
+                values.push(normalize_front_matter_value(next_trimmed));
+            }
+            index += 1;
+        }
+        fields.insert(key, values);
+    }
+    Some(
+        fields
+            .into_iter()
+            .map(|(key, values)| {
+                (
+                    key,
+                    values
+                        .into_iter()
+                        .map(|value| clamp_prompt_content(value.trim()))
+                        .collect(),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn normalize_front_matter_key(value: &str) -> String {
+    let mut normalized = String::new();
+    let mut last_was_underscore = false;
+    for ch in value.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            normalized.push(ch.to_ascii_lowercase());
+            last_was_underscore = false;
+        } else if !last_was_underscore {
+            normalized.push('_');
+            last_was_underscore = true;
+        }
+    }
+    normalized.trim_matches('_').to_string()
+}
+
+fn normalize_front_matter_value(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() >= 2 {
+        let first = trimmed.chars().next().unwrap_or_default();
+        let last = trimmed.chars().last().unwrap_or_default();
+        if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+            return trimmed[1..trimmed.len() - 1].trim().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+fn render_structured_persona_layer(
+    title: &str,
+    preferred_keys: &[&str],
+    layer: &StructuredPersonaLayer,
+) -> Option<String> {
+    if layer.is_empty() {
+        return None;
+    }
+    let mut lines = vec![format!("## {title}")];
+    let mut emitted = Vec::new();
+    for key in preferred_keys {
+        if let Some(values) = layer.fields.get(*key) {
+            render_front_matter_field(&mut lines, key, values);
+            emitted.push((*key).to_string());
+        }
+    }
+    for (key, values) in &layer.fields {
+        if emitted.iter().any(|item| item == key) {
+            continue;
+        }
+        render_front_matter_field(&mut lines, key, values);
+    }
+    if !layer.notes.is_empty() {
+        lines.push("### Notes".into());
+        for note in &layer.notes {
+            lines.push(note.clone());
+        }
+    }
+    Some(lines.join("\n"))
+}
+
+fn render_front_matter_field(lines: &mut Vec<String>, key: &str, values: &[String]) {
+    let values = values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return;
+    }
+    let label = humanize_front_matter_key(key);
+    if values.len() == 1 {
+        lines.push(format!("- {}: {}", label, values[0]));
+        return;
+    }
+    lines.push(format!("- {label}:"));
+    for value in values {
+        lines.push(format!("  - {value}"));
+    }
+}
+
+fn humanize_front_matter_key(key: &str) -> String {
+    match key {
+        "summary" => "Summary".into(),
+        "owned_systems" => "Owned systems".into(),
+        "environments" => "Environments".into(),
+        "standing_preferences" => "Standing preferences".into(),
+        "hard_constraints" => "Hard constraints".into(),
+        "name" => "Name".into(),
+        "role" => "Role".into(),
+        "tone" => "Tone".into(),
+        "style" => "Style".into(),
+        "non_goals" => "Non-goals".into(),
+        "behavioral_rules" => "Behavioral rules".into(),
+        _ => key
+            .split('_')
+            .filter(|part| !part.is_empty())
+            .map(|part| {
+                let mut chars = part.chars();
+                match chars.next() {
+                    Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+                    None => String::new(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+fn render_operational_extensions(blocks: &[ExtensionBlock]) -> Option<String> {
+    let blocks = blocks
+        .iter()
+        .filter(|block| !block.content.trim().is_empty())
+        .collect::<Vec<_>>();
+    if blocks.is_empty() {
+        return None;
+    }
+    let mut lines = vec!["## Operational extensions".to_string()];
+    for block in blocks {
+        lines.push(format!("### {}", block.title));
+        lines.push(block.content.clone());
+    }
+    Some(lines.join("\n"))
 }
 
 fn clamp_prompt_content(content: &str) -> String {
@@ -887,7 +2476,7 @@ fn resolve_worker_count(
     preference: MultiAgentPreference,
 ) -> usize {
     requested_worker_count(prompt)
-        .or_else(|| match preference {
+        .or(match preference {
             MultiAgentPreference::ForceOn => Some(config.default_workers),
             _ => None,
         })
@@ -1007,20 +2596,66 @@ fn select_tool(prompt: &str) -> Option<(&'static str, serde_json::Value)> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use anyhow::Result;
+    use chrono::Utc;
     use hajimi_claw_exec::{LocalExecutor, PlatformMode};
+    use hajimi_claw_llm::StaticBackend;
     use hajimi_claw_policy::{PolicyConfig, PolicyEngine};
     use hajimi_claw_store::Store;
-    use hajimi_claw_types::{AgentEvent, AgentRequest, AgentStream, ClawResult, LlmBackend};
+    use hajimi_claw_tools::ToolRegistry;
+    use hajimi_claw_types::{
+        AgentEvent, AgentRequest, AgentStream, CapabilityId, CapabilityKind, ClawError, ClawResult,
+        LlmBackend, McpServerStatus, MessageRole, ProviderCapabilities, ProviderConfig,
+        ProviderKind, ProviderRecord, TaskKind, TaskRunState, Tool, ToolContext,
+        ToolInvocationStatus, ToolOutput, ToolSpec,
+    };
     use tempfile::tempdir;
     use tokio::sync::Mutex;
 
     use super::{
-        AgentRuntime, MultiAgentConfig, MultiAgentPreference, parse_worker_briefs,
-        requested_worker_count, resolve_worker_count, should_delegate_multi_agent,
+        AgentRuntime, MarkdownPromptSource, MultiAgentConfig, MultiAgentPreference,
+        PromptParseMode, PromptSourceMode, StaticSystemPrompt, SystemPromptSource,
+        parse_persona_layer, parse_worker_briefs, requested_worker_count, resolve_worker_count,
+        should_delegate_multi_agent,
     };
+
+    struct StubCapabilityTool {
+        spec: ToolSpec,
+        capability_id: CapabilityId,
+        output: Option<ToolOutput>,
+        approval_error: Option<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for StubCapabilityTool {
+        fn spec(&self) -> ToolSpec {
+            self.spec.clone()
+        }
+
+        fn capability_id(&self) -> CapabilityId {
+            self.capability_id.clone()
+        }
+
+        async fn call(
+            &self,
+            _ctx: ToolContext,
+            _input: serde_json::Value,
+        ) -> ClawResult<ToolOutput> {
+            match (&self.output, &self.approval_error) {
+                (_, Some(err)) => Err(ClawError::ApprovalRequired(err.clone())),
+                (Some(output), None) => Ok(output.clone()),
+                (None, None) => Ok(ToolOutput {
+                    content: String::new(),
+                    structured: None,
+                }),
+            }
+        }
+    }
 
     #[tokio::test]
     async fn routes_file_read_without_llm() -> Result<()> {
@@ -1052,6 +2687,27 @@ mod tests {
 
     struct ScriptedBackend {
         calls: Mutex<usize>,
+    }
+
+    struct CountingPromptSource {
+        loads: Arc<AtomicUsize>,
+        prompt: String,
+    }
+
+    impl CountingPromptSource {
+        fn new(loads: Arc<AtomicUsize>, prompt: impl Into<String>) -> Self {
+            Self {
+                loads,
+                prompt: prompt.into(),
+            }
+        }
+    }
+
+    impl SystemPromptSource for CountingPromptSource {
+        fn load(&self) -> ClawResult<String> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            Ok(self.prompt.clone())
+        }
     }
 
     #[async_trait::async_trait]
@@ -1106,6 +2762,27 @@ mod tests {
             policy.clone(),
         ));
         let store = Arc::new(Store::open_in_memory()?);
+        store.upsert_provider(&ProviderRecord {
+            config: ProviderConfig {
+                id: "test-provider".into(),
+                label: "Test Provider".into(),
+                kind: ProviderKind::OpenAiCompatible,
+                base_url: "https://example.com/v1".into(),
+                api_key: "secret".into(),
+                model: "gpt-test".into(),
+                fallback_models: vec![],
+                capabilities: ProviderCapabilities {
+                    tool_calling: true,
+                    streaming: false,
+                    json_mode: false,
+                    max_context_chars: Some(24_000),
+                },
+                enabled: true,
+                extra_headers: vec![],
+                created_at: Utc::now(),
+            },
+            is_default: true,
+        })?;
         let agent = AgentRuntime::new(
             Arc::new(ScriptedBackend {
                 calls: Mutex::new(0),
@@ -1113,9 +2790,7 @@ mod tests {
             tools,
             store,
             policy,
-            Arc::new(super::StaticSystemPrompt::new(
-                super::default_system_prompt(),
-            )),
+            Arc::new(StaticSystemPrompt::new(super::default_system_prompt())),
             std::env::temp_dir(),
             MultiAgentConfig::default(),
         );
@@ -1125,6 +2800,588 @@ mod tests {
             .await
             .expect("agent response");
         assert_eq!(response, "tool loop ok");
+        Ok(())
+    }
+
+    fn write_persona_file(dir: &std::path::Path, name: &str, content: &str) {
+        fs::write(dir.join(name), content).unwrap();
+    }
+
+    fn build_test_runtime(
+        llm: Arc<dyn LlmBackend>,
+        prompt_source: Arc<dyn SystemPromptSource>,
+    ) -> AgentRuntime {
+        build_test_runtime_with_persona_dir(llm, prompt_source, std::env::temp_dir())
+    }
+
+    fn build_test_runtime_with_persona_dir(
+        llm: Arc<dyn LlmBackend>,
+        prompt_source: Arc<dyn SystemPromptSource>,
+        persona_dir: PathBuf,
+    ) -> AgentRuntime {
+        build_test_runtime_with_registry(
+            llm,
+            prompt_source,
+            persona_dir,
+            Arc::new(PolicyEngine::new(PolicyConfig::default())),
+            None,
+        )
+    }
+
+    fn build_test_runtime_with_registry(
+        llm: Arc<dyn LlmBackend>,
+        prompt_source: Arc<dyn SystemPromptSource>,
+        persona_dir: PathBuf,
+        policy: Arc<PolicyEngine>,
+        tools: Option<Arc<ToolRegistry>>,
+    ) -> AgentRuntime {
+        let tools = tools.unwrap_or_else(|| {
+            let executor = Arc::new(LocalExecutor::new(
+                policy.clone(),
+                PlatformMode::WindowsSafe,
+            ));
+            Arc::new(ToolRegistry::default(executor, policy.clone()))
+        });
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        store
+            .upsert_provider(&ProviderRecord {
+                config: ProviderConfig {
+                    id: "test-provider".into(),
+                    label: "Test Provider".into(),
+                    kind: ProviderKind::OpenAiCompatible,
+                    base_url: "https://example.com/v1".into(),
+                    api_key: "secret".into(),
+                    model: "gpt-test".into(),
+                    fallback_models: vec![],
+                    capabilities: ProviderCapabilities {
+                        tool_calling: true,
+                        streaming: false,
+                        json_mode: false,
+                        max_context_chars: Some(24_000),
+                    },
+                    enabled: true,
+                    extra_headers: vec![],
+                    created_at: Utc::now(),
+                },
+                is_default: true,
+            })
+            .unwrap();
+        AgentRuntime::new(
+            llm,
+            tools,
+            store,
+            policy,
+            prompt_source,
+            persona_dir,
+            MultiAgentConfig::default(),
+        )
+    }
+
+    #[test]
+    fn plain_text_identity_and_soul_render_as_legacy_layers() {
+        let dir = tempdir().unwrap();
+        write_persona_file(dir.path(), "identity.md", "User runs two VPS nodes.");
+        write_persona_file(dir.path(), "soul.md", "Stay concise and calm.");
+        let source = MarkdownPromptSource::with_mode(
+            "base",
+            vec![dir.path().join("identity.md"), dir.path().join("soul.md")],
+            PromptSourceMode::ExplicitList,
+        );
+
+        let prompt = source.load().unwrap();
+        assert!(prompt.contains("## Identity layer"));
+        assert!(prompt.contains("User runs two VPS nodes."));
+        assert!(prompt.contains("## Soul layer"));
+        assert!(prompt.contains("Stay concise and calm."));
+        assert!(!prompt.contains("## Operational extensions"));
+    }
+
+    #[test]
+    fn structured_front_matter_parses_and_renders_fields() {
+        let dir = tempdir().unwrap();
+        write_persona_file(
+            dir.path(),
+            "identity.md",
+            "---\nsummary: Alice on-call owner\nowned systems:\n  - prod-api\nstanding preferences:\n  - be terse\n---\n\nExtra note.",
+        );
+        let source = MarkdownPromptSource::with_mode(
+            "base",
+            vec![dir.path().join("identity.md")],
+            PromptSourceMode::ExplicitList,
+        );
+
+        let prompt = source.load().unwrap();
+        assert!(prompt.contains("- Summary: Alice on-call owner"));
+        assert!(prompt.contains("- Owned systems: prod-api"));
+        assert!(prompt.contains("- Standing preferences: be terse"));
+        assert!(prompt.contains("### Notes\nExtra note."));
+        let report = source.describe().unwrap().unwrap();
+        assert!(matches!(
+            report.entries[0].parse_mode,
+            PromptParseMode::Structured
+        ));
+    }
+
+    #[test]
+    fn malformed_front_matter_falls_back_to_legacy() {
+        let parsed = parse_persona_layer("---\nsummary\n---\nBody text");
+        match parsed {
+            super::ParsedPersonaLayer::Legacy(body) => {
+                assert!(body.contains("Body text"));
+            }
+            _ => panic!("expected legacy fallback"),
+        }
+    }
+
+    #[test]
+    fn merge_rules_override_structured_fields_and_keep_notes() {
+        let dir = tempdir().unwrap();
+        let base_dir = dir.path().join("base");
+        let override_dir = dir.path().join("override");
+        fs::create_dir_all(&base_dir).unwrap();
+        fs::create_dir_all(&override_dir).unwrap();
+        write_persona_file(
+            &base_dir,
+            "identity.md",
+            "---\nsummary: Base summary\nowned_systems:\n  - prod-api\n---\n\nBase note.",
+        );
+        write_persona_file(
+            &override_dir,
+            "identity.md",
+            "---\nsummary: Override summary\nhard_constraints:\n  - never touch prod without approval\n---\n\nOverride note.",
+        );
+        let source = MarkdownPromptSource::with_mode(
+            "base",
+            vec![
+                base_dir.join("identity.md"),
+                override_dir.join("identity.md"),
+            ],
+            PromptSourceMode::ExplicitList,
+        );
+
+        let prompt = source.load().unwrap();
+        assert!(prompt.contains("- Summary: Override summary"));
+        assert!(prompt.contains("- Hard constraints: never touch prod without approval"));
+        assert!(prompt.contains("Base note."));
+        assert!(prompt.contains("Override note."));
+        assert!(!prompt.contains("Base summary"));
+    }
+
+    #[test]
+    fn operational_extensions_render_in_stable_order() {
+        let dir = tempdir().unwrap();
+        let base_dir = dir.path().join("base");
+        let override_dir = dir.path().join("override");
+        fs::create_dir_all(&base_dir).unwrap();
+        fs::create_dir_all(&override_dir).unwrap();
+        write_persona_file(&base_dir, "agents.md", "Agent policy");
+        write_persona_file(&override_dir, "AGENTS.md", "Repo-local agent override");
+        write_persona_file(&override_dir, "tools.md", "Tool policy");
+        write_persona_file(&override_dir, "skills.md", "Skill hints");
+        let source = MarkdownPromptSource::with_mode(
+            "base",
+            vec![
+                base_dir.join("agents.md"),
+                override_dir.join("AGENTS.md"),
+                override_dir.join("tools.md"),
+                override_dir.join("skills.md"),
+            ],
+            PromptSourceMode::ExplicitList,
+        );
+
+        let prompt = source.load().unwrap();
+        let agent_policy = prompt.find("Agent policy").unwrap();
+        let repo_override = prompt.find("Repo-local agent override").unwrap();
+        let tool_policy = prompt.find("Tool policy").unwrap();
+        let skill_hints = prompt.find("Skill hints").unwrap();
+        assert!(agent_policy < repo_override);
+        assert!(repo_override < tool_policy);
+        assert!(tool_policy < skill_hints);
+    }
+
+    #[test]
+    fn heartbeat_is_reported_but_excluded_from_prompt() {
+        let dir = tempdir().unwrap();
+        write_persona_file(dir.path(), "heartbeat.md", "enabled: false");
+        let source = MarkdownPromptSource::with_mode(
+            "base",
+            vec![dir.path().join("heartbeat.md")],
+            PromptSourceMode::ExplicitList,
+        );
+
+        let prompt = source.load().unwrap();
+        assert_eq!(prompt, "base");
+        let report = source.describe().unwrap().unwrap();
+        assert_eq!(report.entries.len(), 1);
+        assert!(!report.entries[0].included);
+        assert!(matches!(
+            report.entries[0].parse_mode,
+            PromptParseMode::RuntimeOnly
+        ));
+    }
+
+    #[test]
+    fn describe_marks_missing_and_empty_files() {
+        let dir = tempdir().unwrap();
+        write_persona_file(dir.path(), "soul.md", "   \n\n");
+        let source = MarkdownPromptSource::with_mode(
+            "base",
+            vec![dir.path().join("identity.md"), dir.path().join("soul.md")],
+            PromptSourceMode::ExplicitList,
+        );
+
+        let report = source.describe().unwrap().unwrap();
+        assert!(matches!(
+            report.entries[0].parse_mode,
+            PromptParseMode::Missing
+        ));
+        assert!(matches!(
+            report.entries[1].parse_mode,
+            PromptParseMode::Empty
+        ));
+    }
+
+    #[tokio::test]
+    async fn persona_list_renders_effective_view() {
+        let dir = tempdir().unwrap();
+        write_persona_file(dir.path(), "identity.md", "identity body");
+        let runtime = build_test_runtime_with_persona_dir(
+            Arc::new(StaticBackend::new("fallback")),
+            Arc::new(MarkdownPromptSource::with_mode(
+                "base",
+                vec![dir.path().join("identity.md")],
+                PromptSourceMode::ExplicitList,
+            )),
+            dir.path().to_path_buf(),
+        );
+
+        let list = runtime.persona_list().await.unwrap();
+        assert!(list.contains("persona effective view"));
+        assert!(list.contains("[identity layer]"));
+        assert!(list.contains("identity.md"));
+        assert!(list.contains("runtime-only"));
+    }
+
+    #[tokio::test]
+    async fn capability_inventory_shows_native_tools_only_by_default() {
+        let runtime = build_test_runtime(
+            Arc::new(StaticBackend::new("fallback")),
+            Arc::new(StaticSystemPrompt::new("base")),
+        );
+
+        let inventory = runtime.render_capability_inventory();
+        assert!(inventory.contains("capability inventory"));
+        assert!(inventory.contains("native tools:"));
+        assert!(inventory.contains("skills:"));
+        assert!(inventory.contains("mcp tools:"));
+        assert!(inventory.contains("`read_file`"));
+        assert!(inventory.contains("- (none)"));
+    }
+
+    #[tokio::test]
+    async fn capability_inventory_renders_skill_and_mcp_entries() {
+        let policy = Arc::new(PolicyEngine::new(PolicyConfig::default()));
+        let tools = Arc::new(ToolRegistry::from_parts(
+            vec![
+                Arc::new(StubCapabilityTool {
+                    spec: ToolSpec {
+                        name: "read_file".into(),
+                        description: "Read a file".into(),
+                        requires_approval: false,
+                        input_schema: serde_json::json!({"type": "object"}),
+                    },
+                    capability_id: CapabilityId {
+                        kind: CapabilityKind::NativeTool,
+                        name: "read_file".into(),
+                        source: None,
+                    },
+                    output: Some(ToolOutput {
+                        content: "ok".into(),
+                        structured: None,
+                    }),
+                    approval_error: None,
+                }) as Arc<dyn Tool>,
+                Arc::new(StubCapabilityTool {
+                    spec: ToolSpec {
+                        name: "skill.deploy".into(),
+                        description: "Deploy app".into(),
+                        requires_approval: true,
+                        input_schema: serde_json::json!({"type": "object"}),
+                    },
+                    capability_id: CapabilityId {
+                        kind: CapabilityKind::Skill,
+                        name: "skill.deploy".into(),
+                        source: Some("deploy".into()),
+                    },
+                    output: Some(ToolOutput {
+                        content: "deployed".into(),
+                        structured: None,
+                    }),
+                    approval_error: None,
+                }) as Arc<dyn Tool>,
+                Arc::new(StubCapabilityTool {
+                    spec: ToolSpec {
+                        name: "mcp.deploy.run".into(),
+                        description: "Remote deploy".into(),
+                        requires_approval: false,
+                        input_schema: serde_json::json!({"type": "object"}),
+                    },
+                    capability_id: CapabilityId {
+                        kind: CapabilityKind::McpTool,
+                        name: "mcp.deploy.run".into(),
+                        source: Some("deploy".into()),
+                    },
+                    output: Some(ToolOutput {
+                        content: "remote ok".into(),
+                        structured: None,
+                    }),
+                    approval_error: None,
+                }) as Arc<dyn Tool>,
+            ],
+            vec![
+                McpServerStatus {
+                    name: "deploy".into(),
+                    connected: true,
+                    tool_count: 1,
+                    message: "connected".into(),
+                },
+                McpServerStatus {
+                    name: "broken".into(),
+                    connected: false,
+                    tool_count: 0,
+                    message: "initialize failed".into(),
+                },
+            ],
+        ));
+        let runtime = build_test_runtime_with_registry(
+            Arc::new(StaticBackend::new("fallback")),
+            Arc::new(StaticSystemPrompt::new("base")),
+            std::env::temp_dir(),
+            policy,
+            Some(tools),
+        );
+
+        let capabilities = runtime.render_capability_inventory();
+        assert!(
+            capabilities.contains("`skill.deploy` source=deploy approval=required — Deploy app")
+        );
+        assert!(capabilities.contains("`mcp.deploy.run` source=deploy — Remote deploy"));
+
+        let skills = runtime.render_skill_inventory();
+        assert!(skills.contains("skills"));
+        assert!(skills.contains("`skill.deploy` source=deploy approval=required — Deploy app"));
+
+        let mcp = runtime.render_mcp_inventory();
+        assert!(mcp.contains("mcp servers"));
+        assert!(mcp.contains("deploy [connected] tools=1 connected"));
+        assert!(mcp.contains("broken [disconnected] tools=0 initialize failed"));
+
+        let mcp_tools = runtime.render_mcp_tool_inventory(Some("deploy"));
+        assert!(mcp_tools.contains("mcp tools for `deploy`"));
+        assert!(mcp_tools.contains("`mcp.deploy.run` source=deploy — Remote deploy"));
+    }
+
+    #[tokio::test]
+    async fn invoke_capability_persists_direct_tool_task_and_message() -> Result<()> {
+        let policy = Arc::new(PolicyEngine::new(PolicyConfig::default()));
+        let tools = Arc::new(ToolRegistry::from_parts(
+            vec![Arc::new(StubCapabilityTool {
+                spec: ToolSpec {
+                    name: "mcp.deploy.run".into(),
+                    description: "Remote deploy".into(),
+                    requires_approval: false,
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+                capability_id: CapabilityId {
+                    kind: CapabilityKind::McpTool,
+                    name: "mcp.deploy.run".into(),
+                    source: Some("deploy".into()),
+                },
+                output: Some(ToolOutput {
+                    content: "deploy ok".into(),
+                    structured: Some(serde_json::json!({"ok": true})),
+                }),
+                approval_error: None,
+            }) as Arc<dyn Tool>],
+            vec![McpServerStatus {
+                name: "deploy".into(),
+                connected: true,
+                tool_count: 1,
+                message: "connected".into(),
+            }],
+        ));
+        let runtime = build_test_runtime_with_registry(
+            Arc::new(StaticBackend::new("fallback")),
+            Arc::new(StaticSystemPrompt::new("base")),
+            std::env::temp_dir(),
+            policy,
+            Some(tools),
+        );
+
+        let reply = runtime
+            .invoke_capability(
+                "mcp.deploy.run",
+                serde_json::json!({ "service": "api" }),
+                Some(PathBuf::from("/workspace")),
+                None,
+                Some("session-1".into()),
+            )
+            .await?;
+        assert_eq!(reply.message, "{\"ok\":true}");
+
+        let tasks = runtime.list_tasks()?;
+        assert_eq!(tasks.len(), 1);
+        let task = &tasks[0];
+        assert!(matches!(task.kind, TaskKind::DirectToolTask));
+        assert!(matches!(task.state, TaskRunState::Completed));
+        assert_eq!(task.current_session_id.as_deref(), Some("session-1"));
+        assert_eq!(task.cwd, Some(PathBuf::from("/workspace")));
+        assert_eq!(task.result_preview.as_deref(), Some("{\"ok\":true}"));
+
+        let messages = runtime.store.list_messages(reply.conversation_id, 10)?;
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(messages[0].role, MessageRole::Assistant));
+        assert_eq!(messages[0].content, "{\"ok\":true}");
+
+        let invocations = runtime.store.list_tool_invocations(task.id)?;
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].tool_name, "mcp.deploy.run");
+        assert!(matches!(
+            invocations[0].status,
+            ToolInvocationStatus::Completed
+        ));
+        assert_eq!(
+            invocations[0].arguments,
+            serde_json::json!({ "service": "api" })
+        );
+        assert_eq!(
+            invocations[0].output_content.as_deref(),
+            Some("{\"ok\":true}")
+        );
+        assert_eq!(
+            invocations[0].output_structured,
+            Some(serde_json::json!({"ok": true}))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invoke_capability_marks_blocked_approval_state() {
+        let policy = Arc::new(PolicyEngine::new(PolicyConfig::default()));
+        let approval = policy.request_elevation(10, "approve deploy".into());
+        let tools = Arc::new(ToolRegistry::from_parts(
+            vec![Arc::new(StubCapabilityTool {
+                spec: ToolSpec {
+                    name: "mcp.deploy.run".into(),
+                    description: "Remote deploy".into(),
+                    requires_approval: true,
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+                capability_id: CapabilityId {
+                    kind: CapabilityKind::McpTool,
+                    name: "mcp.deploy.run".into(),
+                    source: Some("deploy".into()),
+                },
+                output: None,
+                approval_error: Some(format!(
+                    "approval required: blocked [{}]",
+                    approval.request_id
+                )),
+            }) as Arc<dyn Tool>],
+            vec![McpServerStatus {
+                name: "deploy".into(),
+                connected: true,
+                tool_count: 1,
+                message: "connected".into(),
+            }],
+        ));
+        let runtime = build_test_runtime_with_registry(
+            Arc::new(StaticBackend::new("fallback")),
+            Arc::new(StaticSystemPrompt::new("base")),
+            std::env::temp_dir(),
+            policy,
+            Some(tools),
+        );
+
+        let err = runtime
+            .invoke_capability(
+                "mcp.deploy.run",
+                serde_json::json!({ "service": "api" }),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("skill invocation should block on approval");
+        assert!(matches!(err, ClawError::ApprovalRequired(_)));
+
+        let tasks = runtime.list_tasks().expect("list tasks");
+        assert_eq!(tasks.len(), 1);
+        let task = &tasks[0];
+        assert!(matches!(task.kind, TaskKind::DirectToolTask));
+        assert!(matches!(task.state, TaskRunState::BlockedApproval));
+        assert_eq!(task.blocked_approval_id, Some(approval.request_id));
+        assert!(!task.running);
+
+        let invocations = runtime
+            .store
+            .list_tool_invocations(task.id)
+            .expect("list tool invocations");
+        assert_eq!(invocations.len(), 1);
+        assert!(matches!(
+            invocations[0].status,
+            ToolInvocationStatus::BlockedApproval
+        ));
+        assert_eq!(invocations[0].approval_id, Some(approval.request_id));
+        assert_eq!(invocations[0].tool_name, "mcp.deploy.run");
+
+        let stored_approval = runtime
+            .store
+            .get_approval_record(&approval.request_id.to_string())
+            .expect("approval lookup")
+            .expect("approval record");
+        assert_eq!(stored_approval.task_id, Some(task.id));
+        assert_eq!(stored_approval.tool_name.as_deref(), Some("mcp.deploy.run"));
+        assert!(
+            runtime
+                .store
+                .list_messages(task.conversation_id, 10)
+                .expect("list messages")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn single_agent_keeps_request_time_prompt_loading() -> Result<()> {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let runtime = build_test_runtime(
+            Arc::new(StaticBackend::new("done")),
+            Arc::new(CountingPromptSource::new(loads.clone(), "prompt")),
+        );
+        let reply = runtime
+            .ask_with_provider_and_preference("hello", None, None, MultiAgentPreference::ForceOff)
+            .await?;
+        assert_eq!(reply, "done");
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multi_agent_keeps_request_time_prompt_loading() -> Result<()> {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let runtime = build_test_runtime(
+            Arc::new(StaticBackend::new("WORKER 1: first\nWORKER 2: second")),
+            Arc::new(CountingPromptSource::new(loads.clone(), "prompt")),
+        );
+        let _reply = runtime
+            .ask_with_provider_and_preference(
+                "use 2 agents for this",
+                None,
+                None,
+                MultiAgentPreference::ForceOn,
+            )
+            .await?;
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
         Ok(())
     }
 

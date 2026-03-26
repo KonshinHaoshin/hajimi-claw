@@ -14,6 +14,8 @@ Single-user Telegram/Feishu-first ops agent in Rust.
 - Windows-safe execution mode with allowlist checks and Job Object cleanup
 - Channel-aware onboarding for Telegram or Feishu plus provider/model setup
 - Configurable multi-agent orchestration with coordinator/worker/integrator flow
+- Executable skills registered as first-class tools with shared approval, audit, and persistence
+- Capability inventory and MCP server status surfaced in chat via `/capabilities`, `/skills`, and `/mcp`
 
 ## Running
 
@@ -142,6 +144,16 @@ Current Feishu limitations:
 ## CLI
 
 - `hajimi`
+- `hajimi ask <prompt>`
+- `hajimi tasks`
+- `hajimi approvals`
+- `hajimi approve <request-id>`
+- `hajimi shell open [name]`
+- `hajimi shell status <session-id>`
+- `hajimi shell exec <session-id> <command>`
+- `hajimi shell close <session-id>`
+- `hajimi profile show`
+- `hajimi profile use <ops-safe|dev-agent|computer-use>`
 - `hajimi daemon`
 - `hajimi launch`
 - `hajimi stop`
@@ -157,6 +169,72 @@ Current Feishu limitations:
 - `hajimi models [provider-id]`
 - `hajimi restart`
 - `hajimi help`
+
+`hajimi ask` now records task state and tool invocations in SQLite. If a guarded command blocks on
+approval, `hajimi approve <request-id>` resumes the blocked task instead of asking you to rerun it.
+
+## Skills and MCP
+
+Hajimi now treats native tools, executable skills, and MCP-discovered tools as one capability
+surface.
+
+- Native tools keep their existing names such as `read_file` or `exec_once`
+- When `[telegram].bot_token` is configured, a native `telegram_api` tool is also registered
+- Executable skills are configured in `[skills]` and are registered as tool names like
+  `skill.deploy`
+- MCP tools will be exposed as namespaced tool names like `mcp.<server>.<tool>`
+- All three flow through the same runtime path for approval, audit logging, task persistence, and
+  model tool-calling
+
+`skills.md` remains prompt guidance only. Use it for playbooks, habits, and routing hints. It is
+not the executable source of truth for runnable skills.
+
+### Config
+
+`config.example.toml` now includes these sections:
+
+```toml
+[skills]
+enabled = true
+directory = "./skills"
+manifest_paths = []
+entries = []
+
+[mcp]
+enabled = true
+servers = []
+```
+
+Skill manifests and inline entries deserialize into `ExecutableSkillConfig`, including `name`,
+`description`, `command`, `args`, `cwd`, `env_allowlist`, `requires_approval`, `timeout_secs`,
+`max_output_bytes`, and `input_schema`.
+
+Relative paths in skill manifests, `skills.directory`, `skills.manifest_paths`, and MCP server
+`cwd` values resolve relative to the config file.
+
+### Telegram capability commands
+
+- `/capabilities` — list the effective native tools, executable skills, and MCP tools
+- `/skills` — list executable skills only
+- `/skill run <name> <json-or-text>` — explicitly invoke one configured skill through the runtime
+- `/mcp` — show configured MCP server status
+- `/mcp tools [server]` — list discovered MCP tools, optionally filtered by server
+
+Natural-language requests stay primary. Once a skill or MCP tool is registered in the runtime, the
+model can choose it during normal `/ask` or plain-text requests just like built-in tools.
+
+`telegram_api` calls the configured Telegram Bot API token directly from the native tool layer. A
+typical invocation looks like:
+
+```json
+{
+  "method": "sendMessage",
+  "params": {
+    "text": "deploy finished"
+  },
+  "use_default_chat_id": true
+}
+```
 
 ## Multi-Agent
 
@@ -197,25 +275,43 @@ Behavior:
 
 ## Persona Files
 
-`hajimi onboard` now creates empty persona files in `~/.hajimi/`:
+`hajimi onboard` seeds persona files in `~/.hajimi/`:
 
+- `identity.md`
 - `soul.md`
 - `agents.md`
 - `tools.md`
 - `skills.md`
+- `heartbeat.md`
 
-`hajimi` reloads these files on each request, so Telegram edits take effect on the next `/ask`.
+`hajimi` reloads persona prompt files on each request, so edits take effect on the next `/ask`.
 
-- Auto-discovered files: `soul.md`, `agents.md`, `AGENTS.md`, `tools.md`, `skills.md`
-- Search roots: the current working directory, the config directory, and `~/.hajimi`
+Layered prompt order:
+
+1. base system prompt
+2. `identity.md`
+3. `soul.md`
+4. `agents.md` / `AGENTS.md` / `tools.md` / `skills.md`
+5. runtime overlays such as shell-session metadata and multi-agent role instructions
+
+Auto-discovery behavior:
+
+- Auto-discovered files: `identity.md`, `soul.md`, `agents.md`, `AGENTS.md`, `tools.md`, `skills.md`
+- Search roots and precedence: `persona.directory` -> config directory -> current working directory
+- `identity.md` and `soul.md` support optional front matter, but plain markdown still works
+- Structured `identity.md` / `soul.md` fields override by precedence while freeform notes accumulate
+- Extension files stay additive in precedence order
+- `heartbeat.md` is runtime config only and is never appended into the prompt
 - Optional explicit list: set `[persona].prompt_files` in `config.toml`
 
 Use these files for:
 
-- `soul.md`: tone, temperament, and high-level persona
+- `identity.md`: user profile, owned systems, environments, durable preferences, and hard constraints
+- `soul.md`: Hajimi's stable role, tone, style, and behavioral stance
 - `agents.md` or `AGENTS.md`: repo or operator instructions
 - `tools.md`: tool-use policy and operational preferences
-- `skills.md`: extra habits, playbooks, and skill-selection hints
+- `skills.md`: extra habits, playbooks, and skill-selection hints for the prompt layer only
+- `heartbeat.md`: daemon heartbeat runtime config
 
 ## Telegram commands
 
@@ -232,10 +328,16 @@ Use these files for:
 - `/model current`
 - `/model use [model]`
 - `/persona list`
-- `/persona read <soul|agents|tools|skills>`
+- `/persona guide`
+- `/persona read <identity|heartbeat|soul|agents|tools|skills>`
 - `/persona write <file> <content>`
 - `/persona append <file> <content>`
 - `/ask <text>`
+- `/capabilities`
+- `/skills`
+- `/skill run <name> <json-or-text>`
+- `/mcp`
+- `/mcp tools [server]`
 - `/shell open [name]`
 - `/shell exec <cmd>`
 - `/shell close`

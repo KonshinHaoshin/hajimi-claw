@@ -1,6 +1,6 @@
 {
   "name": "hajimi-claw-linux-x64-gnu",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Prebuilt Linux x64 glibc binary for hajimi-claw",
   "os": [
     "linux"

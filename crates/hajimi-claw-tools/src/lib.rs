@@ -1,3 +1,5 @@
+mod mcp;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -6,8 +8,9 @@ use std::time::Instant;
 use async_trait::async_trait;
 use hajimi_claw_policy::PolicyEngine;
 use hajimi_claw_types::{
-    ClawError, ClawResult, ExecRequest, Executor, SessionId, SessionOpenRequest, Tool, ToolContext,
-    ToolOutput, ToolSpec,
+    CapabilityId, CapabilityKind, CapabilitySummary, ClawError, ClawResult, ExecRequest,
+    ExecutableSkillConfig, Executor, McpServerStatus, SessionId, SessionOpenRequest, Tool,
+    ToolContext, ToolOutput, ToolSpec,
 };
 use regex::Regex;
 use reqwest::Method;
@@ -21,8 +24,34 @@ use tokio::time::{Duration, timeout};
 use tokio_rustls::TlsConnector;
 use url::Url;
 
+pub use mcp::{McpBootstrapResult, bootstrap_mcp_servers};
+
+#[derive(Debug, Clone)]
+pub struct TelegramToolConfig {
+    pub bot_token: String,
+    pub default_chat_id: Option<i64>,
+    api_base_url: Option<String>,
+}
+
+impl TelegramToolConfig {
+    pub fn new(bot_token: impl Into<String>, default_chat_id: Option<i64>) -> Self {
+        Self {
+            bot_token: bot_token.into(),
+            default_chat_id,
+            api_base_url: None,
+        }
+    }
+
+    fn api_base_url(&self) -> &str {
+        self.api_base_url
+            .as_deref()
+            .unwrap_or("https://api.telegram.org")
+    }
+}
+
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
+    mcp_servers: Vec<McpServerStatus>,
 }
 
 impl ToolRegistry {
@@ -31,11 +60,34 @@ impl ToolRegistry {
             .into_iter()
             .map(|tool| (tool.spec().name.clone(), tool))
             .collect();
-        Self { tools }
+        Self {
+            tools,
+            mcp_servers: Vec::new(),
+        }
+    }
+
+    pub fn with_mcp_servers(mut self, mcp_servers: Vec<McpServerStatus>) -> Self {
+        self.mcp_servers = mcp_servers;
+        self
     }
 
     pub fn default(executor: Arc<dyn Executor>, policy: Arc<PolicyEngine>) -> Self {
-        Self::new(vec![
+        Self::new(Self::builtin_tools(executor, policy))
+    }
+
+    pub fn builtin_tools(
+        executor: Arc<dyn Executor>,
+        policy: Arc<PolicyEngine>,
+    ) -> Vec<Arc<dyn Tool>> {
+        Self::builtin_tools_with_telegram(executor, policy, None)
+    }
+
+    pub fn builtin_tools_with_telegram(
+        executor: Arc<dyn Executor>,
+        policy: Arc<PolicyEngine>,
+        telegram: Option<TelegramToolConfig>,
+    ) -> Vec<Arc<dyn Tool>> {
+        let mut tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(ReadFileTool::new(policy.clone())),
             Arc::new(TailFileTool::new(policy.clone())),
             Arc::new(ListDirTool::new(policy.clone())),
@@ -53,17 +105,73 @@ impl ToolRegistry {
             Arc::new(DockerLogsTool::new(executor.clone())),
             Arc::new(DockerRestartTool::new(executor.clone())),
             Arc::new(RunCommandTool::new(executor.clone())),
-            Arc::new(ExecOnceTool::new(executor.clone())),
+            Arc::new(ExecOnceTool::new(executor.clone(), policy.clone())),
             Arc::new(PingHostTool::new(executor.clone())),
             Arc::new(SessionOpenTool::new(executor.clone())),
             Arc::new(SessionStatusTool::new(executor.clone())),
             Arc::new(SessionExecTool::new(executor.clone())),
             Arc::new(SessionCloseTool::new(executor)),
-        ])
+        ];
+        if let Some(config) = telegram.filter(|config| !config.bot_token.trim().is_empty()) {
+            tools.push(Arc::new(TelegramApiTool::new(config)));
+        }
+        tools
+    }
+
+    pub fn from_parts(tools: Vec<Arc<dyn Tool>>, mcp_servers: Vec<McpServerStatus>) -> Self {
+        Self::new(tools).with_mcp_servers(mcp_servers)
+    }
+
+    pub fn tools_with_skill_configs(
+        executor: Arc<dyn Executor>,
+        policy: Arc<PolicyEngine>,
+        skills: Vec<ExecutableSkillConfig>,
+    ) -> Vec<Arc<dyn Tool>> {
+        Self::tools_with_skill_configs_and_telegram(executor, policy, skills, None)
+    }
+
+    pub fn tools_with_skill_configs_and_telegram(
+        executor: Arc<dyn Executor>,
+        policy: Arc<PolicyEngine>,
+        skills: Vec<ExecutableSkillConfig>,
+        telegram: Option<TelegramToolConfig>,
+    ) -> Vec<Arc<dyn Tool>> {
+        let mut tools = Self::builtin_tools_with_telegram(executor.clone(), policy, telegram);
+        tools.extend(skills.into_iter().map(|skill| {
+            Arc::new(ExecutableSkillTool::new(executor.clone(), skill)) as Arc<dyn Tool>
+        }));
+        tools
+    }
+
+    pub fn with_skill_configs(
+        executor: Arc<dyn Executor>,
+        policy: Arc<PolicyEngine>,
+        skills: Vec<ExecutableSkillConfig>,
+    ) -> Self {
+        Self::new(Self::tools_with_skill_configs(executor, policy, skills))
     }
 
     pub fn specs(&self) -> Vec<ToolSpec> {
         self.tools.values().map(|tool| tool.spec()).collect()
+    }
+
+    pub fn capability_summaries(&self) -> Vec<CapabilitySummary> {
+        let mut capabilities = self
+            .tools
+            .values()
+            .map(|tool| tool.capability_summary())
+            .collect::<Vec<_>>();
+        capabilities.sort_by(|left, right| {
+            capability_sort_key(left)
+                .cmp(&capability_sort_key(right))
+                .then_with(|| left.id.name.cmp(&right.id.name))
+                .then_with(|| left.id.source.cmp(&right.id.source))
+        });
+        capabilities
+    }
+
+    pub fn mcp_server_statuses(&self) -> &[McpServerStatus] {
+        &self.mcp_servers
     }
 
     pub async fn call(&self, name: &str, ctx: ToolContext, input: Value) -> ClawResult<ToolOutput> {
@@ -73,6 +181,19 @@ impl ToolRegistry {
             .ok_or_else(|| ClawError::NotFound(format!("tool not found: {name}")))?;
         tool.call(ctx, input).await
     }
+}
+
+fn capability_sort_key(summary: &CapabilitySummary) -> (u8, &str, &str) {
+    let kind_rank = match summary.id.kind {
+        CapabilityKind::NativeTool => 0,
+        CapabilityKind::Skill => 1,
+        CapabilityKind::McpTool => 2,
+    };
+    (
+        kind_rank,
+        summary.id.source.as_deref().unwrap_or(""),
+        summary.id.name.as_str(),
+    )
 }
 
 fn object_schema(properties: Vec<(&str, Value)>, required: &[&str]) -> Value {
@@ -131,6 +252,289 @@ fn string_map_schema(description: &str) -> Value {
             "type": "string",
         },
     })
+}
+
+fn freeform_object_schema(description: &str) -> Value {
+    json!({
+        "type": "object",
+        "description": description,
+    })
+}
+
+struct ExecutableSkillTool {
+    executor: Arc<dyn Executor>,
+    config: ExecutableSkillConfig,
+}
+
+impl ExecutableSkillTool {
+    fn new(executor: Arc<dyn Executor>, config: ExecutableSkillConfig) -> Self {
+        Self { executor, config }
+    }
+}
+
+struct TelegramApiTool {
+    client: reqwest::Client,
+    config: TelegramToolConfig,
+}
+
+impl TelegramApiTool {
+    fn new(config: TelegramToolConfig) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            config,
+        }
+    }
+
+    fn api_url(&self, method: &str) -> String {
+        format!(
+            "{}/bot{}/{}",
+            self.config.api_base_url().trim_end_matches('/'),
+            self.config.bot_token,
+            method
+        )
+    }
+}
+
+#[async_trait]
+impl Tool for TelegramApiTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "telegram_api".into(),
+            description: "Call the configured Telegram Bot API and optionally inject the configured admin chat_id.".into(),
+            requires_approval: true,
+            input_schema: object_schema(
+                vec![
+                    (
+                        "method",
+                        string_schema("Telegram Bot API method name, for example sendMessage or getChat."),
+                    ),
+                    (
+                        "params",
+                        freeform_object_schema("Optional JSON request body sent to the Telegram method."),
+                    ),
+                    (
+                        "use_default_chat_id",
+                        bool_schema("When true, inject the configured admin chat_id if params.chat_id is absent."),
+                    ),
+                ],
+                &["method"],
+            ),
+        }
+    }
+
+    async fn call(&self, _ctx: ToolContext, input: Value) -> ClawResult<ToolOutput> {
+        #[derive(Deserialize)]
+        struct Input {
+            method: String,
+            #[serde(default)]
+            params: Option<Value>,
+            use_default_chat_id: Option<bool>,
+        }
+
+        let input: Input = serde_json::from_value(input)
+            .map_err(|err| ClawError::InvalidRequest(err.to_string()))?;
+        let method = input.method.trim();
+        if !is_valid_telegram_method(method) {
+            return Err(ClawError::InvalidRequest(format!(
+                "invalid Telegram method `{}`",
+                input.method
+            )));
+        }
+
+        let mut params = normalize_telegram_params(input.params)?;
+        maybe_inject_default_chat_id(
+            &mut params,
+            self.config.default_chat_id,
+            input.use_default_chat_id.unwrap_or(false),
+        )?;
+
+        let response = self
+            .client
+            .post(self.api_url(method))
+            .json(&params)
+            .send()
+            .await
+            .map_err(|err| {
+                ClawError::Backend(format!("telegram `{method}` request failed: {err}"))
+            })?;
+        let status = response.status();
+        let body = response.text().await.map_err(|err| {
+            ClawError::Backend(format!("telegram `{method}` response read failed: {err}"))
+        })?;
+        let payload =
+            serde_json::from_str::<Value>(&body).unwrap_or_else(|_| json!({ "raw_body": body }));
+
+        if !status.is_success() {
+            return Err(ClawError::Backend(format_telegram_http_error(
+                method,
+                status.as_u16(),
+                &payload,
+            )));
+        }
+        if payload.get("ok").and_then(Value::as_bool) == Some(false) {
+            return Err(ClawError::Backend(format_telegram_api_error(
+                method, &payload,
+            )));
+        }
+
+        Ok(ToolOutput {
+            content: summarize_telegram_success(method, &payload),
+            structured: Some(payload),
+        })
+    }
+}
+
+fn is_valid_telegram_method(method: &str) -> bool {
+    !method.is_empty() && method.chars().all(|ch| ch.is_ascii_alphanumeric())
+}
+
+fn normalize_telegram_params(params: Option<Value>) -> ClawResult<Value> {
+    let params = params.unwrap_or_else(|| json!({}));
+    if params.is_object() {
+        Ok(params)
+    } else {
+        Err(ClawError::InvalidRequest(
+            "`params` must be a JSON object when provided".into(),
+        ))
+    }
+}
+
+fn maybe_inject_default_chat_id(
+    params: &mut Value,
+    default_chat_id: Option<i64>,
+    use_default_chat_id: bool,
+) -> ClawResult<()> {
+    if !use_default_chat_id {
+        return Ok(());
+    }
+    let params = params
+        .as_object_mut()
+        .ok_or_else(|| ClawError::InvalidRequest("`params` must be a JSON object".into()))?;
+    if params.contains_key("chat_id") {
+        return Ok(());
+    }
+    let chat_id = default_chat_id.ok_or_else(|| {
+        ClawError::InvalidRequest(
+            "no default Telegram chat_id is configured; pass params.chat_id explicitly".into(),
+        )
+    })?;
+    params.insert("chat_id".into(), json!(chat_id));
+    Ok(())
+}
+
+fn summarize_telegram_success(method: &str, payload: &Value) -> String {
+    if let Some(message_id) = payload
+        .get("result")
+        .and_then(|result| result.get("message_id"))
+        .and_then(Value::as_i64)
+    {
+        format!("telegram `{method}` ok message_id={message_id}")
+    } else {
+        format!("telegram `{method}` ok")
+    }
+}
+
+fn format_telegram_http_error(method: &str, status: u16, payload: &Value) -> String {
+    let description = payload
+        .get("description")
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("raw_body").and_then(Value::as_str))
+        .unwrap_or("unknown error");
+    format!("telegram `{method}` failed with HTTP {status}: {description}")
+}
+
+fn format_telegram_api_error(method: &str, payload: &Value) -> String {
+    let error_code = payload
+        .get("error_code")
+        .and_then(Value::as_i64)
+        .map(|code| format!(" error_code={code}"))
+        .unwrap_or_default();
+    let description = payload
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown Telegram API error");
+    format!("telegram `{method}` failed{error_code}: {description}")
+}
+
+#[async_trait]
+impl Tool for ExecutableSkillTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: format!("skill.{}", self.config.name),
+            description: self.config.description.clone(),
+            requires_approval: self.config.requires_approval,
+            input_schema: self.config.input_schema.clone(),
+        }
+    }
+
+    fn capability_id(&self) -> CapabilityId {
+        CapabilityId {
+            kind: CapabilityKind::Skill,
+            name: self.spec().name,
+            source: Some(self.config.name.clone()),
+        }
+    }
+
+    async fn call(&self, ctx: ToolContext, input: Value) -> ClawResult<ToolOutput> {
+        let stdin = serde_json::to_string(&json!({
+            "conversation_id": ctx.conversation_id.to_string(),
+            "working_directory": ctx
+                .working_directory
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            "elevated": ctx.elevated,
+            "input": input,
+        }))
+        .map_err(|err| ClawError::InvalidRequest(err.to_string()))?;
+
+        let result = self
+            .executor
+            .run_once(ExecRequest {
+                command: self.config.command.clone(),
+                args: self.config.args.clone(),
+                cwd: self.config.cwd.clone().or(ctx.working_directory),
+                env_allowlist: self.config.env_allowlist.clone(),
+                timeout_secs: self.config.timeout_secs.unwrap_or(120),
+                max_output_bytes: self.config.max_output_bytes.unwrap_or(32 * 1024),
+                requires_tty: false,
+                stdin: Some(stdin),
+            })
+            .await?;
+
+        if result.exit_code.unwrap_or_default() != 0 {
+            return Err(ClawError::Backend(if result.stderr.trim().is_empty() {
+                format!(
+                    "skill `{}` failed with exit code {}",
+                    self.config.name,
+                    result.exit_code.unwrap_or_default()
+                )
+            } else {
+                result.stderr.trim().to_string()
+            }));
+        }
+
+        if result.stdout.trim().is_empty() {
+            return Ok(ToolOutput {
+                content: String::new(),
+                structured: None,
+            });
+        }
+
+        let parsed: Value = serde_json::from_str(&result.stdout).map_err(|err| {
+            ClawError::Backend(format!(
+                "skill `{}` returned invalid JSON: {err}",
+                self.config.name
+            ))
+        })?;
+        Ok(ToolOutput {
+            content: parsed
+                .get("content")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| result.stdout.trim().to_string()),
+            structured: parsed.get("structured").cloned(),
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -986,6 +1390,7 @@ impl Tool for SystemdStatusTool {
                 timeout_secs: 30,
                 max_output_bytes: 16 * 1024,
                 requires_tty: false,
+                stdin: None,
             })
             .await?;
         Ok(command_output(result))
@@ -1033,6 +1438,7 @@ impl Tool for SystemdRestartTool {
                 timeout_secs: 30,
                 max_output_bytes: 8 * 1024,
                 requires_tty: false,
+                stdin: None,
             })
             .await?;
         Ok(command_output(result))
@@ -1071,6 +1477,7 @@ impl Tool for DockerPsTool {
                 timeout_secs: 20,
                 max_output_bytes: 12 * 1024,
                 requires_tty: false,
+                stdin: None,
             })
             .await?;
         Ok(command_output(result))
@@ -1130,6 +1537,7 @@ impl Tool for DockerLogsTool {
                 timeout_secs: 30,
                 max_output_bytes: 16 * 1024,
                 requires_tty: false,
+                stdin: None,
             })
             .await?;
         Ok(command_output(result))
@@ -1177,6 +1585,7 @@ impl Tool for DockerRestartTool {
                 timeout_secs: 30,
                 max_output_bytes: 8 * 1024,
                 requires_tty: false,
+                stdin: None,
             })
             .await?;
         Ok(command_output(result))
@@ -1230,6 +1639,7 @@ impl Tool for RunCommandTool {
                 timeout_secs: 60,
                 max_output_bytes: 24 * 1024,
                 requires_tty: false,
+                stdin: None,
             })
             .await?;
         Ok(command_output(result))
@@ -1238,11 +1648,12 @@ impl Tool for RunCommandTool {
 
 struct ExecOnceTool {
     executor: Arc<dyn Executor>,
+    policy: Arc<PolicyEngine>,
 }
 
 impl ExecOnceTool {
-    fn new(executor: Arc<dyn Executor>) -> Self {
-        Self { executor }
+    fn new(executor: Arc<dyn Executor>, policy: Arc<PolicyEngine>) -> Self {
+        Self { executor, policy }
     }
 }
 
@@ -1289,6 +1700,7 @@ impl Tool for ExecOnceTool {
 
         let input: Input = serde_json::from_value(input)
             .map_err(|err| ClawError::InvalidRequest(err.to_string()))?;
+        let config = self.policy.config();
         let result = self
             .executor
             .run_once(ExecRequest {
@@ -1296,9 +1708,16 @@ impl Tool for ExecOnceTool {
                 args: input.args.unwrap_or_default(),
                 cwd: input.cwd.or(ctx.working_directory),
                 env_allowlist: vec![],
-                timeout_secs: input.timeout_secs.unwrap_or(60).max(1),
-                max_output_bytes: input.max_output_bytes.unwrap_or(24 * 1024).max(256),
+                timeout_secs: input
+                    .timeout_secs
+                    .unwrap_or(60)
+                    .clamp(1, config.max_timeout_secs),
+                max_output_bytes: input
+                    .max_output_bytes
+                    .unwrap_or(24 * 1024)
+                    .clamp(256, config.max_output_bytes),
                 requires_tty: input.requires_tty.unwrap_or(false),
+                stdin: None,
             })
             .await?;
         Ok(command_output(result))
@@ -1379,6 +1798,7 @@ impl Tool for PingHostTool {
                 timeout_secs: (timeout_secs * count as u64).max(timeout_secs),
                 max_output_bytes: 16 * 1024,
                 requires_tty: false,
+                stdin: None,
             })
             .await?;
         Ok(command_output(result))
@@ -1550,6 +1970,7 @@ impl Tool for SessionExecTool {
                     timeout_secs: 120,
                     max_output_bytes: 24 * 1024,
                     requires_tty: false,
+                    stdin: None,
                 },
             )
             .await?;
@@ -1677,14 +2098,16 @@ fn truncate_string(content: String, max_bytes: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     use anyhow::Result;
     use hajimi_claw_exec::{LocalExecutor, PlatformMode};
     use hajimi_claw_policy::{PolicyConfig, PolicyEngine};
     use hajimi_claw_types::{
-        ClawError, ConversationId, ExecRequest, ExecResult, Executor, SessionHandle, SessionId,
-        SessionOpenRequest, ToolContext,
+        CapabilityId, CapabilityKind, ClawError, ClawResult, ConversationId, ExecRequest,
+        ExecResult, ExecutableSkillConfig, Executor, McpServerStatus, SessionHandle, SessionId,
+        SessionOpenRequest, Tool, ToolContext, ToolOutput, ToolSpec,
     };
     use serde_json::json;
     use tempfile::tempdir;
@@ -1692,7 +2115,37 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::Mutex;
 
-    use super::ToolRegistry;
+    use super::{
+        TelegramApiTool, TelegramToolConfig, ToolRegistry, is_valid_telegram_method,
+        maybe_inject_default_chat_id, normalize_telegram_params,
+    };
+
+    struct StubTool {
+        spec: ToolSpec,
+        capability_id: CapabilityId,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for StubTool {
+        fn spec(&self) -> ToolSpec {
+            self.spec.clone()
+        }
+
+        fn capability_id(&self) -> CapabilityId {
+            self.capability_id.clone()
+        }
+
+        async fn call(
+            &self,
+            _ctx: ToolContext,
+            _input: serde_json::Value,
+        ) -> ClawResult<ToolOutput> {
+            Ok(ToolOutput {
+                content: self.spec.name.clone(),
+                structured: None,
+            })
+        }
+    }
 
     #[tokio::test]
     async fn read_file_respects_policy() -> Result<()> {
@@ -1865,19 +2318,33 @@ mod tests {
 
     struct FakeExecutor {
         last_request: Mutex<Option<ExecRequest>>,
+        result: Mutex<ExecResult>,
     }
 
-    #[async_trait::async_trait]
-    impl Executor for FakeExecutor {
-        async fn run_once(&self, req: ExecRequest) -> Result<ExecResult, ClawError> {
-            *self.last_request.lock().await = Some(req);
-            Ok(ExecResult {
+    impl FakeExecutor {
+        fn new() -> Self {
+            Self::with_result(ExecResult {
                 exit_code: Some(0),
                 stdout: "pong".into(),
                 stderr: String::new(),
                 duration_ms: 5,
                 truncated: false,
             })
+        }
+
+        fn with_result(result: ExecResult) -> Self {
+            Self {
+                last_request: Mutex::new(None),
+                result: Mutex::new(result),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Executor for FakeExecutor {
+        async fn run_once(&self, req: ExecRequest) -> Result<ExecResult, ClawError> {
+            *self.last_request.lock().await = Some(req);
+            Ok(self.result.lock().await.clone())
         }
 
         async fn open_session(&self, _req: SessionOpenRequest) -> Result<SessionHandle, ClawError> {
@@ -1903,9 +2370,7 @@ mod tests {
 
     #[tokio::test]
     async fn ping_host_builds_ping_command() -> Result<()> {
-        let executor = Arc::new(FakeExecutor {
-            last_request: Mutex::new(None),
-        });
+        let executor = Arc::new(FakeExecutor::new());
         let policy = Arc::new(PolicyEngine::new(PolicyConfig::default()));
         let tools = ToolRegistry::default(executor.clone(), policy);
         let output = tools
@@ -1933,6 +2398,202 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exec_once_clamps_output_and_timeout_to_policy_maximums() -> Result<()> {
+        let executor = Arc::new(FakeExecutor::new());
+        let policy = Arc::new(PolicyEngine::new(PolicyConfig {
+            max_timeout_secs: 30,
+            max_output_bytes: 4096,
+            ..PolicyConfig::default()
+        }));
+        let tools = ToolRegistry::default(executor.clone(), policy);
+        let _ = tools
+            .call(
+                "exec_once",
+                ToolContext {
+                    conversation_id: ConversationId::new(),
+                    working_directory: None,
+                    elevated: true,
+                },
+                json!({
+                    "command": "powershell",
+                    "args": ["-Command", "Get-ComputerInfo"],
+                    "timeout_secs": 999,
+                    "max_output_bytes": 65536
+                }),
+            )
+            .await?;
+
+        let request = executor
+            .last_request
+            .lock()
+            .await
+            .clone()
+            .expect("captured request");
+        assert_eq!(request.timeout_secs, 30);
+        assert_eq!(request.max_output_bytes, 4096);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executable_skill_tool_pipes_json_over_stdin() -> Result<()> {
+        let executor = Arc::new(FakeExecutor::with_result(ExecResult {
+            exit_code: Some(0),
+            stdout: json!({
+                "content": "skill pong",
+                "structured": { "ok": true }
+            })
+            .to_string(),
+            stderr: String::new(),
+            duration_ms: 5,
+            truncated: false,
+        }));
+        let skill = ExecutableSkillConfig {
+            name: "deploy".into(),
+            description: "Run a deploy helper".into(),
+            command: "skill-runner".into(),
+            args: vec!["--json".into()],
+            cwd: Some(PathBuf::from("/tmp/skills")),
+            env_allowlist: vec!["PATH".into()],
+            requires_approval: true,
+            timeout_secs: Some(45),
+            max_output_bytes: Some(2048),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "service": { "type": "string" }
+                },
+                "required": ["service"],
+                "additionalProperties": false
+            }),
+        };
+        let tools = ToolRegistry::with_skill_configs(
+            executor.clone(),
+            Arc::new(PolicyEngine::new(PolicyConfig::default())),
+            vec![skill],
+        );
+
+        let output = tools
+            .call(
+                "skill.deploy",
+                ToolContext {
+                    conversation_id: ConversationId::new(),
+                    working_directory: Some(PathBuf::from("/workspace")),
+                    elevated: true,
+                },
+                json!({ "service": "api" }),
+            )
+            .await?;
+
+        let request = executor
+            .last_request
+            .lock()
+            .await
+            .clone()
+            .expect("captured request");
+        assert_eq!(request.command, "skill-runner");
+        assert_eq!(request.args, vec!["--json"]);
+        assert_eq!(request.cwd, Some(PathBuf::from("/tmp/skills")));
+        assert_eq!(request.timeout_secs, 45);
+        assert_eq!(request.max_output_bytes, 2048);
+        assert_eq!(request.env_allowlist, vec!["PATH"]);
+        let stdin = request.stdin.expect("stdin payload");
+        assert!(stdin.contains("\"service\":\"api\""));
+        assert!(stdin.contains("\"elevated\":true"));
+        assert_eq!(output.content, "skill pong");
+        assert_eq!(output.structured, Some(json!({ "ok": true })));
+        Ok(())
+    }
+
+    #[test]
+    fn builtin_tools_include_telegram_api_when_token_is_configured() {
+        let executor = Arc::new(FakeExecutor::new());
+        let policy = Arc::new(PolicyEngine::new(PolicyConfig::default()));
+        let tools = ToolRegistry::builtin_tools_with_telegram(
+            executor,
+            policy,
+            Some(TelegramToolConfig::new("telegram-token", Some(123456))),
+        );
+        assert!(tools.iter().any(|tool| tool.spec().name == "telegram_api"));
+    }
+
+    #[test]
+    fn telegram_method_validation_rejects_invalid_names() {
+        assert!(is_valid_telegram_method("sendMessage"));
+        assert!(!is_valid_telegram_method("sendMessage/evil"));
+        assert!(!is_valid_telegram_method("send-message"));
+        assert!(!is_valid_telegram_method(""));
+    }
+
+    #[test]
+    fn telegram_default_chat_id_injection_is_optional_and_safe() {
+        let mut params =
+            normalize_telegram_params(Some(json!({ "text": "hi" }))).expect("params normalization");
+        maybe_inject_default_chat_id(&mut params, Some(42), true).expect("inject chat id");
+        assert_eq!(params["chat_id"], 42);
+        assert_eq!(params["text"], "hi");
+
+        let mut prefilled =
+            normalize_telegram_params(Some(json!({ "chat_id": 7 }))).expect("prefilled params");
+        maybe_inject_default_chat_id(&mut prefilled, Some(42), true).expect("preserve existing");
+        assert_eq!(prefilled["chat_id"], 7);
+    }
+
+    #[tokio::test]
+    async fn telegram_api_tool_posts_to_bot_api_and_returns_structured_payload() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buffer = [0_u8; 4096];
+            let read = stream.read(&mut buffer).await.expect("read request");
+            let request = String::from_utf8_lossy(&buffer[..read]);
+            assert!(request.contains("POST /bottelegram-token/sendMessage HTTP/1.1"));
+            assert!(request.contains("\"chat_id\":99"));
+            assert!(request.contains("\"text\":\"hello\""));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 51\r\nContent-Type: application/json\r\n\r\n{\"ok\":true,\"result\":{\"message_id\":321,\"text\":\"hi\"}}",
+                )
+                .await
+                .expect("write response");
+        });
+
+        let tool = TelegramApiTool::new(TelegramToolConfig {
+            bot_token: "telegram-token".into(),
+            default_chat_id: Some(99),
+            api_base_url: Some(format!("http://{addr}")),
+        });
+        let output = tool
+            .call(
+                ToolContext {
+                    conversation_id: ConversationId::new(),
+                    working_directory: None,
+                    elevated: false,
+                },
+                json!({
+                    "method": "sendMessage",
+                    "params": { "text": "hello" },
+                    "use_default_chat_id": true
+                }),
+            )
+            .await?;
+
+        server.await?;
+        assert!(output.content.contains("telegram `sendMessage` ok"));
+        assert_eq!(
+            output.structured,
+            Some(json!({
+                "ok": true,
+                "result": {
+                    "message_id": 321,
+                    "text": "hi"
+                }
+            }))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn tls_check_rejects_invalid_url() -> Result<()> {
         let policy = Arc::new(PolicyEngine::new(PolicyConfig::default()));
         let executor = Arc::new(LocalExecutor::new(
@@ -1955,5 +2616,96 @@ mod tests {
 
         assert!(matches!(err, ClawError::InvalidRequest(_)));
         Ok(())
+    }
+
+    #[test]
+    fn capability_summaries_sort_native_skill_and_mcp_entries() {
+        let tools = ToolRegistry::from_parts(
+            vec![
+                Arc::new(StubTool {
+                    spec: ToolSpec {
+                        name: "mcp.deploy.run".into(),
+                        description: "Remote deploy".into(),
+                        requires_approval: true,
+                        input_schema: json!({"type": "object"}),
+                    },
+                    capability_id: CapabilityId {
+                        kind: CapabilityKind::McpTool,
+                        name: "mcp.deploy.run".into(),
+                        source: Some("deploy".into()),
+                    },
+                }) as Arc<dyn Tool>,
+                Arc::new(StubTool {
+                    spec: ToolSpec {
+                        name: "read_file".into(),
+                        description: "Read a file".into(),
+                        requires_approval: false,
+                        input_schema: json!({"type": "object"}),
+                    },
+                    capability_id: CapabilityId {
+                        kind: CapabilityKind::NativeTool,
+                        name: "read_file".into(),
+                        source: None,
+                    },
+                }) as Arc<dyn Tool>,
+                Arc::new(StubTool {
+                    spec: ToolSpec {
+                        name: "skill.deploy".into(),
+                        description: "Deploy helper".into(),
+                        requires_approval: true,
+                        input_schema: json!({"type": "object"}),
+                    },
+                    capability_id: CapabilityId {
+                        kind: CapabilityKind::Skill,
+                        name: "skill.deploy".into(),
+                        source: Some("deploy".into()),
+                    },
+                }) as Arc<dyn Tool>,
+                Arc::new(StubTool {
+                    spec: ToolSpec {
+                        name: "tail_file".into(),
+                        description: "Tail a file".into(),
+                        requires_approval: false,
+                        input_schema: json!({"type": "object"}),
+                    },
+                    capability_id: CapabilityId {
+                        kind: CapabilityKind::NativeTool,
+                        name: "tail_file".into(),
+                        source: None,
+                    },
+                }) as Arc<dyn Tool>,
+            ],
+            vec![],
+        );
+
+        let summaries = tools.capability_summaries();
+        assert_eq!(summaries.len(), 4);
+        assert_eq!(summaries[0].id.name, "read_file");
+        assert_eq!(summaries[1].id.name, "tail_file");
+        assert_eq!(summaries[2].id.name, "skill.deploy");
+        assert_eq!(summaries[2].id.kind, CapabilityKind::Skill);
+        assert!(summaries[2].requires_approval);
+        assert_eq!(summaries[3].id.name, "mcp.deploy.run");
+        assert_eq!(summaries[3].id.kind, CapabilityKind::McpTool);
+    }
+
+    #[test]
+    fn with_mcp_servers_keeps_status_inventory() {
+        let statuses = vec![
+            McpServerStatus {
+                name: "deploy".into(),
+                connected: true,
+                tool_count: 2,
+                message: "connected".into(),
+            },
+            McpServerStatus {
+                name: "broken".into(),
+                connected: false,
+                tool_count: 0,
+                message: "startup failed".into(),
+            },
+        ];
+        let registry = ToolRegistry::from_parts(vec![], statuses.clone());
+        assert_eq!(registry.mcp_server_statuses(), statuses.as_slice());
     }
 }

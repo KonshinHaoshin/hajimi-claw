@@ -561,7 +561,7 @@ dependencies = [
 
 [[package]]
 name = "hajimi-claw"
-version = "0.1.1"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "hajimi-claw-daemon",
@@ -570,7 +570,7 @@ dependencies = [
 
 [[package]]
 name = "hajimi-claw-agent"
-version = "0.1.1"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -592,7 +592,7 @@ dependencies = [
 
 [[package]]
 name = "hajimi-claw-bot"
-version = "0.1.1"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "axum",
@@ -612,7 +612,7 @@ dependencies = [
 
 [[package]]
 name = "hajimi-claw-daemon"
-version = "0.1.1"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -626,6 +626,7 @@ dependencies = [
  "hajimi-claw-tools",
  "hajimi-claw-types",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
@@ -638,7 +639,7 @@ dependencies = [
 
 [[package]]
 name = "hajimi-claw-exec"
-version = "0.1.1"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -655,7 +656,7 @@ dependencies = [
 
 [[package]]
 name = "hajimi-claw-gateway"
-version = "0.1.1"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -669,6 +670,7 @@ dependencies = [
  "hajimi-claw-types",
  "reqwest",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
@@ -676,7 +678,7 @@ dependencies = [
 
 [[package]]
 name = "hajimi-claw-llm"
-version = "0.1.1"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -693,7 +695,7 @@ dependencies = [
 
 [[package]]
 name = "hajimi-claw-policy"
-version = "0.1.1"
+version = "0.1.4"
 dependencies = [
  "chrono",
  "hajimi-claw-types",
@@ -704,7 +706,7 @@ dependencies = [
 
 [[package]]
 name = "hajimi-claw-store"
-version = "0.1.1"
+version = "0.1.4"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -719,7 +721,7 @@ dependencies = [
 
 [[package]]
 name = "hajimi-claw-tools"
-version = "0.1.1"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -741,7 +743,7 @@ dependencies = [
 
 [[package]]
 name = "hajimi-claw-types"
-version = "0.1.1"
+version = "0.1.4"
 dependencies = [
  "async-trait",
  "chrono",

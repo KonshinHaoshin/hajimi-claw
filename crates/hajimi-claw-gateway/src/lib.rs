@@ -8,11 +8,12 @@ use hajimi_claw_llm::{list_models, test_provider};
 use hajimi_claw_policy::PolicyEngine;
 use hajimi_claw_store::Store;
 use hajimi_claw_types::{
-    ClawError, ClawResult, OnboardingSession, OnboardingStep, ProviderConfig, ProviderDraft,
-    ProviderKind, ProviderRecord,
+    ClawError, ClawResult, ConversationId, OnboardingSession, OnboardingStep, ProviderCapabilities,
+    ProviderConfig, ProviderDraft, ProviderKind, ProviderRecord,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::sync::RwLock;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,7 +24,9 @@ pub enum GatewayCommand {
     ShellExec(String),
     ShellClose,
     Status,
+    NewConversation,
     Approve(String),
+    ElevatedMenu,
     ElevatedOn,
     ElevatedOff,
     ElevatedAsk,
@@ -46,6 +49,11 @@ pub enum GatewayCommand {
     AgentsOff,
     AgentsAuto,
     AgentsStatus,
+    Capabilities,
+    Skills,
+    SkillRun { name: String, input: String },
+    Mcp,
+    McpTools(Option<String>),
     PersonaGuide,
     PersonaList,
     PersonaRead(String),
@@ -63,6 +71,7 @@ pub struct GatewayRequest {
     pub raw_text: String,
     pub command: GatewayCommand,
     pub current_session_id: Option<String>,
+    pub current_conversation_id: Option<ConversationId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,10 +81,18 @@ pub enum SessionDirective {
     Clear,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConversationDirective {
+    Keep,
+    Set(ConversationId),
+    Clear,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewayResponse {
     pub text: String,
     pub session: SessionDirective,
+    pub conversation: ConversationDirective,
     pub keyboard: Option<InlineKeyboard>,
 }
 
@@ -193,12 +210,21 @@ impl Gateway for InProcessGateway {
                     .resolve_provider_for_chat(request.actor_chat_id)
                     .map_err(store_error)?
                     .map(|record| record.config.id);
+                let reply = self
+                    .runtime
+                    .ask_with_provider_and_preference_and_session_and_conversation(
+                        &prompt,
+                        None,
+                        provider_id,
+                        preference,
+                        request.current_conversation_id,
+                        request.current_session_id.clone(),
+                    )
+                    .await?;
                 Ok(GatewayResponse {
-                    text: self
-                        .runtime
-                        .ask_with_provider_and_preference(&prompt, None, provider_id, preference)
-                        .await?,
+                    text: reply.message,
                     session: SessionDirective::Keep,
+                    conversation: ConversationDirective::Set(reply.conversation_id),
                     keyboard: None,
                 })
             }
@@ -207,6 +233,7 @@ impl Gateway for InProcessGateway {
                 Ok(GatewayResponse {
                     text: reply.message,
                     session: SessionDirective::Set(reply.session_id),
+                    conversation: ConversationDirective::Keep,
                     keyboard: None,
                 })
             }
@@ -217,6 +244,7 @@ impl Gateway for InProcessGateway {
                 Ok(GatewayResponse {
                     text: self.runtime.shell_exec(&session_id, &command).await?,
                     session: SessionDirective::Keep,
+                    conversation: ConversationDirective::Keep,
                     keyboard: None,
                 })
             }
@@ -227,6 +255,7 @@ impl Gateway for InProcessGateway {
                 Ok(GatewayResponse {
                     text: self.runtime.shell_status(&session_id).await?,
                     session: SessionDirective::Keep,
+                    conversation: ConversationDirective::Keep,
                     keyboard: None,
                 })
             }
@@ -237,17 +266,40 @@ impl Gateway for InProcessGateway {
                 Ok(GatewayResponse {
                     text: self.runtime.shell_close(&session_id).await?,
                     session: SessionDirective::Clear,
+                    conversation: ConversationDirective::Keep,
                     keyboard: None,
                 })
             }
+            GatewayCommand::NewConversation => Ok(GatewayResponse {
+                text: "started a new conversation".into(),
+                session: SessionDirective::Keep,
+                conversation: ConversationDirective::Clear,
+                keyboard: None,
+            }),
             GatewayCommand::Status => Ok(text_response(&self.runtime.status()?)),
             GatewayCommand::Approve(request_id) => {
-                Ok(text_response(&self.runtime.approve(&request_id)?))
+                Ok(text_response(&self.runtime.approve(&request_id).await?))
             }
-            GatewayCommand::ElevatedOn => Ok(text_response(&self.runtime.enable_elevated())),
-            GatewayCommand::ElevatedOff => Ok(text_response(&self.runtime.stop_elevated())),
-            GatewayCommand::ElevatedAsk => Ok(text_response(&self.runtime.enable_approval_mode())),
-            GatewayCommand::ElevatedFull => Ok(text_response(&self.runtime.enable_full_elevated())),
+            GatewayCommand::ElevatedMenu => Ok(text_response_with_keyboard(
+                &elevated_menu_text(),
+                Some(elevated_keyboard()),
+            )),
+            GatewayCommand::ElevatedOn => Ok(text_response_with_keyboard(
+                &self.runtime.enable_elevated(),
+                Some(elevated_keyboard()),
+            )),
+            GatewayCommand::ElevatedOff => Ok(text_response_with_keyboard(
+                &self.runtime.stop_elevated(),
+                Some(elevated_keyboard()),
+            )),
+            GatewayCommand::ElevatedAsk => Ok(text_response_with_keyboard(
+                &self.runtime.enable_approval_mode(),
+                Some(elevated_keyboard()),
+            )),
+            GatewayCommand::ElevatedFull => Ok(text_response_with_keyboard(
+                &self.runtime.enable_full_elevated(),
+                Some(elevated_keyboard()),
+            )),
             GatewayCommand::Cancel(task_id) => Ok(text_response(&format!(
                 "cancel is not implemented yet for task {task_id}"
             ))),
@@ -289,6 +341,41 @@ impl Gateway for InProcessGateway {
                     .await
             }
             GatewayCommand::AgentsStatus => self.agents_status(request.actor_chat_id).await,
+            GatewayCommand::Capabilities => Ok(text_response_with_keyboard(
+                &self.runtime.render_capability_inventory(),
+                Some(capabilities_keyboard()),
+            )),
+            GatewayCommand::Skills => Ok(text_response_with_keyboard(
+                &self.runtime.render_skill_inventory(),
+                Some(skills_keyboard()),
+            )),
+            GatewayCommand::SkillRun { name, input } => {
+                let parsed = parse_skill_input(&input)?;
+                let reply = self
+                    .runtime
+                    .invoke_skill(
+                        &name,
+                        parsed,
+                        None,
+                        request.current_conversation_id,
+                        request.current_session_id.clone(),
+                    )
+                    .await?;
+                Ok(GatewayResponse {
+                    text: reply.message,
+                    session: SessionDirective::Keep,
+                    conversation: ConversationDirective::Set(reply.conversation_id),
+                    keyboard: None,
+                })
+            }
+            GatewayCommand::Mcp => Ok(text_response_with_keyboard(
+                &self.runtime.render_mcp_inventory(),
+                Some(mcp_keyboard()),
+            )),
+            GatewayCommand::McpTools(server) => Ok(text_response_with_keyboard(
+                &self.runtime.render_mcp_tool_inventory(server.as_deref()),
+                Some(mcp_keyboard()),
+            )),
             GatewayCommand::PersonaGuide => Ok(text_response_with_keyboard(
                 &persona_guide_text(),
                 Some(persona_guide_keyboard()),
@@ -713,8 +800,29 @@ pub fn parse_gateway_command(text: &str) -> GatewayCommand {
     if trimmed == "/model use" {
         return GatewayCommand::ModelPicker;
     }
+    if trimmed == "/capabilities" {
+        return GatewayCommand::Capabilities;
+    }
+    if trimmed == "/skills" {
+        return GatewayCommand::Skills;
+    }
+    if trimmed == "/mcp" {
+        return GatewayCommand::Mcp;
+    }
     if let Some(rest) = trimmed.strip_prefix("/model use ") {
         return GatewayCommand::ModelUse(rest.trim().into());
+    }
+    if let Some(rest) = trimmed.strip_prefix("/skill run ") {
+        if let Some((name, input)) = split_file_and_content(rest.trim()) {
+            return GatewayCommand::SkillRun { name, input };
+        }
+    }
+    if trimmed == "/mcp tools" {
+        return GatewayCommand::McpTools(None);
+    }
+    if let Some(rest) = trimmed.strip_prefix("/mcp tools ") {
+        let server = rest.trim();
+        return GatewayCommand::McpTools((!server.is_empty()).then(|| server.to_string()));
     }
     if trimmed == "/persona list" {
         return GatewayCommand::PersonaList;
@@ -757,6 +865,9 @@ pub fn parse_gateway_command(text: &str) -> GatewayCommand {
     if let Some(rest) = trimmed.strip_prefix("/approve ") {
         return GatewayCommand::Approve(rest.trim().into());
     }
+    if trimmed == "/elevated" {
+        return GatewayCommand::ElevatedMenu;
+    }
     if trimmed == "/elevated on" {
         return GatewayCommand::ElevatedOn;
     }
@@ -771,6 +882,9 @@ pub fn parse_gateway_command(text: &str) -> GatewayCommand {
     }
     if trimmed == "/shell close" {
         return GatewayCommand::ShellClose;
+    }
+    if trimmed == "/new" {
+        return GatewayCommand::NewConversation;
     }
     if trimmed == "/shell status" {
         return GatewayCommand::ShellStatus;
@@ -809,6 +923,11 @@ pub fn help_text() -> String {
         "/provider set-model <provider-id> <model>",
         "/model current",
         "/model use [model]",
+        "/capabilities",
+        "/skills",
+        "/skill run <name> <json-or-text>",
+        "/mcp",
+        "/mcp tools [server]",
         "/agents on",
         "/agents off",
         "/agents auto",
@@ -822,9 +941,11 @@ pub fn help_text() -> String {
         "/shell status",
         "/shell exec <cmd>",
         "/shell close",
+        "/new",
         "/status",
         "/menu",
         "/approve <request-id>",
+        "/elevated",
         "/elevated on",
         "/elevated off",
         "/elevated ask",
@@ -846,6 +967,14 @@ fn ensure_provider_exists(store: &Store, provider_id: &str) -> ClawResult<()> {
         )));
     }
     Ok(())
+}
+
+fn parse_skill_input(raw: &str) -> ClawResult<Value> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    serde_json::from_str(trimmed).or_else(|_| Ok(serde_json::json!({ "input": trimmed })))
 }
 
 fn finalize_provider(draft: ProviderDraft) -> ClawResult<ProviderConfig> {
@@ -873,6 +1002,7 @@ fn finalize_provider(draft: ProviderDraft) -> ClawResult<ProviderConfig> {
         api_key,
         model,
         fallback_models: draft.fallback_models.unwrap_or_default(),
+        capabilities: default_provider_capabilities(),
         enabled: true,
         extra_headers: vec![],
         created_at: Utc::now(),
@@ -886,6 +1016,15 @@ fn parse_provider_kind(raw: &str) -> ClawResult<ProviderKind> {
         _ => Err(ClawError::InvalidRequest(
             "provider kind must be `openai-compatible` or `custom-chat-completions`".into(),
         )),
+    }
+}
+
+fn default_provider_capabilities() -> ProviderCapabilities {
+    ProviderCapabilities {
+        tool_calling: true,
+        streaming: false,
+        json_mode: false,
+        max_context_chars: Some(24_000),
     }
 }
 
@@ -928,6 +1067,7 @@ fn text_response(text: &str) -> GatewayResponse {
     GatewayResponse {
         text: text.to_string(),
         session: SessionDirective::Keep,
+        conversation: ConversationDirective::Keep,
         keyboard: None,
     }
 }
@@ -936,6 +1076,7 @@ fn text_response_with_keyboard(text: &str, keyboard: Option<InlineKeyboard>) -> 
     GatewayResponse {
         text: text.to_string(),
         session: SessionDirective::Keep,
+        conversation: ConversationDirective::Keep,
         keyboard,
     }
 }
@@ -997,8 +1138,132 @@ fn main_menu_keyboard() -> InlineKeyboard {
                     data: "/provider list".into(),
                 },
                 InlineButton {
+                    text: "Skills".into(),
+                    data: "/skills".into(),
+                },
+                InlineButton {
+                    text: "MCP".into(),
+                    data: "/mcp".into(),
+                },
+                InlineButton {
+                    text: "Capabilities".into(),
+                    data: "/capabilities".into(),
+                },
+            ],
+            vec![
+                InlineButton {
+                    text: "New".into(),
+                    data: "/new".into(),
+                },
+                InlineButton {
+                    text: "Elevated".into(),
+                    data: "/elevated".into(),
+                },
+                InlineButton {
                     text: "Persona".into(),
                     data: "/persona guide".into(),
+                },
+            ],
+        ],
+    }
+}
+
+fn elevated_menu_text() -> String {
+    [
+        "elevated controls",
+        "",
+        "`/elevated ask` = default guarded mode. Sensitive actions stop for approval.",
+        "`/elevated on` = temporary elevated lease for guarded and dangerous commands.",
+        "`/elevated full` = full local bypass for workdir, writable path, Windows safe allowlist, and sensitive env checks.",
+        "`/elevated off` = disable any active elevated lease.",
+    ]
+    .join("\n")
+}
+
+fn capabilities_keyboard() -> InlineKeyboard {
+    InlineKeyboard {
+        rows: vec![
+            vec![
+                InlineButton {
+                    text: "Skills".into(),
+                    data: "/skills".into(),
+                },
+                InlineButton {
+                    text: "MCP".into(),
+                    data: "/mcp".into(),
+                },
+            ],
+            vec![InlineButton {
+                text: "Back to menu".into(),
+                data: "/menu".into(),
+            }],
+        ],
+    }
+}
+
+fn skills_keyboard() -> InlineKeyboard {
+    InlineKeyboard {
+        rows: vec![
+            vec![
+                InlineButton {
+                    text: "Capabilities".into(),
+                    data: "/capabilities".into(),
+                },
+                InlineButton {
+                    text: "MCP tools".into(),
+                    data: "/mcp tools".into(),
+                },
+            ],
+            vec![InlineButton {
+                text: "Back to menu".into(),
+                data: "/menu".into(),
+            }],
+        ],
+    }
+}
+
+fn mcp_keyboard() -> InlineKeyboard {
+    InlineKeyboard {
+        rows: vec![
+            vec![
+                InlineButton {
+                    text: "MCP tools".into(),
+                    data: "/mcp tools".into(),
+                },
+                InlineButton {
+                    text: "Capabilities".into(),
+                    data: "/capabilities".into(),
+                },
+            ],
+            vec![InlineButton {
+                text: "Back to menu".into(),
+                data: "/menu".into(),
+            }],
+        ],
+    }
+}
+
+fn elevated_keyboard() -> InlineKeyboard {
+    InlineKeyboard {
+        rows: vec![
+            vec![
+                InlineButton {
+                    text: "Ask".into(),
+                    data: "/elevated ask".into(),
+                },
+                InlineButton {
+                    text: "On".into(),
+                    data: "/elevated on".into(),
+                },
+            ],
+            vec![
+                InlineButton {
+                    text: "Full".into(),
+                    data: "/elevated full".into(),
+                },
+                InlineButton {
+                    text: "Off".into(),
+                    data: "/elevated off".into(),
                 },
             ],
         ],
@@ -1009,15 +1274,31 @@ fn persona_guide_text() -> String {
     [
         "persona guide",
         "",
-        "`identity.md` = who the user is, what systems they own, and standing preferences.",
-        "`soul.md` = Hajimi's personality. It is preseeded as a concise cat AI assistant.",
-        "`heartbeat.md` = daemon heartbeat config.",
+        "Layer model:",
+        "1. base system prompt",
+        "2. `identity.md` = who the user is, owned systems, environments, durable preferences, and hard constraints",
+        "3. `soul.md` = Hajimi's stable role, tone, style, and behavioral stance",
+        "4. `agents.md` / `AGENTS.md` / `tools.md` / `skills.md` = operational extensions for delegation, tools, workflows, and repo guidance",
+        "5. runtime overlays like shell-session metadata and multi-agent role instructions",
+        "",
+        "Precedence:",
+        "- auto-discovery loads `persona.directory`, then the config directory, then the current working directory",
+        "- higher-precedence files override structured `identity.md` / `soul.md` fields while preserving accumulated notes",
+        "- extensions stay additive in precedence order",
+        "- if `[persona].prompt_files` is set, that explicit list is used instead",
+        "",
+        "Parsing:",
+        "- `identity.md` and `soul.md` support optional front matter, but plain markdown still works",
+        "- malformed front matter safely falls back to legacy markdown behavior",
+        "- `heartbeat.md` is runtime config only and never enters the prompt",
         "",
         "Heartbeat format example:",
         "`enabled: true`",
         "`interval_secs: 30`",
         "",
         "Useful commands:",
+        "`/persona list`",
+        "`/persona read identity`",
         "`/persona read soul`",
         "`/persona write identity You are helping Alice maintain two Linux VPS nodes.`",
         "`/persona write soul You are Hajimi, a calm cat AI ops assistant.`",
@@ -1200,12 +1481,40 @@ mod tests {
     use hajimi_claw_policy::PolicyEngine;
     use hajimi_claw_store::Store;
     use hajimi_claw_tools::ToolRegistry;
+    use hajimi_claw_types::{
+        CapabilityId, CapabilityKind, ClawResult, Tool, ToolContext, ToolOutput, ToolSpec,
+    };
     use tempfile::tempdir;
 
     use super::{
         Gateway, GatewayCommand, GatewayRequest, InProcessGateway, SessionDirective,
         parse_gateway_command,
     };
+
+    struct StubSkillTool {
+        spec: ToolSpec,
+        capability_id: CapabilityId,
+        output: ToolOutput,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for StubSkillTool {
+        fn spec(&self) -> ToolSpec {
+            self.spec.clone()
+        }
+
+        fn capability_id(&self) -> CapabilityId {
+            self.capability_id.clone()
+        }
+
+        async fn call(
+            &self,
+            _ctx: ToolContext,
+            _input: serde_json::Value,
+        ) -> ClawResult<ToolOutput> {
+            Ok(self.output.clone())
+        }
+    }
 
     #[test]
     fn parses_provider_test_command() {
@@ -1279,10 +1588,103 @@ mod tests {
     }
 
     #[test]
+    fn parses_capability_commands() {
+        assert_eq!(
+            parse_gateway_command("/capabilities"),
+            GatewayCommand::Capabilities
+        );
+        assert_eq!(parse_gateway_command("/skills"), GatewayCommand::Skills);
+        assert_eq!(parse_gateway_command("/mcp"), GatewayCommand::Mcp);
+        assert_eq!(
+            parse_gateway_command("/mcp tools demo"),
+            GatewayCommand::McpTools(Some("demo".into()))
+        );
+        assert_eq!(
+            parse_gateway_command("/skill run skill.deploy {\"service\":\"api\"}"),
+            GatewayCommand::SkillRun {
+                name: "skill.deploy".into(),
+                input: "{\"service\":\"api\"}".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn persona_guide_mentions_layered_persona_model() {
+        let guide = super::persona_guide_text();
+        assert!(guide.contains("Layer model:"));
+        assert!(guide.contains("`identity.md`"));
+        assert!(guide.contains("`soul.md`"));
+        assert!(
+            guide.contains("`heartbeat.md` is runtime config only and never enters the prompt")
+        );
+        assert!(guide.contains("`/persona list`"));
+    }
+
+    #[test]
+    fn help_text_mentions_capability_commands() {
+        let help = super::help_text();
+        assert!(help.contains("/capabilities"));
+        assert!(help.contains("/skills"));
+        assert!(help.contains("/skill run <name> <json-or-text>"));
+        assert!(help.contains("/mcp"));
+        assert!(help.contains("/mcp tools [server]"));
+    }
+
+    #[test]
+    fn parse_skill_input_supports_json_text_and_empty() {
+        assert_eq!(
+            super::parse_skill_input("{\"service\":\"api\"}").unwrap(),
+            serde_json::json!({ "service": "api" })
+        );
+        assert_eq!(
+            super::parse_skill_input(" deploy api ").unwrap(),
+            serde_json::json!({ "input": "deploy api" })
+        );
+        assert_eq!(
+            super::parse_skill_input("   ").unwrap(),
+            serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn capability_keyboards_link_related_views() {
+        let capabilities = super::capabilities_keyboard();
+        assert_eq!(capabilities.rows[0][0].data, "/skills");
+        assert_eq!(capabilities.rows[0][1].data, "/mcp");
+        assert_eq!(capabilities.rows[1][0].data, "/menu");
+
+        let skills = super::skills_keyboard();
+        assert_eq!(skills.rows[0][0].data, "/capabilities");
+        assert_eq!(skills.rows[0][1].data, "/mcp tools");
+        assert_eq!(skills.rows[1][0].data, "/menu");
+
+        let mcp = super::mcp_keyboard();
+        assert_eq!(mcp.rows[0][0].data, "/mcp tools");
+        assert_eq!(mcp.rows[0][1].data, "/capabilities");
+        assert_eq!(mcp.rows[1][0].data, "/menu");
+    }
+
+    #[test]
     fn parses_shell_status_command() {
         assert_eq!(
             parse_gateway_command("/shell status"),
             GatewayCommand::ShellStatus
+        );
+    }
+
+    #[test]
+    fn parses_elevated_menu_command() {
+        assert_eq!(
+            parse_gateway_command("/elevated"),
+            GatewayCommand::ElevatedMenu
+        );
+    }
+
+    #[test]
+    fn parses_new_conversation_command() {
+        assert_eq!(
+            parse_gateway_command("/new"),
+            GatewayCommand::NewConversation
         );
     }
 
@@ -1314,6 +1716,7 @@ mod tests {
                 raw_text: "/shell open ops".into(),
                 command: GatewayCommand::ShellOpen(Some("ops".into())),
                 current_session_id: None,
+                current_conversation_id: None,
             })
             .await?;
         assert!(matches!(response.session, SessionDirective::Set(_)));
@@ -1348,6 +1751,7 @@ mod tests {
                 raw_text: "/onboard".into(),
                 command: GatewayCommand::Onboard,
                 current_session_id: None,
+                current_conversation_id: None,
             })
             .await?;
         assert!(response.text.contains("Step 1/5"));
@@ -1378,6 +1782,12 @@ mod tests {
                 api_key: "secret".into(),
                 model: "gpt-5.1".into(),
                 fallback_models: vec![],
+                capabilities: hajimi_claw_types::ProviderCapabilities {
+                    tool_calling: true,
+                    streaming: false,
+                    json_mode: false,
+                    max_context_chars: Some(24_000),
+                },
                 enabled: true,
                 extra_headers: vec![],
                 created_at: chrono::Utc::now(),
@@ -1398,8 +1808,45 @@ mod tests {
                 raw_text: "/provider current".into(),
                 command: GatewayCommand::ProviderCurrent,
                 current_session_id: None,
+                current_conversation_id: None,
             })
             .await?;
+        assert!(response.keyboard.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn elevated_menu_returns_keyboard() -> Result<()> {
+        let dir = tempdir()?;
+        let mut config = hajimi_claw_policy::PolicyConfig::default();
+        config.allowed_workdirs = vec![dir.path().to_path_buf(), std::env::current_dir()?];
+        config.admin_user_id = 1;
+        config.admin_chat_id = 2;
+        let policy = Arc::new(PolicyEngine::new(config));
+        let executor = Arc::new(LocalExecutor::new(
+            policy.clone(),
+            PlatformMode::WindowsSafe,
+        ));
+        let tools = Arc::new(ToolRegistry::default(executor, policy.clone()));
+        let store = Arc::new(Store::open_in_memory()?);
+        let runtime = Arc::new(AgentRuntime::for_tests(
+            tools,
+            store.clone(),
+            policy.clone(),
+        ));
+        let gateway = InProcessGateway::new(runtime, policy, store);
+
+        let response = gateway
+            .handle(GatewayRequest {
+                actor_user_id: 1,
+                actor_chat_id: 2,
+                raw_text: "/elevated".into(),
+                command: GatewayCommand::ElevatedMenu,
+                current_session_id: None,
+                current_conversation_id: None,
+            })
+            .await?;
+        assert!(response.text.contains("elevated controls"));
         assert!(response.keyboard.is_some());
         Ok(())
     }
@@ -1432,6 +1879,7 @@ mod tests {
                 raw_text: "/agents on".into(),
                 command: GatewayCommand::AgentsOn,
                 current_session_id: None,
+                current_conversation_id: None,
             })
             .await?;
 
@@ -1442,11 +1890,169 @@ mod tests {
                 raw_text: "你好".into(),
                 command: GatewayCommand::Ask("你好".into()),
                 current_session_id: None,
+                current_conversation_id: None,
             })
             .await
             .expect("preview should exist");
         assert!(preview.text.contains("agents"));
         assert!(preview.keyboard.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn capability_views_return_expected_keyboards() -> Result<()> {
+        let dir = tempdir()?;
+        let mut config = hajimi_claw_policy::PolicyConfig::default();
+        config.allowed_workdirs = vec![dir.path().to_path_buf(), std::env::current_dir()?];
+        config.admin_user_id = 1;
+        config.admin_chat_id = 2;
+        let policy = Arc::new(PolicyEngine::new(config));
+        let executor = Arc::new(LocalExecutor::new(
+            policy.clone(),
+            PlatformMode::WindowsSafe,
+        ));
+        let _ = executor;
+        let tools = Arc::new(ToolRegistry::from_parts(
+            vec![],
+            vec![
+                hajimi_claw_types::McpServerStatus {
+                    name: "deploy".into(),
+                    connected: true,
+                    tool_count: 1,
+                    message: "connected".into(),
+                },
+                hajimi_claw_types::McpServerStatus {
+                    name: "broken".into(),
+                    connected: false,
+                    tool_count: 0,
+                    message: "initialize failed".into(),
+                },
+            ],
+        ));
+        let store = Arc::new(Store::open_in_memory()?);
+        let runtime = Arc::new(AgentRuntime::for_tests(
+            tools,
+            store.clone(),
+            policy.clone(),
+        ));
+        let gateway = InProcessGateway::new(runtime, policy, store);
+
+        let capabilities = gateway
+            .handle(GatewayRequest {
+                actor_user_id: 1,
+                actor_chat_id: 2,
+                raw_text: "/capabilities".into(),
+                command: GatewayCommand::Capabilities,
+                current_session_id: None,
+                current_conversation_id: None,
+            })
+            .await?;
+        assert!(capabilities.text.contains("capability inventory"));
+        assert_eq!(capabilities.keyboard, Some(super::capabilities_keyboard()));
+
+        let skills = gateway
+            .handle(GatewayRequest {
+                actor_user_id: 1,
+                actor_chat_id: 2,
+                raw_text: "/skills".into(),
+                command: GatewayCommand::Skills,
+                current_session_id: None,
+                current_conversation_id: None,
+            })
+            .await?;
+        assert!(skills.text.contains("skills"));
+        assert_eq!(skills.keyboard, Some(super::skills_keyboard()));
+
+        let mcp = gateway
+            .handle(GatewayRequest {
+                actor_user_id: 1,
+                actor_chat_id: 2,
+                raw_text: "/mcp".into(),
+                command: GatewayCommand::Mcp,
+                current_session_id: None,
+                current_conversation_id: None,
+            })
+            .await?;
+        assert!(mcp.text.contains("mcp servers"));
+        assert!(mcp.text.contains("deploy [connected] tools=1 connected"));
+        assert!(
+            mcp.text
+                .contains("broken [disconnected] tools=0 initialize failed")
+        );
+        assert_eq!(mcp.keyboard, Some(super::mcp_keyboard()));
+
+        let mcp_tools = gateway
+            .handle(GatewayRequest {
+                actor_user_id: 1,
+                actor_chat_id: 2,
+                raw_text: "/mcp tools deploy".into(),
+                command: GatewayCommand::McpTools(Some("deploy".into())),
+                current_session_id: None,
+                current_conversation_id: None,
+            })
+            .await?;
+        assert!(mcp_tools.text.contains("mcp tools for `deploy`"));
+        assert!(mcp_tools.text.contains("(no mcp tools available)"));
+        assert_eq!(mcp_tools.keyboard, Some(super::mcp_keyboard()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skill_run_invokes_runtime_and_sets_conversation() -> Result<()> {
+        let dir = tempdir()?;
+        let mut config = hajimi_claw_policy::PolicyConfig::default();
+        config.allowed_workdirs = vec![dir.path().to_path_buf(), std::env::current_dir()?];
+        config.admin_user_id = 1;
+        config.admin_chat_id = 2;
+        let policy = Arc::new(PolicyEngine::new(config));
+        let tools = Arc::new(ToolRegistry::from_parts(
+            vec![Arc::new(StubSkillTool {
+                spec: ToolSpec {
+                    name: "skill.deploy".into(),
+                    description: "Deploy app".into(),
+                    requires_approval: false,
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+                capability_id: CapabilityId {
+                    kind: CapabilityKind::Skill,
+                    name: "skill.deploy".into(),
+                    source: Some("deploy".into()),
+                },
+                output: ToolOutput {
+                    content: "deploy ok".into(),
+                    structured: None,
+                },
+            }) as Arc<dyn Tool>],
+            vec![],
+        ));
+        let store = Arc::new(Store::open_in_memory()?);
+        let runtime = Arc::new(AgentRuntime::for_tests(
+            tools,
+            store.clone(),
+            policy.clone(),
+        ));
+        let gateway = InProcessGateway::new(runtime, policy, store);
+
+        let response = gateway
+            .handle(GatewayRequest {
+                actor_user_id: 1,
+                actor_chat_id: 2,
+                raw_text: "/skill run skill.deploy deploy api".into(),
+                command: GatewayCommand::SkillRun {
+                    name: "skill.deploy".into(),
+                    input: "deploy api".into(),
+                },
+                current_session_id: None,
+                current_conversation_id: None,
+            })
+            .await?;
+        assert_eq!(response.text, "deploy ok");
+        assert!(matches!(response.session, SessionDirective::Keep));
+        assert!(matches!(
+            response.conversation,
+            super::ConversationDirective::Set(_)
+        ));
+        assert!(response.keyboard.is_none());
         Ok(())
     }
 }

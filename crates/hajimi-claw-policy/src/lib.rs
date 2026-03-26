@@ -123,6 +123,14 @@ impl PolicyEngine {
         matches!(self.current_mode(), PolicyMode::ElevatedLease)
     }
 
+    pub fn is_full_elevated(&self) -> bool {
+        let state = self.state.read().expect("policy state poisoned");
+        state
+            .elevated_lease
+            .as_ref()
+            .is_some_and(|lease| lease.expires_at.is_none())
+    }
+
     pub fn request_elevation(&self, minutes: i64, reason: String) -> ApprovalRequest {
         let request = ApprovalRequest {
             request_id: ApprovalId::new(),
@@ -150,6 +158,15 @@ impl PolicyEngine {
             });
         }
         Some(request)
+    }
+
+    pub fn get_approval(&self, request_id: ApprovalId) -> Option<ApprovalRequest> {
+        self.state
+            .read()
+            .expect("policy state poisoned")
+            .approvals
+            .get(&request_id)
+            .cloned()
     }
 
     pub fn enable_elevation(&self, minutes: i64, reason: String) {
@@ -224,7 +241,7 @@ impl PolicyEngine {
             }
         }
 
-        if is_sensitive_env(&req.env_allowlist) {
+        if !self.is_full_elevated() && is_sensitive_env(&req.env_allowlist) {
             return PolicyDecision::Deny("sensitive env vars cannot be inherited".into());
         }
 
@@ -263,6 +280,12 @@ impl PolicyEngine {
             .iter()
             .any(|pattern| pattern.is_match(&rendered))
         {
+            if self.is_elevated() {
+                return PolicyDecision::Allow {
+                    risk: RiskLevel::Guarded,
+                    mode: PolicyMode::ElevatedLease,
+                };
+            }
             let approval = ApprovalRequest {
                 request_id: ApprovalId::new(),
                 reason: "guarded command requires explicit approval".into(),
@@ -296,6 +319,9 @@ impl PolicyEngine {
     }
 
     pub fn is_allowed_workdir(&self, path: &Path) -> bool {
+        if self.is_full_elevated() {
+            return true;
+        }
         normalize(path).is_some_and(|candidate| {
             self.config
                 .allowed_workdirs
@@ -305,6 +331,9 @@ impl PolicyEngine {
     }
 
     pub fn is_writable_workdir(&self, path: &Path) -> bool {
+        if self.is_full_elevated() {
+            return true;
+        }
         normalize(path).is_some_and(|candidate| {
             self.config
                 .writable_workdirs
@@ -363,6 +392,7 @@ mod tests {
             timeout_secs: 30,
             max_output_bytes: 1024,
             requires_tty: false,
+            stdin: None,
         }
     }
 
@@ -402,6 +432,26 @@ mod tests {
             engine.evaluate_exec(&request),
             PolicyDecision::Allow { .. }
         ));
+    }
+
+    #[test]
+    fn full_elevation_allows_disallowed_workdir_and_sensitive_env() {
+        let engine = PolicyEngine::new(PolicyConfig {
+            allowed_workdirs: vec![PathBuf::from("C:/allowed")],
+            ..PolicyConfig::default()
+        });
+        let mut request = sample_request("powershell", &["-Command", "Get-ChildItem"]);
+        request.cwd = Some(PathBuf::from("C:/Windows/System32"));
+        request.env_allowlist = vec!["OPENAI_API_KEY".into()];
+
+        engine.enable_full_elevation("manual override".into());
+
+        assert!(matches!(
+            engine.evaluate_exec(&request),
+            PolicyDecision::Allow { .. }
+        ));
+        assert!(engine.is_allowed_workdir(PathBuf::from("C:/Windows/System32").as_path()));
+        assert!(engine.is_writable_workdir(PathBuf::from("C:/Windows/System32").as_path()));
     }
 
     #[test]

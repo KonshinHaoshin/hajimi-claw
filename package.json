@@ -1,6 +1,6 @@
 {
   "name": "hajimi-claw",
-  "version": "0.1.2",
+  "version": "0.1.4",
   "description": "Single-user Telegram-first ops agent in Rust",
   "bin": {
     "hajimi": "bin/hajimi-claw.js",
@@ -12,10 +12,10 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "hajimi-claw-linux-arm64-gnu": "0.1.2",
-    "hajimi-claw-linux-x64-gnu": "0.1.2",
-    "hajimi-claw-win32-arm64-msvc": "0.1.2",
-    "hajimi-claw-win32-x64-msvc": "0.1.2"
+    "hajimi-claw-linux-arm64-gnu": "0.1.3",
+    "hajimi-claw-linux-x64-gnu": "0.1.3",
+    "hajimi-claw-win32-arm64-msvc": "0.1.3",
+    "hajimi-claw-win32-x64-msvc": "0.1.3"
   },
   "files": [
     "bin",

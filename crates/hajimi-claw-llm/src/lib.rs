@@ -444,8 +444,8 @@ mod tests {
     use futures::TryStreamExt;
     use hajimi_claw_store::Store;
     use hajimi_claw_types::{
-        AgentRequest, ConversationId, ConversationMessage, LlmBackend, MessageRole, ProviderConfig,
-        ProviderKind, ProviderRecord,
+        AgentRequest, ConversationId, ConversationMessage, LlmBackend, MessageRole,
+        ProviderCapabilities, ProviderConfig, ProviderKind, ProviderRecord,
     };
 
     use super::{StaticBackend, StoreBackedBackend};
@@ -509,6 +509,12 @@ mod tests {
                     api_key: "secret".into(),
                     model: "gpt-demo".into(),
                     fallback_models: vec![],
+                    capabilities: ProviderCapabilities {
+                        tool_calling: true,
+                        streaming: false,
+                        json_mode: false,
+                        max_context_chars: Some(24_000),
+                    },
                     enabled: true,
                     extra_headers: vec![],
                     created_at: Utc::now(),

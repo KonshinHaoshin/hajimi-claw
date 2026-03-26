@@ -39,6 +39,10 @@ npm/platforms/*/bin/hajimi-claw.exe
 
 # Local persona / runtime home
 .hajimi/
+target-alt/
 
 # Local private notes
 .release-local.md
+
+CLAUDE.md
+.claude/

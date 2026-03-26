@@ -1,6 +1,6 @@
 {
   "name": "hajimi-claw-win32-x64-msvc",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Prebuilt Windows x64 binary for hajimi-claw",
   "os": [
     "win32"
