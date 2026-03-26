@@ -392,6 +392,7 @@ mod tests {
             timeout_secs: 30,
             max_output_bytes: 1024,
             requires_tty: false,
+            stdin: None,
         }
     }
 

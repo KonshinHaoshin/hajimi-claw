@@ -348,6 +348,7 @@ impl Store {
                 conversation_id: parse_conversation_id(row.get::<_, String>(1)?),
                 kind: match row.get::<_, String>(2)?.as_str() {
                     "PersistentShellTask" => TaskKind::PersistentShellTask,
+                    "DirectToolTask" => TaskKind::DirectToolTask,
                     _ => TaskKind::EphemeralAgentTask,
                 },
                 description: row.get(3)?,
@@ -386,6 +387,7 @@ impl Store {
                         conversation_id: parse_conversation_id(row.get::<_, String>(1)?),
                         kind: match row.get::<_, String>(2)?.as_str() {
                             "PersistentShellTask" => TaskKind::PersistentShellTask,
+                            "DirectToolTask" => TaskKind::DirectToolTask,
                             _ => TaskKind::EphemeralAgentTask,
                         },
                         description: row.get(3)?,
@@ -1167,7 +1169,7 @@ mod tests {
     use chrono::Utc;
     use hajimi_claw_types::{
         ConversationMessage, HeartbeatStatus, MessageRole, ProviderCapabilities, ProviderConfig,
-        ProviderKind, ProviderRecord,
+        ProviderKind, ProviderRecord, TaskKind,
     };
 
     use super::{SecretCipher, Store};
@@ -1207,6 +1209,32 @@ mod tests {
         store.upsert_task(&task).unwrap();
         let tasks = store.list_tasks().unwrap();
         assert_eq!(tasks.len(), 1);
+    }
+
+    #[test]
+    fn persists_direct_tool_task_kind() {
+        let store = Store::open_in_memory().unwrap();
+        let task = hajimi_claw_types::TaskStatus {
+            id: hajimi_claw_types::TaskId::new(),
+            conversation_id: hajimi_claw_types::ConversationId::new(),
+            kind: TaskKind::DirectToolTask,
+            description: "invoke skill.demo".into(),
+            queued_at: Utc::now(),
+            started_at: None,
+            finished_at: None,
+            state: hajimi_claw_types::TaskRunState::Completed,
+            running: false,
+            cwd: None,
+            provider_id: None,
+            current_session_id: None,
+            result_preview: None,
+            error: None,
+            blocked_approval_id: None,
+        };
+
+        store.upsert_task(&task).unwrap();
+        let loaded = store.get_task(task.id).unwrap().unwrap();
+        assert!(matches!(loaded.kind, TaskKind::DirectToolTask));
     }
 
     #[test]

@@ -13,6 +13,7 @@ use hajimi_claw_types::{
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::sync::RwLock;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +49,11 @@ pub enum GatewayCommand {
     AgentsOff,
     AgentsAuto,
     AgentsStatus,
+    Capabilities,
+    Skills,
+    SkillRun { name: String, input: String },
+    Mcp,
+    McpTools(Option<String>),
     PersonaGuide,
     PersonaList,
     PersonaRead(String),
@@ -335,6 +341,41 @@ impl Gateway for InProcessGateway {
                     .await
             }
             GatewayCommand::AgentsStatus => self.agents_status(request.actor_chat_id).await,
+            GatewayCommand::Capabilities => Ok(text_response_with_keyboard(
+                &self.runtime.render_capability_inventory(),
+                Some(capabilities_keyboard()),
+            )),
+            GatewayCommand::Skills => Ok(text_response_with_keyboard(
+                &self.runtime.render_skill_inventory(),
+                Some(skills_keyboard()),
+            )),
+            GatewayCommand::SkillRun { name, input } => {
+                let parsed = parse_skill_input(&input)?;
+                let reply = self
+                    .runtime
+                    .invoke_skill(
+                        &name,
+                        parsed,
+                        None,
+                        request.current_conversation_id,
+                        request.current_session_id.clone(),
+                    )
+                    .await?;
+                Ok(GatewayResponse {
+                    text: reply.message,
+                    session: SessionDirective::Keep,
+                    conversation: ConversationDirective::Set(reply.conversation_id),
+                    keyboard: None,
+                })
+            }
+            GatewayCommand::Mcp => Ok(text_response_with_keyboard(
+                &self.runtime.render_mcp_inventory(),
+                Some(mcp_keyboard()),
+            )),
+            GatewayCommand::McpTools(server) => Ok(text_response_with_keyboard(
+                &self.runtime.render_mcp_tool_inventory(server.as_deref()),
+                Some(mcp_keyboard()),
+            )),
             GatewayCommand::PersonaGuide => Ok(text_response_with_keyboard(
                 &persona_guide_text(),
                 Some(persona_guide_keyboard()),
@@ -759,8 +800,29 @@ pub fn parse_gateway_command(text: &str) -> GatewayCommand {
     if trimmed == "/model use" {
         return GatewayCommand::ModelPicker;
     }
+    if trimmed == "/capabilities" {
+        return GatewayCommand::Capabilities;
+    }
+    if trimmed == "/skills" {
+        return GatewayCommand::Skills;
+    }
+    if trimmed == "/mcp" {
+        return GatewayCommand::Mcp;
+    }
     if let Some(rest) = trimmed.strip_prefix("/model use ") {
         return GatewayCommand::ModelUse(rest.trim().into());
+    }
+    if let Some(rest) = trimmed.strip_prefix("/skill run ") {
+        if let Some((name, input)) = split_file_and_content(rest.trim()) {
+            return GatewayCommand::SkillRun { name, input };
+        }
+    }
+    if trimmed == "/mcp tools" {
+        return GatewayCommand::McpTools(None);
+    }
+    if let Some(rest) = trimmed.strip_prefix("/mcp tools ") {
+        let server = rest.trim();
+        return GatewayCommand::McpTools((!server.is_empty()).then(|| server.to_string()));
     }
     if trimmed == "/persona list" {
         return GatewayCommand::PersonaList;
@@ -861,6 +923,11 @@ pub fn help_text() -> String {
         "/provider set-model <provider-id> <model>",
         "/model current",
         "/model use [model]",
+        "/capabilities",
+        "/skills",
+        "/skill run <name> <json-or-text>",
+        "/mcp",
+        "/mcp tools [server]",
         "/agents on",
         "/agents off",
         "/agents auto",
@@ -900,6 +967,14 @@ fn ensure_provider_exists(store: &Store, provider_id: &str) -> ClawResult<()> {
         )));
     }
     Ok(())
+}
+
+fn parse_skill_input(raw: &str) -> ClawResult<Value> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    serde_json::from_str(trimmed).or_else(|_| Ok(serde_json::json!({ "input": trimmed })))
 }
 
 fn finalize_provider(draft: ProviderDraft) -> ClawResult<ProviderConfig> {
@@ -1063,6 +1138,20 @@ fn main_menu_keyboard() -> InlineKeyboard {
                     data: "/provider list".into(),
                 },
                 InlineButton {
+                    text: "Skills".into(),
+                    data: "/skills".into(),
+                },
+                InlineButton {
+                    text: "MCP".into(),
+                    data: "/mcp".into(),
+                },
+                InlineButton {
+                    text: "Capabilities".into(),
+                    data: "/capabilities".into(),
+                },
+            ],
+            vec![
+                InlineButton {
                     text: "New".into(),
                     data: "/new".into(),
                 },
@@ -1089,6 +1178,69 @@ fn elevated_menu_text() -> String {
         "`/elevated off` = disable any active elevated lease.",
     ]
     .join("\n")
+}
+
+fn capabilities_keyboard() -> InlineKeyboard {
+    InlineKeyboard {
+        rows: vec![
+            vec![
+                InlineButton {
+                    text: "Skills".into(),
+                    data: "/skills".into(),
+                },
+                InlineButton {
+                    text: "MCP".into(),
+                    data: "/mcp".into(),
+                },
+            ],
+            vec![InlineButton {
+                text: "Back to menu".into(),
+                data: "/menu".into(),
+            }],
+        ],
+    }
+}
+
+fn skills_keyboard() -> InlineKeyboard {
+    InlineKeyboard {
+        rows: vec![
+            vec![
+                InlineButton {
+                    text: "Capabilities".into(),
+                    data: "/capabilities".into(),
+                },
+                InlineButton {
+                    text: "MCP tools".into(),
+                    data: "/mcp tools".into(),
+                },
+            ],
+            vec![InlineButton {
+                text: "Back to menu".into(),
+                data: "/menu".into(),
+            }],
+        ],
+    }
+}
+
+fn mcp_keyboard() -> InlineKeyboard {
+    InlineKeyboard {
+        rows: vec![
+            vec![
+                InlineButton {
+                    text: "MCP tools".into(),
+                    data: "/mcp tools".into(),
+                },
+                InlineButton {
+                    text: "Capabilities".into(),
+                    data: "/capabilities".into(),
+                },
+            ],
+            vec![InlineButton {
+                text: "Back to menu".into(),
+                data: "/menu".into(),
+            }],
+        ],
+    }
 }
 
 fn elevated_keyboard() -> InlineKeyboard {
@@ -1408,6 +1560,27 @@ mod tests {
     }
 
     #[test]
+    fn parses_capability_commands() {
+        assert_eq!(
+            parse_gateway_command("/capabilities"),
+            GatewayCommand::Capabilities
+        );
+        assert_eq!(parse_gateway_command("/skills"), GatewayCommand::Skills);
+        assert_eq!(parse_gateway_command("/mcp"), GatewayCommand::Mcp);
+        assert_eq!(
+            parse_gateway_command("/mcp tools demo"),
+            GatewayCommand::McpTools(Some("demo".into()))
+        );
+        assert_eq!(
+            parse_gateway_command("/skill run skill.deploy {\"service\":\"api\"}"),
+            GatewayCommand::SkillRun {
+                name: "skill.deploy".into(),
+                input: "{\"service\":\"api\"}".into(),
+            }
+        );
+    }
+
+    #[test]
     fn persona_guide_mentions_layered_persona_model() {
         let guide = super::persona_guide_text();
         assert!(guide.contains("Layer model:"));
@@ -1417,6 +1590,16 @@ mod tests {
             guide.contains("`heartbeat.md` is runtime config only and never enters the prompt")
         );
         assert!(guide.contains("`/persona list`"));
+    }
+
+    #[test]
+    fn help_text_mentions_capability_commands() {
+        let help = super::help_text();
+        assert!(help.contains("/capabilities"));
+        assert!(help.contains("/skills"));
+        assert!(help.contains("/skill run <name> <json-or-text>"));
+        assert!(help.contains("/mcp"));
+        assert!(help.contains("/mcp tools [server]"));
     }
 
     #[test]

@@ -6,8 +6,9 @@ use std::time::Instant;
 use async_trait::async_trait;
 use hajimi_claw_policy::PolicyEngine;
 use hajimi_claw_types::{
-    ClawError, ClawResult, ExecRequest, Executor, SessionId, SessionOpenRequest, Tool, ToolContext,
-    ToolOutput, ToolSpec,
+    CapabilityId, CapabilityKind, CapabilitySummary, ClawError, ClawResult, ExecRequest,
+    ExecutableSkillConfig, Executor, McpServerStatus, SessionId, SessionOpenRequest, Tool,
+    ToolContext, ToolOutput, ToolSpec,
 };
 use regex::Regex;
 use reqwest::Method;
@@ -23,6 +24,7 @@ use url::Url;
 
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
+    mcp_servers: Vec<McpServerStatus>,
 }
 
 impl ToolRegistry {
@@ -31,11 +33,26 @@ impl ToolRegistry {
             .into_iter()
             .map(|tool| (tool.spec().name.clone(), tool))
             .collect();
-        Self { tools }
+        Self {
+            tools,
+            mcp_servers: Vec::new(),
+        }
+    }
+
+    pub fn with_mcp_servers(mut self, mcp_servers: Vec<McpServerStatus>) -> Self {
+        self.mcp_servers = mcp_servers;
+        self
     }
 
     pub fn default(executor: Arc<dyn Executor>, policy: Arc<PolicyEngine>) -> Self {
-        Self::new(vec![
+        Self::new(Self::builtin_tools(executor, policy))
+    }
+
+    pub fn builtin_tools(
+        executor: Arc<dyn Executor>,
+        policy: Arc<PolicyEngine>,
+    ) -> Vec<Arc<dyn Tool>> {
+        vec![
             Arc::new(ReadFileTool::new(policy.clone())),
             Arc::new(TailFileTool::new(policy.clone())),
             Arc::new(ListDirTool::new(policy.clone())),
@@ -59,11 +76,46 @@ impl ToolRegistry {
             Arc::new(SessionStatusTool::new(executor.clone())),
             Arc::new(SessionExecTool::new(executor.clone())),
             Arc::new(SessionCloseTool::new(executor)),
-        ])
+        ]
+    }
+
+    pub fn from_parts(tools: Vec<Arc<dyn Tool>>, mcp_servers: Vec<McpServerStatus>) -> Self {
+        Self::new(tools).with_mcp_servers(mcp_servers)
+    }
+
+    pub fn with_skill_configs(
+        executor: Arc<dyn Executor>,
+        policy: Arc<PolicyEngine>,
+        skills: Vec<ExecutableSkillConfig>,
+    ) -> Self {
+        let mut tools = Self::builtin_tools(executor.clone(), policy);
+        tools.extend(skills.into_iter().map(|skill| {
+            Arc::new(ExecutableSkillTool::new(executor.clone(), skill)) as Arc<dyn Tool>
+        }));
+        Self::new(tools)
     }
 
     pub fn specs(&self) -> Vec<ToolSpec> {
         self.tools.values().map(|tool| tool.spec()).collect()
+    }
+
+    pub fn capability_summaries(&self) -> Vec<CapabilitySummary> {
+        let mut capabilities = self
+            .tools
+            .values()
+            .map(|tool| tool.capability_summary())
+            .collect::<Vec<_>>();
+        capabilities.sort_by(|left, right| {
+            capability_sort_key(left)
+                .cmp(&capability_sort_key(right))
+                .then_with(|| left.id.name.cmp(&right.id.name))
+                .then_with(|| left.id.source.cmp(&right.id.source))
+        });
+        capabilities
+    }
+
+    pub fn mcp_server_statuses(&self) -> &[McpServerStatus] {
+        &self.mcp_servers
     }
 
     pub async fn call(&self, name: &str, ctx: ToolContext, input: Value) -> ClawResult<ToolOutput> {
@@ -73,6 +125,19 @@ impl ToolRegistry {
             .ok_or_else(|| ClawError::NotFound(format!("tool not found: {name}")))?;
         tool.call(ctx, input).await
     }
+}
+
+fn capability_sort_key(summary: &CapabilitySummary) -> (u8, &str, &str) {
+    let kind_rank = match summary.id.kind {
+        CapabilityKind::NativeTool => 0,
+        CapabilityKind::Skill => 1,
+        CapabilityKind::McpTool => 2,
+    };
+    (
+        kind_rank,
+        summary.id.source.as_deref().unwrap_or(""),
+        summary.id.name.as_str(),
+    )
 }
 
 fn object_schema(properties: Vec<(&str, Value)>, required: &[&str]) -> Value {
@@ -131,6 +196,98 @@ fn string_map_schema(description: &str) -> Value {
             "type": "string",
         },
     })
+}
+
+struct ExecutableSkillTool {
+    executor: Arc<dyn Executor>,
+    config: ExecutableSkillConfig,
+}
+
+impl ExecutableSkillTool {
+    fn new(executor: Arc<dyn Executor>, config: ExecutableSkillConfig) -> Self {
+        Self { executor, config }
+    }
+}
+
+#[async_trait]
+impl Tool for ExecutableSkillTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: format!("skill.{}", self.config.name),
+            description: self.config.description.clone(),
+            requires_approval: self.config.requires_approval,
+            input_schema: self.config.input_schema.clone(),
+        }
+    }
+
+    fn capability_id(&self) -> CapabilityId {
+        CapabilityId {
+            kind: CapabilityKind::Skill,
+            name: self.spec().name,
+            source: Some(self.config.name.clone()),
+        }
+    }
+
+    async fn call(&self, ctx: ToolContext, input: Value) -> ClawResult<ToolOutput> {
+        let stdin = serde_json::to_string(&json!({
+            "conversation_id": ctx.conversation_id.to_string(),
+            "working_directory": ctx
+                .working_directory
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            "elevated": ctx.elevated,
+            "input": input,
+        }))
+        .map_err(|err| ClawError::InvalidRequest(err.to_string()))?;
+
+        let result = self
+            .executor
+            .run_once(ExecRequest {
+                command: self.config.command.clone(),
+                args: self.config.args.clone(),
+                cwd: self.config.cwd.clone().or(ctx.working_directory),
+                env_allowlist: self.config.env_allowlist.clone(),
+                timeout_secs: self.config.timeout_secs.unwrap_or(120),
+                max_output_bytes: self.config.max_output_bytes.unwrap_or(32 * 1024),
+                requires_tty: false,
+                stdin: Some(stdin),
+            })
+            .await?;
+
+        if result.exit_code.unwrap_or_default() != 0 {
+            return Err(ClawError::Backend(if result.stderr.trim().is_empty() {
+                format!(
+                    "skill `{}` failed with exit code {}",
+                    self.config.name,
+                    result.exit_code.unwrap_or_default()
+                )
+            } else {
+                result.stderr.trim().to_string()
+            }));
+        }
+
+        if result.stdout.trim().is_empty() {
+            return Ok(ToolOutput {
+                content: String::new(),
+                structured: None,
+            });
+        }
+
+        let parsed: Value = serde_json::from_str(&result.stdout).map_err(|err| {
+            ClawError::Backend(format!(
+                "skill `{}` returned invalid JSON: {err}",
+                self.config.name
+            ))
+        })?;
+        Ok(ToolOutput {
+            content: parsed
+                .get("content")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| result.stdout.trim().to_string()),
+            structured: parsed.get("structured").cloned(),
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -986,6 +1143,7 @@ impl Tool for SystemdStatusTool {
                 timeout_secs: 30,
                 max_output_bytes: 16 * 1024,
                 requires_tty: false,
+                stdin: None,
             })
             .await?;
         Ok(command_output(result))
@@ -1033,6 +1191,7 @@ impl Tool for SystemdRestartTool {
                 timeout_secs: 30,
                 max_output_bytes: 8 * 1024,
                 requires_tty: false,
+                stdin: None,
             })
             .await?;
         Ok(command_output(result))
@@ -1071,6 +1230,7 @@ impl Tool for DockerPsTool {
                 timeout_secs: 20,
                 max_output_bytes: 12 * 1024,
                 requires_tty: false,
+                stdin: None,
             })
             .await?;
         Ok(command_output(result))
@@ -1130,6 +1290,7 @@ impl Tool for DockerLogsTool {
                 timeout_secs: 30,
                 max_output_bytes: 16 * 1024,
                 requires_tty: false,
+                stdin: None,
             })
             .await?;
         Ok(command_output(result))
@@ -1177,6 +1338,7 @@ impl Tool for DockerRestartTool {
                 timeout_secs: 30,
                 max_output_bytes: 8 * 1024,
                 requires_tty: false,
+                stdin: None,
             })
             .await?;
         Ok(command_output(result))
@@ -1230,6 +1392,7 @@ impl Tool for RunCommandTool {
                 timeout_secs: 60,
                 max_output_bytes: 24 * 1024,
                 requires_tty: false,
+                stdin: None,
             })
             .await?;
         Ok(command_output(result))
@@ -1307,6 +1470,7 @@ impl Tool for ExecOnceTool {
                     .unwrap_or(24 * 1024)
                     .clamp(256, config.max_output_bytes),
                 requires_tty: input.requires_tty.unwrap_or(false),
+                stdin: None,
             })
             .await?;
         Ok(command_output(result))
@@ -1387,6 +1551,7 @@ impl Tool for PingHostTool {
                 timeout_secs: (timeout_secs * count as u64).max(timeout_secs),
                 max_output_bytes: 16 * 1024,
                 requires_tty: false,
+                stdin: None,
             })
             .await?;
         Ok(command_output(result))
@@ -1558,6 +1723,7 @@ impl Tool for SessionExecTool {
                     timeout_secs: 120,
                     max_output_bytes: 24 * 1024,
                     requires_tty: false,
+                    stdin: None,
                 },
             )
             .await?;
@@ -1685,14 +1851,15 @@ fn truncate_string(content: String, max_bytes: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     use anyhow::Result;
     use hajimi_claw_exec::{LocalExecutor, PlatformMode};
     use hajimi_claw_policy::{PolicyConfig, PolicyEngine};
     use hajimi_claw_types::{
-        ClawError, ConversationId, ExecRequest, ExecResult, Executor, SessionHandle, SessionId,
-        SessionOpenRequest, ToolContext,
+        ClawError, ConversationId, ExecRequest, ExecResult, ExecutableSkillConfig, Executor,
+        SessionHandle, SessionId, SessionOpenRequest, ToolContext,
     };
     use serde_json::json;
     use tempfile::tempdir;
@@ -1873,19 +2040,33 @@ mod tests {
 
     struct FakeExecutor {
         last_request: Mutex<Option<ExecRequest>>,
+        result: Mutex<ExecResult>,
     }
 
-    #[async_trait::async_trait]
-    impl Executor for FakeExecutor {
-        async fn run_once(&self, req: ExecRequest) -> Result<ExecResult, ClawError> {
-            *self.last_request.lock().await = Some(req);
-            Ok(ExecResult {
+    impl FakeExecutor {
+        fn new() -> Self {
+            Self::with_result(ExecResult {
                 exit_code: Some(0),
                 stdout: "pong".into(),
                 stderr: String::new(),
                 duration_ms: 5,
                 truncated: false,
             })
+        }
+
+        fn with_result(result: ExecResult) -> Self {
+            Self {
+                last_request: Mutex::new(None),
+                result: Mutex::new(result),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Executor for FakeExecutor {
+        async fn run_once(&self, req: ExecRequest) -> Result<ExecResult, ClawError> {
+            *self.last_request.lock().await = Some(req);
+            Ok(self.result.lock().await.clone())
         }
 
         async fn open_session(&self, _req: SessionOpenRequest) -> Result<SessionHandle, ClawError> {
@@ -1911,9 +2092,7 @@ mod tests {
 
     #[tokio::test]
     async fn ping_host_builds_ping_command() -> Result<()> {
-        let executor = Arc::new(FakeExecutor {
-            last_request: Mutex::new(None),
-        });
+        let executor = Arc::new(FakeExecutor::new());
         let policy = Arc::new(PolicyEngine::new(PolicyConfig::default()));
         let tools = ToolRegistry::default(executor.clone(), policy);
         let output = tools
@@ -1942,9 +2121,7 @@ mod tests {
 
     #[tokio::test]
     async fn exec_once_clamps_output_and_timeout_to_policy_maximums() -> Result<()> {
-        let executor = Arc::new(FakeExecutor {
-            last_request: Mutex::new(None),
-        });
+        let executor = Arc::new(FakeExecutor::new());
         let policy = Arc::new(PolicyEngine::new(PolicyConfig {
             max_timeout_secs: 30,
             max_output_bytes: 4096,
@@ -1976,6 +2153,76 @@ mod tests {
             .expect("captured request");
         assert_eq!(request.timeout_secs, 30);
         assert_eq!(request.max_output_bytes, 4096);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executable_skill_tool_pipes_json_over_stdin() -> Result<()> {
+        let executor = Arc::new(FakeExecutor::with_result(ExecResult {
+            exit_code: Some(0),
+            stdout: json!({
+                "content": "skill pong",
+                "structured": { "ok": true }
+            })
+            .to_string(),
+            stderr: String::new(),
+            duration_ms: 5,
+            truncated: false,
+        }));
+        let skill = ExecutableSkillConfig {
+            name: "deploy".into(),
+            description: "Run a deploy helper".into(),
+            command: "skill-runner".into(),
+            args: vec!["--json".into()],
+            cwd: Some(PathBuf::from("/tmp/skills")),
+            env_allowlist: vec!["PATH".into()],
+            requires_approval: true,
+            timeout_secs: Some(45),
+            max_output_bytes: Some(2048),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "service": { "type": "string" }
+                },
+                "required": ["service"],
+                "additionalProperties": false
+            }),
+        };
+        let tools = ToolRegistry::with_skill_configs(
+            executor.clone(),
+            Arc::new(PolicyEngine::new(PolicyConfig::default())),
+            vec![skill],
+        );
+
+        let output = tools
+            .call(
+                "skill.deploy",
+                ToolContext {
+                    conversation_id: ConversationId::new(),
+                    working_directory: Some(PathBuf::from("/workspace")),
+                    elevated: true,
+                },
+                json!({ "service": "api" }),
+            )
+            .await?;
+
+        let request = executor
+            .last_request
+            .lock()
+            .await
+            .clone()
+            .expect("captured request");
+        assert_eq!(request.command, "skill-runner");
+        assert_eq!(request.args, vec!["--json"]);
+        assert_eq!(request.cwd, Some(PathBuf::from("/tmp/skills")));
+        assert_eq!(request.timeout_secs, 45);
+        assert_eq!(request.max_output_bytes, 2048);
+        assert_eq!(request.env_allowlist, vec!["PATH"]);
+        let stdin = request.stdin.expect("stdin payload");
+        assert!(stdin.contains("\"service\":\"api\""));
+        assert!(stdin.contains("\"elevated\":true"));
+        assert_eq!(output.content, "skill pong");
+        assert_eq!(output.structured, Some(json!({ "ok": true })));
         Ok(())
     }
 

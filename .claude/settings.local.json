@@ -4,7 +4,8 @@
       "Bash(head:*)",
       "Bash(cargo test:*)",
       "Bash(cargo fmt:*)",
-      "Bash(cargo clippy:*)"
+      "Bash(cargo clippy:*)",
+      "WebSearch"
     ]
   }
 }

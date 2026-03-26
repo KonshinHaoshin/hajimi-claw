@@ -11,6 +11,7 @@ use hajimi_claw_types::{
     ClawError, ClawResult, ExecRequest, ExecResult, Executor, SessionHandle, SessionId,
     SessionOpenRequest,
 };
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, timeout};
@@ -82,9 +83,21 @@ impl LocalExecutor {
 
         let start = Instant::now();
         let mut command = build_command(&req, self.mode)?;
-        let child = command
+        let mut child = command
             .spawn()
             .map_err(|err| ClawError::Backend(err.to_string()))?;
+
+        if let Some(stdin) = &req.stdin {
+            let mut child_stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| ClawError::Backend("stdin not available".into()))?;
+            child_stdin
+                .write_all(stdin.as_bytes())
+                .await
+                .map_err(|err| ClawError::Backend(err.to_string()))?;
+            drop(child_stdin);
+        }
 
         #[cfg(windows)]
         let _job = windows_job::attach_kill_on_close(&child).ok();
@@ -252,7 +265,11 @@ fn build_command(req: &ExecRequest, mode: PlatformMode) -> ClawResult<Command> {
     };
 
     command.kill_on_drop(true);
-    command.stdin(Stdio::null());
+    if req.stdin.is_some() {
+        command.stdin(Stdio::piped());
+    } else {
+        command.stdin(Stdio::null());
+    }
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     command.env_clear();
@@ -388,6 +405,7 @@ mod tests {
             timeout_secs: 10,
             max_output_bytes: 128,
             requires_tty: false,
+            stdin: None,
         };
 
         let result = executor.run_once(req).await.expect("command succeeds");
@@ -417,6 +435,7 @@ mod tests {
                     timeout_secs: 10,
                     max_output_bytes: 128,
                     requires_tty: false,
+                    stdin: None,
                 },
             )
             .await
@@ -433,6 +452,7 @@ mod tests {
                     timeout_secs: 10,
                     max_output_bytes: 256,
                     requires_tty: false,
+                    stdin: None,
                 },
             )
             .await
@@ -461,6 +481,7 @@ mod tests {
             timeout_secs: 10,
             max_output_bytes: 128,
             requires_tty: false,
+            stdin: None,
         };
 
         assert!(executor.validate_windows_safe_request(&req).is_ok());

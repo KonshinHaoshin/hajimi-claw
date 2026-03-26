@@ -11,10 +11,11 @@ use hajimi_claw_policy::PolicyEngine;
 use hajimi_claw_store::Store;
 use hajimi_claw_tools::ToolRegistry;
 use hajimi_claw_types::{
-    AgentEvent, AgentRequest, ApprovalId, ApprovalRecord, ClawError, ClawResult, ConversationId,
-    ConversationMessage, LlmBackend, MessageRole, PolicyMode, ProviderRecord, TaskId, TaskKind,
-    TaskRunState, TaskStatus, ToolCallRecord, ToolContext, ToolExchange, ToolInvocationRecord,
-    ToolInvocationStatus, ToolResultRecord,
+    AgentEvent, AgentRequest, ApprovalId, ApprovalRecord, CapabilityKind, CapabilitySummary,
+    ClawError, ClawResult, ConversationId, ConversationMessage, LlmBackend, McpServerStatus,
+    MessageRole, PolicyMode, ProviderRecord, TaskId, TaskKind, TaskRunState, TaskStatus,
+    ToolCallRecord, ToolContext, ToolExchange, ToolInvocationRecord, ToolInvocationStatus,
+    ToolResultRecord,
 };
 use regex::Regex;
 use serde_json::json;
@@ -41,6 +42,12 @@ pub struct ShellOpenReply {
 
 #[derive(Debug, Clone)]
 pub struct AskReply {
+    pub conversation_id: ConversationId,
+    pub message: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CapabilityInvokeReply {
     pub conversation_id: ConversationId,
     pub message: String,
 }
@@ -588,6 +595,225 @@ impl AgentRuntime {
         self.store.list_pending_approvals().map_err(store_error)
     }
 
+    pub fn list_capabilities(&self) -> Vec<CapabilitySummary> {
+        self.tools.capability_summaries()
+    }
+
+    pub fn list_skill_capabilities(&self) -> Vec<CapabilitySummary> {
+        self.list_capabilities()
+            .into_iter()
+            .filter(|capability| matches!(capability.id.kind, CapabilityKind::Skill))
+            .collect()
+    }
+
+    pub fn list_mcp_server_statuses(&self) -> Vec<McpServerStatus> {
+        self.tools.mcp_server_statuses().to_vec()
+    }
+
+    pub fn list_mcp_capabilities(&self, server: Option<&str>) -> Vec<CapabilitySummary> {
+        self.list_capabilities()
+            .into_iter()
+            .filter(|capability| matches!(capability.id.kind, CapabilityKind::McpTool))
+            .filter(|capability| {
+                server
+                    .is_none_or(|server_name| capability.id.source.as_deref() == Some(server_name))
+            })
+            .collect()
+    }
+
+    pub fn render_capability_inventory(&self) -> String {
+        let capabilities = self.list_capabilities();
+        let mut lines = vec!["capability inventory".to_string()];
+        lines.extend(render_capability_section(
+            "native tools",
+            capabilities
+                .iter()
+                .filter(|capability| matches!(capability.id.kind, CapabilityKind::NativeTool)),
+        ));
+        lines.extend(render_capability_section(
+            "skills",
+            capabilities
+                .iter()
+                .filter(|capability| matches!(capability.id.kind, CapabilityKind::Skill)),
+        ));
+        lines.extend(render_capability_section(
+            "mcp tools",
+            capabilities
+                .iter()
+                .filter(|capability| matches!(capability.id.kind, CapabilityKind::McpTool)),
+        ));
+        lines.join("\n")
+    }
+
+    pub fn render_skill_inventory(&self) -> String {
+        let skills = self.list_skill_capabilities();
+        if skills.is_empty() {
+            return "skills\n(no executable skills configured)".into();
+        }
+        let mut lines = vec!["skills".to_string()];
+        lines.extend(render_capability_lines(&skills));
+        lines.join("\n")
+    }
+
+    pub fn render_mcp_inventory(&self) -> String {
+        let servers = self.list_mcp_server_statuses();
+        if servers.is_empty() {
+            return "mcp servers\n(no mcp servers configured)".into();
+        }
+
+        let mut lines = vec!["mcp servers".to_string()];
+        for server in servers {
+            let status = if server.connected {
+                "connected"
+            } else {
+                "disconnected"
+            };
+            lines.push(format!(
+                "- {} [{}] tools={} {}",
+                server.name, status, server.tool_count, server.message
+            ));
+        }
+        lines.join("\n")
+    }
+
+    pub fn render_mcp_tool_inventory(&self, server: Option<&str>) -> String {
+        let tools = self.list_mcp_capabilities(server);
+        let heading = match server {
+            Some(server) => format!("mcp tools for `{server}`"),
+            None => "mcp tools".into(),
+        };
+        if tools.is_empty() {
+            return format!("{heading}\n(no mcp tools available)");
+        }
+        let mut lines = vec![heading];
+        lines.extend(render_capability_lines(&tools));
+        lines.join("\n")
+    }
+
+    pub async fn invoke_skill(
+        &self,
+        skill_name: &str,
+        input: serde_json::Value,
+        cwd: Option<PathBuf>,
+        conversation_id: Option<ConversationId>,
+        current_session_id: Option<String>,
+    ) -> ClawResult<CapabilityInvokeReply> {
+        if !self
+            .list_skill_capabilities()
+            .iter()
+            .any(|capability| capability.id.name == skill_name)
+        {
+            return Err(ClawError::NotFound(format!(
+                "skill not found: {skill_name}"
+            )));
+        }
+        self.invoke_capability(skill_name, input, cwd, conversation_id, current_session_id)
+            .await
+    }
+
+    pub async fn invoke_capability(
+        &self,
+        capability_name: &str,
+        input: serde_json::Value,
+        cwd: Option<PathBuf>,
+        conversation_id: Option<ConversationId>,
+        current_session_id: Option<String>,
+    ) -> ClawResult<CapabilityInvokeReply> {
+        let _permit = self
+            .task_gate
+            .acquire()
+            .await
+            .map_err(|_| ClawError::Backend("task gate closed".into()))?;
+
+        let capability = self
+            .list_capabilities()
+            .into_iter()
+            .find(|entry| entry.id.name == capability_name)
+            .ok_or_else(|| {
+                ClawError::NotFound(format!("capability not found: {capability_name}"))
+            })?;
+
+        let task_id = TaskId::new();
+        let conversation_id = conversation_id.unwrap_or_default();
+        let serialized_input =
+            serde_json::to_string(&input).unwrap_or_else(|_| "<invalid-json>".into());
+        let request_preview = if serialized_input == "{}" {
+            format!("invoke {}", capability.id.name)
+        } else {
+            format!("invoke {} {}", capability.id.name, serialized_input)
+        };
+        let description = format!("invoke {}", capability.id.name);
+        let mut status = self.new_task_status(
+            task_id,
+            conversation_id,
+            TaskKind::DirectToolTask,
+            &description,
+            cwd.clone(),
+            None,
+            current_session_id.clone(),
+        );
+        self.store.upsert_task(&status).map_err(store_error)?;
+
+        let execution = TaskExecution {
+            task_id,
+            conversation_id,
+            prompt: request_preview,
+            cwd,
+            provider_id: None,
+            current_session_id,
+        };
+
+        let result = match self
+            .execute_tool_call(
+                &execution,
+                None,
+                &capability.id.name,
+                input,
+                status.current_session_id.clone(),
+                1,
+            )
+            .await?
+        {
+            ToolCallOutcome::Completed(exchange) => Ok(exchange.result.content),
+            ToolCallOutcome::Blocked(err) => Err(err),
+        };
+
+        match &result {
+            Ok(content) => {
+                status.running = false;
+                status.state = TaskRunState::Completed;
+                status.finished_at = Some(Utc::now());
+                status.result_preview = Some(clamp_chars(content, 400));
+                status.error = None;
+                status.blocked_approval_id = None;
+                self.store.upsert_task(&status).map_err(store_error)?;
+                self.store
+                    .save_message(
+                        conversation_id,
+                        &ConversationMessage {
+                            role: MessageRole::Assistant,
+                            content: content.clone(),
+                            created_at: Utc::now(),
+                        },
+                    )
+                    .map_err(store_error)?;
+            }
+            Err(ClawError::ApprovalRequired(_)) => {}
+            Err(err) => {
+                status.running = false;
+                status.state = TaskRunState::Failed;
+                status.finished_at = Some(Utc::now());
+                status.error = Some(err.to_string());
+                self.store.upsert_task(&status).map_err(store_error)?;
+            }
+        }
+
+        result.map(|message| CapabilityInvokeReply {
+            conversation_id,
+            message,
+        })
+    }
+
     pub fn status(&self) -> ClawResult<String> {
         let tasks = self.store.list_tasks().map_err(store_error)?;
         let task_lines = if tasks.is_empty() {
@@ -1079,7 +1305,8 @@ impl AgentRuntime {
             current_session_id: task.current_session_id.clone(),
         };
 
-        let result = if execution.provider_id.is_none() && select_tool(&execution.prompt).is_some()
+        let result = if matches!(task.kind, TaskKind::DirectToolTask)
+            || (execution.provider_id.is_none() && select_tool(&execution.prompt).is_some())
         {
             let blocked = self.load_blocked_tool_invocation(task_id)?.ok_or_else(|| {
                 ClawError::NotFound(format!(
@@ -1361,6 +1588,43 @@ fn render_tool_output(output: &hajimi_claw_types::ToolOutput) -> String {
         .as_ref()
         .map(|value| serde_json::to_string(value).unwrap_or_else(|_| output.content.clone()))
         .unwrap_or_else(|| output.content.clone())
+}
+
+fn render_capability_section<'a>(
+    heading: &str,
+    capabilities: impl Iterator<Item = &'a CapabilitySummary>,
+) -> Vec<String> {
+    let collected = capabilities.cloned().collect::<Vec<_>>();
+    let mut lines = vec![format!("{heading}:")];
+    if collected.is_empty() {
+        lines.push("- (none)".into());
+    } else {
+        lines.extend(render_capability_lines(&collected));
+    }
+    lines
+}
+
+fn render_capability_lines(capabilities: &[CapabilitySummary]) -> Vec<String> {
+    capabilities
+        .iter()
+        .map(|capability| {
+            let approval = if capability.requires_approval {
+                " approval=required"
+            } else {
+                ""
+            };
+            let source = capability
+                .id
+                .source
+                .as_deref()
+                .map(|source| format!(" source={source}"))
+                .unwrap_or_default();
+            format!(
+                "- `{}`{}{} — {}",
+                capability.id.name, source, approval, capability.description
+            )
+        })
+        .collect()
 }
 
 fn latest_tool_invocations(records: Vec<ToolInvocationRecord>) -> Vec<ToolInvocationRecord> {
@@ -2744,6 +3008,22 @@ mod tests {
         assert!(list.contains("[identity layer]"));
         assert!(list.contains("identity.md"));
         assert!(list.contains("runtime-only"));
+    }
+
+    #[tokio::test]
+    async fn capability_inventory_shows_native_tools_only_by_default() {
+        let runtime = build_test_runtime(
+            Arc::new(StaticBackend::new("fallback")),
+            Arc::new(StaticSystemPrompt::new("base")),
+        );
+
+        let inventory = runtime.render_capability_inventory();
+        assert!(inventory.contains("capability inventory"));
+        assert!(inventory.contains("native tools:"));
+        assert!(inventory.contains("skills:"));
+        assert!(inventory.contains("mcp tools:"));
+        assert!(inventory.contains("`read_file`"));
+        assert!(inventory.contains("- (none)"));
     }
 
     #[tokio::test]

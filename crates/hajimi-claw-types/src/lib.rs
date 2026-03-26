@@ -172,6 +172,8 @@ pub struct ExecRequest {
     pub timeout_secs: u64,
     pub max_output_bytes: usize,
     pub requires_tty: bool,
+    #[serde(default)]
+    pub stdin: Option<String>,
 }
 
 impl ExecRequest {
@@ -241,6 +243,68 @@ pub struct ApprovalDecision {
     pub decided_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CapabilityKind {
+    NativeTool,
+    Skill,
+    McpTool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityId {
+    pub kind: CapabilityKind,
+    pub name: String,
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutableSkillConfig {
+    pub name: String,
+    pub description: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub cwd: Option<PathBuf>,
+    #[serde(default)]
+    pub env_allowlist: Vec<String>,
+    #[serde(default)]
+    pub requires_approval: bool,
+    pub timeout_secs: Option<u64>,
+    pub max_output_bytes: Option<usize>,
+    pub input_schema: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerConfig {
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub cwd: Option<PathBuf>,
+    #[serde(default)]
+    pub env_allowlist: Vec<String>,
+    pub startup_timeout_secs: Option<u64>,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub requires_approval: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilitySummary {
+    pub id: CapabilityId,
+    pub description: String,
+    pub requires_approval: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerStatus {
+    pub name: String,
+    pub connected: bool,
+    pub tool_count: usize,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSpec {
     pub name: String,
@@ -260,6 +324,14 @@ pub struct ToolContext {
     pub conversation_id: ConversationId,
     pub working_directory: Option<PathBuf>,
     pub elevated: bool,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+fn default_capability_kind() -> CapabilityKind {
+    CapabilityKind::NativeTool
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -325,6 +397,7 @@ pub type AgentStream = Pin<Box<dyn Stream<Item = ClawResult<AgentEvent>> + Send>
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TaskKind {
     EphemeralAgentTask,
+    DirectToolTask,
     PersistentShellTask,
 }
 
@@ -434,6 +507,24 @@ pub trait LlmBackend: Send + Sync {
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
+
+    fn capability_id(&self) -> CapabilityId {
+        CapabilityId {
+            kind: CapabilityKind::NativeTool,
+            name: self.spec().name,
+            source: None,
+        }
+    }
+
+    fn capability_summary(&self) -> CapabilitySummary {
+        let spec = self.spec();
+        CapabilitySummary {
+            id: self.capability_id(),
+            description: spec.description,
+            requires_approval: spec.requires_approval,
+        }
+    }
+
     async fn call(&self, ctx: ToolContext, input: Value) -> ClawResult<ToolOutput>;
 }
 
