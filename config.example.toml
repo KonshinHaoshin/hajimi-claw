@@ -47,10 +47,13 @@ worker_timeout_secs = 90
 max_context_chars_per_worker = 24000
 
 [persona]
-# hajimi onboard creates soul.md, agents.md, tools.md, and skills.md here.
+# hajimi onboard seeds identity.md, soul.md, agents.md, tools.md, skills.md, and heartbeat.md here.
 directory = "~/.hajimi"
-# Optional. If empty, hajimi auto-loads soul.md, agents.md, AGENTS.md, tools.md,
-# and skills.md from the current working directory, the config directory, and persona.directory.
+# Optional. If empty, hajimi auto-loads identity.md, soul.md, agents.md, AGENTS.md,
+# tools.md, and skills.md from persona.directory, the config directory, and the current
+# working directory, in that precedence order.
+# identity.md and soul.md are layered first-class persona files; heartbeat.md is runtime
+# config only and is never appended into the prompt.
 prompt_files = []
 
 [policy]

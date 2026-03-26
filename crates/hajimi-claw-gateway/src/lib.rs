@@ -1122,15 +1122,31 @@ fn persona_guide_text() -> String {
     [
         "persona guide",
         "",
-        "`identity.md` = who the user is, what systems they own, and standing preferences.",
-        "`soul.md` = Hajimi's personality. It is preseeded as a concise cat AI assistant.",
-        "`heartbeat.md` = daemon heartbeat config.",
+        "Layer model:",
+        "1. base system prompt",
+        "2. `identity.md` = who the user is, owned systems, environments, durable preferences, and hard constraints",
+        "3. `soul.md` = Hajimi's stable role, tone, style, and behavioral stance",
+        "4. `agents.md` / `AGENTS.md` / `tools.md` / `skills.md` = operational extensions for delegation, tools, workflows, and repo guidance",
+        "5. runtime overlays like shell-session metadata and multi-agent role instructions",
+        "",
+        "Precedence:",
+        "- auto-discovery loads `persona.directory`, then the config directory, then the current working directory",
+        "- higher-precedence files override structured `identity.md` / `soul.md` fields while preserving accumulated notes",
+        "- extensions stay additive in precedence order",
+        "- if `[persona].prompt_files` is set, that explicit list is used instead",
+        "",
+        "Parsing:",
+        "- `identity.md` and `soul.md` support optional front matter, but plain markdown still works",
+        "- malformed front matter safely falls back to legacy markdown behavior",
+        "- `heartbeat.md` is runtime config only and never enters the prompt",
         "",
         "Heartbeat format example:",
         "`enabled: true`",
         "`interval_secs: 30`",
         "",
         "Useful commands:",
+        "`/persona list`",
+        "`/persona read identity`",
         "`/persona read soul`",
         "`/persona write identity You are helping Alice maintain two Linux VPS nodes.`",
         "`/persona write soul You are Hajimi, a calm cat AI ops assistant.`",
@@ -1389,6 +1405,18 @@ mod tests {
             parse_gateway_command("/persona guide"),
             GatewayCommand::PersonaGuide
         );
+    }
+
+    #[test]
+    fn persona_guide_mentions_layered_persona_model() {
+        let guide = super::persona_guide_text();
+        assert!(guide.contains("Layer model:"));
+        assert!(guide.contains("`identity.md`"));
+        assert!(guide.contains("`soul.md`"));
+        assert!(
+            guide.contains("`heartbeat.md` is runtime config only and never enters the prompt")
+        );
+        assert!(guide.contains("`/persona list`"));
     }
 
     #[test]

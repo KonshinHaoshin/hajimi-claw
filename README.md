@@ -210,25 +210,43 @@ Behavior:
 
 ## Persona Files
 
-`hajimi onboard` now creates empty persona files in `~/.hajimi/`:
+`hajimi onboard` seeds persona files in `~/.hajimi/`:
 
+- `identity.md`
 - `soul.md`
 - `agents.md`
 - `tools.md`
 - `skills.md`
+- `heartbeat.md`
 
-`hajimi` reloads these files on each request, so Telegram edits take effect on the next `/ask`.
+`hajimi` reloads persona prompt files on each request, so edits take effect on the next `/ask`.
 
-- Auto-discovered files: `soul.md`, `agents.md`, `AGENTS.md`, `tools.md`, `skills.md`
-- Search roots: the current working directory, the config directory, and `~/.hajimi`
+Layered prompt order:
+
+1. base system prompt
+2. `identity.md`
+3. `soul.md`
+4. `agents.md` / `AGENTS.md` / `tools.md` / `skills.md`
+5. runtime overlays such as shell-session metadata and multi-agent role instructions
+
+Auto-discovery behavior:
+
+- Auto-discovered files: `identity.md`, `soul.md`, `agents.md`, `AGENTS.md`, `tools.md`, `skills.md`
+- Search roots and precedence: `persona.directory` -> config directory -> current working directory
+- `identity.md` and `soul.md` support optional front matter, but plain markdown still works
+- Structured `identity.md` / `soul.md` fields override by precedence while freeform notes accumulate
+- Extension files stay additive in precedence order
+- `heartbeat.md` is runtime config only and is never appended into the prompt
 - Optional explicit list: set `[persona].prompt_files` in `config.toml`
 
 Use these files for:
 
-- `soul.md`: tone, temperament, and high-level persona
+- `identity.md`: user profile, owned systems, environments, durable preferences, and hard constraints
+- `soul.md`: Hajimi's stable role, tone, style, and behavioral stance
 - `agents.md` or `AGENTS.md`: repo or operator instructions
 - `tools.md`: tool-use policy and operational preferences
 - `skills.md`: extra habits, playbooks, and skill-selection hints
+- `heartbeat.md`: daemon heartbeat runtime config
 
 ## Telegram commands
 
@@ -245,7 +263,8 @@ Use these files for:
 - `/model current`
 - `/model use [model]`
 - `/persona list`
-- `/persona read <soul|agents|tools|skills>`
+- `/persona guide`
+- `/persona read <identity|heartbeat|soul|agents|tools|skills>`
 - `/persona write <file> <content>`
 - `/persona append <file> <content>`
 - `/ask <text>`

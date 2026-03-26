@@ -1,6 +1,6 @@
 {
   "name": "hajimi-claw",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Single-user Telegram-first ops agent in Rust",
   "bin": {
     "hajimi": "bin/hajimi-claw.js",

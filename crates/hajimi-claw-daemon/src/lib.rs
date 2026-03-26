@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use hajimi_claw_agent::{
-    AgentRuntime, MarkdownPromptSource, MultiAgentConfig, default_system_prompt,
+    AgentRuntime, MarkdownPromptSource, MultiAgentConfig, PromptSourceMode, default_system_prompt,
 };
 use hajimi_claw_bot::{FeishuBot, FeishuConfig, TelegramBot, TelegramConfig};
 use hajimi_claw_exec::{LocalExecutor, PlatformMode};
@@ -315,10 +315,11 @@ async fn build_runtime_components(
         Arc::new(StoreBackedBackend::new(store.clone(), Some(fallback)));
     let persona_dir = resolve_persona_directory(config);
     ensure_persona_files(&persona_dir)?;
-    let prompt_files = resolve_persona_paths(config_path, &config.persona)?;
-    let prompt_source = Arc::new(MarkdownPromptSource::new(
+    let (prompt_mode, prompt_files) = resolve_persona_paths(config_path, &config.persona)?;
+    let prompt_source = Arc::new(MarkdownPromptSource::with_mode(
         default_system_prompt(),
         prompt_files,
+        prompt_mode,
     ));
 
     let runtime = Arc::new(AgentRuntime::new(
@@ -543,7 +544,7 @@ fn resolve_or_default_config_path() -> Result<PathBuf> {
             return Ok(candidate);
         }
     }
-    Ok(default_config_path()?)
+    default_config_path()
 }
 
 fn config_search_paths() -> Result<Vec<PathBuf>> {
@@ -636,7 +637,7 @@ fn default_workdirs(config_path: &Path) -> Vec<PathBuf> {
 fn resolve_persona_paths(
     config_path: Option<&Path>,
     persona: &PersonaSection,
-) -> Result<Vec<PathBuf>> {
+) -> Result<(PromptSourceMode, Vec<PathBuf>)> {
     let mut paths = Vec::new();
     if !persona.prompt_files.is_empty() {
         for path in &persona.prompt_files {
@@ -652,18 +653,19 @@ fn resolve_persona_paths(
                 paths.push(resolved);
             }
         }
-        return Ok(paths);
+        return Ok((PromptSourceMode::ExplicitList, paths));
     }
 
-    let mut roots = vec![std::env::current_dir()?];
+    let persona_dir = resolve_persona_directory_from_section(persona);
+    let mut roots = vec![persona_dir];
     if let Some(config_dir) = config_path.and_then(Path::parent) {
         if roots.iter().all(|root| root != config_dir) {
             roots.push(config_dir.to_path_buf());
         }
     }
-    let persona_dir = resolve_persona_directory_from_section(persona);
-    if roots.iter().all(|root| root != &persona_dir) {
-        roots.push(persona_dir);
+    let current_dir = std::env::current_dir()?;
+    if roots.iter().all(|root| root != &current_dir) {
+        roots.push(current_dir);
     }
 
     for root in roots {
@@ -681,7 +683,7 @@ fn resolve_persona_paths(
             }
         }
     }
-    Ok(paths)
+    Ok((PromptSourceMode::AutoDiscovery, paths))
 }
 
 fn resolve_persona_directory(config: &AppConfig) -> PathBuf {
@@ -956,7 +958,7 @@ async fn interactive_onboard(config_path: PathBuf) -> Result<()> {
     println!("Master key file: {}", master_key_file.display());
     println!("Persona files ready in {}", persona_dir.display());
     println!(
-        "Next: open Telegram or Feishu and use `/persona guide` to complete identity, soul, and heartbeat guidance there."
+        "Next: open Telegram or Feishu and use `/persona guide` to review identity, soul, extensions, precedence, and heartbeat runtime config."
     );
     Ok(())
 }
@@ -1272,7 +1274,7 @@ fn cli_launch() -> Result<()> {
     let pid_path = pid_file_path(&loaded.path);
     if let Some(pid) = read_pid_file(&pid_path)? {
         if is_process_running(pid) {
-            anyhow::bail!("hajimi is already running in background with pid {}", pid);
+            anyhow::bail!("hajimi is already running in background with pid {pid}");
         }
         let _ = fs::remove_file(&pid_path);
     }
@@ -1433,23 +1435,23 @@ fn default_persona_templates() -> [(&'static str, &'static str); 6] {
     [
         (
             "identity.md",
-            "# Identity\n\nDescribe who the user is, what systems they own, and any standing preferences.\n",
+            "---\nsummary: Replace this with a short profile of the user or team.\nowned_systems:\n  - List durable infrastructure, services, or repos the user owns.\nenvironments:\n  - Describe important environments like prod, staging, lab, or local dev.\nstanding_preferences:\n  - Capture durable workflow preferences, response style, and operating habits.\nhard_constraints:\n  - Record non-negotiable rules, safety boundaries, or compliance requirements.\n---\n\n# Identity notes\n\nAdd any extra freeform notes that do not fit the structured fields above.\n",
         ),
         (
             "soul.md",
-            "# Soul\n\nYou are Hajimi, a cat AI assistant with sharp operational instincts. Be concise, capable, and slightly cat-like without becoming noisy or childish. Prefer action, concrete terminal work, and honest status over fluff.\n",
+            "---\nname: Hajimi\nrole: Single-user ops and coding assistant.\ntone:\n  - Concise\n  - Calm\n  - Capable\nstyle:\n  - Prefer action, direct answers, and concrete verification.\nnon_goals:\n  - Do not become noisy, childish, or overly theatrical.\nbehavioral_rules:\n  - Be slightly cat-like only when it helps personality without distracting from the work.\n  - Stay honest about system state and next actions.\n---\n\n# Soul notes\n\nYou are Hajimi, a cat AI assistant with sharp operational instincts. Keep a stable, reliable personality across requests.\n",
         ),
         (
             "agents.md",
-            "# Agents\n\nDocument sub-agent rules, delegation style, and multi-agent boundaries here.\n",
+            "# Agents\n\nUse this file for delegation rules, worker boundaries, and repo-local agent habits.\n",
         ),
         (
             "tools.md",
-            "# Tools\n\nDocument preferred tools, shell habits, and safety constraints here.\n",
+            "# Tools\n\nUse this file for preferred tools, safety rules, and operational workflow notes.\n",
         ),
         (
             "skills.md",
-            "# Skills\n\nDocument reusable workflows and special operating skills here.\n",
+            "# Skills\n\nUse this file for reusable playbooks, team workflows, and task-specific habits.\n",
         ),
         ("heartbeat.md", "enabled: true\ninterval_secs: 30\n"),
     ]
@@ -1597,7 +1599,7 @@ fn stop_process(pid: u32) -> Result<()> {
             .status()
             .context("invoke taskkill")?;
         if !status.success() {
-            anyhow::bail!("failed to stop process {}", pid);
+            anyhow::bail!("failed to stop process {pid}");
         }
     }
 
@@ -2111,6 +2113,7 @@ mod tests {
         load_heartbeat_file_config, log_file_path, open_store, pairing_text_matches, pid_file_path,
         resolve_model_choice, resolve_persona_paths, select_platform_mode, slugify,
     };
+    use hajimi_claw_agent::PromptSourceMode;
     use hajimi_claw_exec::PlatformMode;
     use tempfile::tempdir;
 
@@ -2149,24 +2152,63 @@ mod tests {
     }
 
     #[test]
-    fn persona_paths_include_local_and_home_files() {
+    fn persona_paths_use_base_then_overrides_precedence() {
         let dir = tempdir().unwrap();
-        let config_path = dir.path().join("config.toml");
-        let persona_dir = dir.path().join(".hajimi");
-        fs::write(dir.path().join("soul.md"), "Speak tersely.").unwrap();
+        let config_dir = dir.path().join("config-dir");
+        let cwd_dir = dir.path().join("workspace");
+        let persona_dir = dir.path().join("persona-base");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::create_dir_all(&cwd_dir).unwrap();
         ensure_persona_files(&persona_dir).unwrap();
+        fs::write(config_dir.join("soul.md"), "config soul").unwrap();
+        fs::write(cwd_dir.join("tools.md"), "cwd tools").unwrap();
+        let previous_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&cwd_dir).unwrap();
 
-        let paths = resolve_persona_paths(
-            Some(&config_path),
+        let (mode, paths) = resolve_persona_paths(
+            Some(&config_dir.join("config.toml")),
             &PersonaSection {
                 directory: Some(persona_dir.clone()),
                 prompt_files: vec![],
             },
         )
         .unwrap();
-        assert!(paths.contains(&persona_dir.join("identity.md")));
-        assert!(paths.contains(&dir.path().join("soul.md")));
-        assert!(paths.contains(&persona_dir.join("skills.md")));
+
+        std::env::set_current_dir(previous_cwd).unwrap();
+
+        assert_eq!(mode, PromptSourceMode::AutoDiscovery);
+        assert_eq!(paths[0], persona_dir.join("identity.md"));
+        assert!(
+            paths
+                .iter()
+                .position(|path| path == &config_dir.join("soul.md"))
+                .unwrap()
+                < paths
+                    .iter()
+                    .position(|path| path == &cwd_dir.join("tools.md"))
+                    .unwrap()
+        );
+    }
+
+    #[test]
+    fn persona_paths_respect_explicit_prompt_files_order() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let explicit = vec![
+            Path::new("custom/identity.md").to_path_buf(),
+            Path::new("soul.md").to_path_buf(),
+        ];
+        let (mode, paths) = resolve_persona_paths(
+            Some(&config_path),
+            &PersonaSection {
+                directory: Some(dir.path().join("persona")),
+                prompt_files: explicit.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(mode, PromptSourceMode::ExplicitList);
+        assert_eq!(paths[0], dir.path().join("custom").join("identity.md"));
+        assert_eq!(paths[1], dir.path().join("soul.md"));
     }
 
     #[test]

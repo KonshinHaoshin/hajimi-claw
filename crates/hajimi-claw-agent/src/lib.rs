@@ -448,6 +448,13 @@ impl AgentRuntime {
     }
 
     pub async fn persona_list(&self) -> ClawResult<String> {
+        if let Some(report) = self.prompt_source.describe()? {
+            let heartbeat_path = self.persona_dir.join("heartbeat.md");
+            return Ok(report
+                .with_runtime_entry(heartbeat_path)
+                .render_persona_list());
+        }
+
         let mut lines = Vec::new();
         for file in persona_file_names() {
             let path = self.persona_dir.join(file);
@@ -1183,8 +1190,7 @@ impl AgentRuntime {
                     messages: vec![ConversationMessage {
                         role: MessageRole::User,
                         content: format!(
-                            "Original user request:\n{}\n\nCoordinator assignment:\n{}",
-                            original_prompt, brief
+                            "Original user request:\n{original_prompt}\n\nCoordinator assignment:\n{brief}"
                         ),
                         created_at: Utc::now(),
                     }],
@@ -1251,8 +1257,7 @@ impl AgentRuntime {
         {
             Ok(text) if !text.trim().is_empty() => Ok(text),
             Ok(_) | Err(_) => Ok(format!(
-                "I used {} sub-agents for this request.\n\nCoordinator plan:\n{}\n\n{}",
-                worker_count, coordinator_plan, summary_block
+                "I used {worker_count} sub-agents for this request.\n\nCoordinator plan:\n{coordinator_plan}\n\n{summary_block}"
             )),
         }
     }
@@ -1439,6 +1444,173 @@ Rules:
 
 pub trait SystemPromptSource: Send + Sync {
     fn load(&self) -> ClawResult<String>;
+
+    fn describe(&self) -> ClawResult<Option<PromptSourceReport>> {
+        Ok(None)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptSourceMode {
+    AutoDiscovery,
+    ExplicitList,
+}
+
+impl PromptSourceMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::AutoDiscovery => "auto-discovery",
+            Self::ExplicitList => "explicit [persona].prompt_files",
+        }
+    }
+
+    fn precedence_label(self) -> &'static str {
+        match self {
+            Self::AutoDiscovery => {
+                "persona.directory -> config directory -> current working directory"
+            }
+            Self::ExplicitList => "uses the configured prompt_files order",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PromptLayer {
+    Identity,
+    Soul,
+    OperationalExtensions,
+    RuntimeConfig,
+}
+
+impl PromptLayer {
+    fn heading(self) -> &'static str {
+        match self {
+            Self::Identity => "identity layer",
+            Self::Soul => "soul layer",
+            Self::OperationalExtensions => "operational extensions",
+            Self::RuntimeConfig => "runtime config",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptParseMode {
+    Structured,
+    Legacy,
+    Markdown,
+    Missing,
+    Empty,
+    RuntimeOnly,
+}
+
+impl PromptParseMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Structured => "structured",
+            Self::Legacy => "legacy",
+            Self::Markdown => "markdown",
+            Self::Missing => "missing",
+            Self::Empty => "empty",
+            Self::RuntimeOnly => "runtime-only",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PromptSourceEntry {
+    pub path: PathBuf,
+    pub layer: PromptLayer,
+    pub label: String,
+    pub included: bool,
+    pub parse_mode: PromptParseMode,
+}
+
+impl PromptSourceEntry {
+    fn new(
+        path: PathBuf,
+        layer: PromptLayer,
+        label: String,
+        included: bool,
+        parse_mode: PromptParseMode,
+    ) -> Self {
+        Self {
+            path,
+            layer,
+            label,
+            included,
+            parse_mode,
+        }
+    }
+
+    fn runtime_only(path: PathBuf) -> Self {
+        Self::new(
+            path.clone(),
+            PromptLayer::RuntimeConfig,
+            file_label(&path),
+            false,
+            PromptParseMode::RuntimeOnly,
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PromptSourceReport {
+    pub mode: PromptSourceMode,
+    pub entries: Vec<PromptSourceEntry>,
+}
+
+impl PromptSourceReport {
+    pub fn contains_path(&self, path: &Path) -> bool {
+        self.entries.iter().any(|entry| entry.path == path)
+    }
+
+    pub fn with_runtime_entry(mut self, path: PathBuf) -> Self {
+        if !self.contains_path(&path) {
+            self.entries.push(PromptSourceEntry::runtime_only(path));
+        }
+        self
+    }
+
+    pub fn render_persona_list(&self) -> String {
+        let mut lines = vec![
+            "persona effective view".to_string(),
+            format!("source mode: {}", self.mode.label()),
+            format!("precedence: {}", self.mode.precedence_label()),
+            "prompt order: base system prompt -> identity layer -> soul layer -> operational extensions -> runtime overlays".to_string(),
+        ];
+        for layer in [
+            PromptLayer::Identity,
+            PromptLayer::Soul,
+            PromptLayer::OperationalExtensions,
+            PromptLayer::RuntimeConfig,
+        ] {
+            let entries = self
+                .entries
+                .iter()
+                .filter(|entry| entry.layer == layer)
+                .collect::<Vec<_>>();
+            if entries.is_empty() {
+                continue;
+            }
+            lines.push(String::new());
+            lines.push(format!("[{}]", layer.heading()));
+            for entry in entries {
+                let status = if entry.included {
+                    "included"
+                } else {
+                    "excluded"
+                };
+                lines.push(format!(
+                    "{}\t{}\t{}\t{}",
+                    status,
+                    entry.label,
+                    entry.parse_mode.label(),
+                    entry.path.display()
+                ));
+            }
+        }
+        lines.join("\n")
+    }
 }
 
 pub struct StaticSystemPrompt {
@@ -1459,48 +1631,498 @@ impl SystemPromptSource for StaticSystemPrompt {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersonaFileKind {
+    Identity,
+    Soul,
+    Agents,
+    Tools,
+    Skills,
+    Heartbeat,
+    Additional,
+}
+
+impl PersonaFileKind {
+    fn layer(self) -> PromptLayer {
+        match self {
+            Self::Identity => PromptLayer::Identity,
+            Self::Soul => PromptLayer::Soul,
+            Self::Heartbeat => PromptLayer::RuntimeConfig,
+            Self::Agents | Self::Tools | Self::Skills | Self::Additional => {
+                PromptLayer::OperationalExtensions
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct StructuredPersonaLayer {
+    fields: BTreeMap<String, Vec<String>>,
+    notes: Vec<String>,
+}
+
+impl StructuredPersonaLayer {
+    fn is_empty(&self) -> bool {
+        self.fields.values().all(Vec::is_empty) && self.notes.is_empty()
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ParsedPersonaLayer {
+    Structured {
+        fields: BTreeMap<String, Vec<String>>,
+        body: String,
+    },
+    Legacy(String),
+}
+
+#[derive(Debug, Clone)]
+struct ExtensionBlock {
+    title: &'static str,
+    content: String,
+}
+
+impl ExtensionBlock {
+    fn new(kind: PersonaFileKind, content: String) -> Self {
+        let title = match kind {
+            PersonaFileKind::Agents => "Agents and delegation",
+            PersonaFileKind::Tools => "Tools and safety",
+            PersonaFileKind::Skills => "Skills and workflows",
+            PersonaFileKind::Additional => "Additional guidance",
+            _ => "Additional guidance",
+        };
+        Self { title, content }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CompiledPromptSource {
+    report: PromptSourceReport,
+    identity: StructuredPersonaLayer,
+    soul: StructuredPersonaLayer,
+    extensions: Vec<ExtensionBlock>,
+}
+
 pub struct MarkdownPromptSource {
     base_prompt: String,
     files: Vec<PathBuf>,
+    mode: PromptSourceMode,
 }
 
 impl MarkdownPromptSource {
     pub fn new(base_prompt: impl Into<String>, files: Vec<PathBuf>) -> Self {
+        Self::with_mode(base_prompt, files, PromptSourceMode::AutoDiscovery)
+    }
+
+    pub fn with_mode(
+        base_prompt: impl Into<String>,
+        files: Vec<PathBuf>,
+        mode: PromptSourceMode,
+    ) -> Self {
         Self {
             base_prompt: base_prompt.into(),
             files,
+            mode,
         }
+    }
+
+    fn compile(&self) -> ClawResult<CompiledPromptSource> {
+        let mut entries = Vec::new();
+        let mut identity = StructuredPersonaLayer::default();
+        let mut soul = StructuredPersonaLayer::default();
+        let mut extensions = Vec::new();
+
+        for path in &self.files {
+            let label = file_label(path);
+            let kind = classify_persona_file(path);
+            if matches!(kind, PersonaFileKind::Heartbeat) {
+                entries.push(PromptSourceEntry::new(
+                    path.clone(),
+                    kind.layer(),
+                    label,
+                    false,
+                    PromptParseMode::RuntimeOnly,
+                ));
+                continue;
+            }
+
+            let content = match fs::read_to_string(path) {
+                Ok(content) => content,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    entries.push(PromptSourceEntry::new(
+                        path.clone(),
+                        kind.layer(),
+                        label,
+                        false,
+                        PromptParseMode::Missing,
+                    ));
+                    continue;
+                }
+                Err(err) => return Err(ClawError::Backend(err.to_string())),
+            };
+            let trimmed = content.trim();
+            if trimmed.is_empty() {
+                entries.push(PromptSourceEntry::new(
+                    path.clone(),
+                    kind.layer(),
+                    label,
+                    false,
+                    PromptParseMode::Empty,
+                ));
+                continue;
+            }
+
+            match kind {
+                PersonaFileKind::Identity => {
+                    let parse_mode =
+                        merge_structured_layer(&mut identity, parse_persona_layer(trimmed));
+                    entries.push(PromptSourceEntry::new(
+                        path.clone(),
+                        kind.layer(),
+                        label,
+                        true,
+                        parse_mode,
+                    ));
+                }
+                PersonaFileKind::Soul => {
+                    let parse_mode =
+                        merge_structured_layer(&mut soul, parse_persona_layer(trimmed));
+                    entries.push(PromptSourceEntry::new(
+                        path.clone(),
+                        kind.layer(),
+                        label,
+                        true,
+                        parse_mode,
+                    ));
+                }
+                PersonaFileKind::Agents
+                | PersonaFileKind::Tools
+                | PersonaFileKind::Skills
+                | PersonaFileKind::Additional => {
+                    extensions.push(ExtensionBlock::new(kind, clamp_prompt_content(trimmed)));
+                    entries.push(PromptSourceEntry::new(
+                        path.clone(),
+                        kind.layer(),
+                        label,
+                        true,
+                        PromptParseMode::Markdown,
+                    ));
+                }
+                PersonaFileKind::Heartbeat => unreachable!(),
+            }
+        }
+
+        Ok(CompiledPromptSource {
+            report: PromptSourceReport {
+                mode: self.mode,
+                entries,
+            },
+            identity,
+            soul,
+            extensions,
+        })
     }
 }
 
 impl SystemPromptSource for MarkdownPromptSource {
     fn load(&self) -> ClawResult<String> {
+        let compiled = self.compile()?;
         let mut prompt = self.base_prompt.clone();
         let mut sections = Vec::new();
-        for path in &self.files {
-            let content = match fs::read_to_string(path) {
-                Ok(content) => content,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => return Err(ClawError::Backend(err.to_string())),
-            };
-            let trimmed = content.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            sections.push(format!(
-                "[{}]\n{}",
-                file_label(path),
-                clamp_prompt_content(trimmed)
-            ));
+        if let Some(section) = render_structured_persona_layer(
+            "Identity layer",
+            &[
+                "summary",
+                "owned_systems",
+                "environments",
+                "standing_preferences",
+                "hard_constraints",
+            ],
+            &compiled.identity,
+        ) {
+            sections.push(section);
+        }
+        if let Some(section) = render_structured_persona_layer(
+            "Soul layer",
+            &[
+                "name",
+                "role",
+                "tone",
+                "style",
+                "non_goals",
+                "behavioral_rules",
+            ],
+            &compiled.soul,
+        ) {
+            sections.push(section);
+        }
+        if let Some(section) = render_operational_extensions(&compiled.extensions) {
+            sections.push(section);
         }
         if !sections.is_empty() {
             prompt.push_str(
-                "\n\nLocal markdown guidance is attached below. Treat it as repo-specific operating guidance and persona shaping context.\n\n",
+                "\n\nApply the layered persona context below after the base system rules. Identity captures the user and durable environment. Soul defines Hajimi's stable character. Operational extensions add workflow, delegation, and tool guidance.\n\n",
             );
             prompt.push_str(&sections.join("\n\n"));
         }
         Ok(prompt)
     }
+
+    fn describe(&self) -> ClawResult<Option<PromptSourceReport>> {
+        Ok(Some(self.compile()?.report))
+    }
+}
+
+fn classify_persona_file(path: &Path) -> PersonaFileKind {
+    match file_label(path).to_ascii_lowercase().as_str() {
+        "identity.md" => PersonaFileKind::Identity,
+        "soul.md" => PersonaFileKind::Soul,
+        "agents.md" => PersonaFileKind::Agents,
+        "tools.md" => PersonaFileKind::Tools,
+        "skills.md" => PersonaFileKind::Skills,
+        "heartbeat.md" => PersonaFileKind::Heartbeat,
+        _ => PersonaFileKind::Additional,
+    }
+}
+
+fn merge_structured_layer(
+    target: &mut StructuredPersonaLayer,
+    parsed: ParsedPersonaLayer,
+) -> PromptParseMode {
+    match parsed {
+        ParsedPersonaLayer::Structured { fields, body } => {
+            for (key, value) in fields {
+                target.fields.insert(key, value);
+            }
+            let body = clamp_prompt_content(body.trim());
+            if !body.is_empty() {
+                target.notes.push(body);
+            }
+            PromptParseMode::Structured
+        }
+        ParsedPersonaLayer::Legacy(body) => {
+            let body = clamp_prompt_content(body.trim());
+            if !body.is_empty() {
+                target.notes.push(body);
+            }
+            PromptParseMode::Legacy
+        }
+    }
+}
+
+fn parse_persona_layer(content: &str) -> ParsedPersonaLayer {
+    let trimmed = content.trim();
+    let Some((front_matter, body)) = split_front_matter(trimmed) else {
+        return ParsedPersonaLayer::Legacy(trimmed.to_string());
+    };
+    let Some(fields) = parse_front_matter_map(front_matter) else {
+        return ParsedPersonaLayer::Legacy(trimmed.to_string());
+    };
+    ParsedPersonaLayer::Structured {
+        fields,
+        body: body.trim().to_string(),
+    }
+}
+
+fn split_front_matter(content: &str) -> Option<(&str, &str)> {
+    static FRONT_MATTER_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let regex = FRONT_MATTER_RE.get_or_init(|| {
+        Regex::new(r"\A---\r?\n(?P<front>[\s\S]*?)\r?\n---(?:\r?\n(?P<body>[\s\S]*))?\z")
+            .expect("valid front matter regex")
+    });
+    let captures = regex.captures(content)?;
+    Some((
+        captures.name("front")?.as_str(),
+        captures
+            .name("body")
+            .map(|value| value.as_str())
+            .unwrap_or(""),
+    ))
+}
+
+fn parse_front_matter_map(front_matter: &str) -> Option<BTreeMap<String, Vec<String>>> {
+    let lines = front_matter.lines().collect::<Vec<_>>();
+    let mut index = 0usize;
+    let mut fields = BTreeMap::new();
+    while index < lines.len() {
+        let line = lines[index].trim_end();
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            index += 1;
+            continue;
+        }
+        if line.starts_with(' ') || line.starts_with('\t') {
+            return None;
+        }
+        let (raw_key, raw_value) = trimmed.split_once(':')?;
+        let key = normalize_front_matter_key(raw_key);
+        if key.is_empty() {
+            return None;
+        }
+        let value = raw_value.trim();
+        if !value.is_empty() {
+            fields.insert(key, vec![normalize_front_matter_value(value)]);
+            index += 1;
+            continue;
+        }
+
+        index += 1;
+        let mut values = Vec::new();
+        while index < lines.len() {
+            let next = lines[index];
+            let next_trimmed = next.trim();
+            if next_trimmed.is_empty() {
+                index += 1;
+                continue;
+            }
+            if !next.starts_with(' ') && !next.starts_with('\t') {
+                break;
+            }
+            if let Some(item) = next_trimmed.strip_prefix("- ") {
+                values.push(normalize_front_matter_value(item.trim()));
+            } else {
+                values.push(normalize_front_matter_value(next_trimmed));
+            }
+            index += 1;
+        }
+        fields.insert(key, values);
+    }
+    Some(
+        fields
+            .into_iter()
+            .map(|(key, values)| {
+                (
+                    key,
+                    values
+                        .into_iter()
+                        .map(|value| clamp_prompt_content(value.trim()))
+                        .collect(),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn normalize_front_matter_key(value: &str) -> String {
+    let mut normalized = String::new();
+    let mut last_was_underscore = false;
+    for ch in value.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            normalized.push(ch.to_ascii_lowercase());
+            last_was_underscore = false;
+        } else if !last_was_underscore {
+            normalized.push('_');
+            last_was_underscore = true;
+        }
+    }
+    normalized.trim_matches('_').to_string()
+}
+
+fn normalize_front_matter_value(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() >= 2 {
+        let first = trimmed.chars().next().unwrap_or_default();
+        let last = trimmed.chars().last().unwrap_or_default();
+        if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+            return trimmed[1..trimmed.len() - 1].trim().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+fn render_structured_persona_layer(
+    title: &str,
+    preferred_keys: &[&str],
+    layer: &StructuredPersonaLayer,
+) -> Option<String> {
+    if layer.is_empty() {
+        return None;
+    }
+    let mut lines = vec![format!("## {title}")];
+    let mut emitted = Vec::new();
+    for key in preferred_keys {
+        if let Some(values) = layer.fields.get(*key) {
+            render_front_matter_field(&mut lines, key, values);
+            emitted.push((*key).to_string());
+        }
+    }
+    for (key, values) in &layer.fields {
+        if emitted.iter().any(|item| item == key) {
+            continue;
+        }
+        render_front_matter_field(&mut lines, key, values);
+    }
+    if !layer.notes.is_empty() {
+        lines.push("### Notes".into());
+        for note in &layer.notes {
+            lines.push(note.clone());
+        }
+    }
+    Some(lines.join("\n"))
+}
+
+fn render_front_matter_field(lines: &mut Vec<String>, key: &str, values: &[String]) {
+    let values = values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return;
+    }
+    let label = humanize_front_matter_key(key);
+    if values.len() == 1 {
+        lines.push(format!("- {}: {}", label, values[0]));
+        return;
+    }
+    lines.push(format!("- {label}:"));
+    for value in values {
+        lines.push(format!("  - {value}"));
+    }
+}
+
+fn humanize_front_matter_key(key: &str) -> String {
+    match key {
+        "summary" => "Summary".into(),
+        "owned_systems" => "Owned systems".into(),
+        "environments" => "Environments".into(),
+        "standing_preferences" => "Standing preferences".into(),
+        "hard_constraints" => "Hard constraints".into(),
+        "name" => "Name".into(),
+        "role" => "Role".into(),
+        "tone" => "Tone".into(),
+        "style" => "Style".into(),
+        "non_goals" => "Non-goals".into(),
+        "behavioral_rules" => "Behavioral rules".into(),
+        _ => key
+            .split('_')
+            .filter(|part| !part.is_empty())
+            .map(|part| {
+                let mut chars = part.chars();
+                match chars.next() {
+                    Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+                    None => String::new(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+fn render_operational_extensions(blocks: &[ExtensionBlock]) -> Option<String> {
+    let blocks = blocks
+        .iter()
+        .filter(|block| !block.content.trim().is_empty())
+        .collect::<Vec<_>>();
+    if blocks.is_empty() {
+        return None;
+    }
+    let mut lines = vec!["## Operational extensions".to_string()];
+    for block in blocks {
+        lines.push(format!("### {}", block.title));
+        lines.push(block.content.clone());
+    }
+    Some(lines.join("\n"))
 }
 
 fn clamp_prompt_content(content: &str) -> String {
@@ -1590,7 +2212,7 @@ fn resolve_worker_count(
     preference: MultiAgentPreference,
 ) -> usize {
     requested_worker_count(prompt)
-        .or_else(|| match preference {
+        .or(match preference {
             MultiAgentPreference::ForceOn => Some(config.default_workers),
             _ => None,
         })
@@ -1710,13 +2332,18 @@ fn select_tool(prompt: &str) -> Option<(&'static str, serde_json::Value)> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use anyhow::Result;
     use chrono::Utc;
     use hajimi_claw_exec::{LocalExecutor, PlatformMode};
+    use hajimi_claw_llm::StaticBackend;
     use hajimi_claw_policy::{PolicyConfig, PolicyEngine};
     use hajimi_claw_store::Store;
+    use hajimi_claw_tools::ToolRegistry;
     use hajimi_claw_types::{
         AgentEvent, AgentRequest, AgentStream, ClawResult, LlmBackend, ProviderCapabilities,
         ProviderConfig, ProviderKind, ProviderRecord,
@@ -1725,8 +2352,10 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::{
-        AgentRuntime, MultiAgentConfig, MultiAgentPreference, parse_worker_briefs,
-        requested_worker_count, resolve_worker_count, should_delegate_multi_agent,
+        AgentRuntime, MarkdownPromptSource, MultiAgentConfig, MultiAgentPreference,
+        PromptParseMode, PromptSourceMode, StaticSystemPrompt, SystemPromptSource,
+        parse_persona_layer, parse_worker_briefs, requested_worker_count, resolve_worker_count,
+        should_delegate_multi_agent,
     };
 
     #[tokio::test]
@@ -1759,6 +2388,27 @@ mod tests {
 
     struct ScriptedBackend {
         calls: Mutex<usize>,
+    }
+
+    struct CountingPromptSource {
+        loads: Arc<AtomicUsize>,
+        prompt: String,
+    }
+
+    impl CountingPromptSource {
+        fn new(loads: Arc<AtomicUsize>, prompt: impl Into<String>) -> Self {
+            Self {
+                loads,
+                prompt: prompt.into(),
+            }
+        }
+    }
+
+    impl SystemPromptSource for CountingPromptSource {
+        fn load(&self) -> ClawResult<String> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            Ok(self.prompt.clone())
+        }
     }
 
     #[async_trait::async_trait]
@@ -1841,9 +2491,7 @@ mod tests {
             tools,
             store,
             policy,
-            Arc::new(super::StaticSystemPrompt::new(
-                super::default_system_prompt(),
-            )),
+            Arc::new(StaticSystemPrompt::new(super::default_system_prompt())),
             std::env::temp_dir(),
             MultiAgentConfig::default(),
         );
@@ -1853,6 +2501,282 @@ mod tests {
             .await
             .expect("agent response");
         assert_eq!(response, "tool loop ok");
+        Ok(())
+    }
+
+    fn write_persona_file(dir: &std::path::Path, name: &str, content: &str) {
+        fs::write(dir.join(name), content).unwrap();
+    }
+
+    fn build_test_runtime(
+        llm: Arc<dyn LlmBackend>,
+        prompt_source: Arc<dyn SystemPromptSource>,
+    ) -> AgentRuntime {
+        build_test_runtime_with_persona_dir(llm, prompt_source, std::env::temp_dir())
+    }
+
+    fn build_test_runtime_with_persona_dir(
+        llm: Arc<dyn LlmBackend>,
+        prompt_source: Arc<dyn SystemPromptSource>,
+        persona_dir: PathBuf,
+    ) -> AgentRuntime {
+        let policy = Arc::new(PolicyEngine::new(PolicyConfig::default()));
+        let executor = Arc::new(LocalExecutor::new(
+            policy.clone(),
+            PlatformMode::WindowsSafe,
+        ));
+        let tools = Arc::new(ToolRegistry::default(executor, policy.clone()));
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        store
+            .upsert_provider(&ProviderRecord {
+                config: ProviderConfig {
+                    id: "test-provider".into(),
+                    label: "Test Provider".into(),
+                    kind: ProviderKind::OpenAiCompatible,
+                    base_url: "https://example.com/v1".into(),
+                    api_key: "secret".into(),
+                    model: "gpt-test".into(),
+                    fallback_models: vec![],
+                    capabilities: ProviderCapabilities {
+                        tool_calling: true,
+                        streaming: false,
+                        json_mode: false,
+                        max_context_chars: Some(24_000),
+                    },
+                    enabled: true,
+                    extra_headers: vec![],
+                    created_at: Utc::now(),
+                },
+                is_default: true,
+            })
+            .unwrap();
+        AgentRuntime::new(
+            llm,
+            tools,
+            store,
+            policy,
+            prompt_source,
+            persona_dir,
+            MultiAgentConfig::default(),
+        )
+    }
+
+    #[test]
+    fn plain_text_identity_and_soul_render_as_legacy_layers() {
+        let dir = tempdir().unwrap();
+        write_persona_file(dir.path(), "identity.md", "User runs two VPS nodes.");
+        write_persona_file(dir.path(), "soul.md", "Stay concise and calm.");
+        let source = MarkdownPromptSource::with_mode(
+            "base",
+            vec![dir.path().join("identity.md"), dir.path().join("soul.md")],
+            PromptSourceMode::ExplicitList,
+        );
+
+        let prompt = source.load().unwrap();
+        assert!(prompt.contains("## Identity layer"));
+        assert!(prompt.contains("User runs two VPS nodes."));
+        assert!(prompt.contains("## Soul layer"));
+        assert!(prompt.contains("Stay concise and calm."));
+        assert!(!prompt.contains("## Operational extensions"));
+    }
+
+    #[test]
+    fn structured_front_matter_parses_and_renders_fields() {
+        let dir = tempdir().unwrap();
+        write_persona_file(
+            dir.path(),
+            "identity.md",
+            "---\nsummary: Alice on-call owner\nowned systems:\n  - prod-api\nstanding preferences:\n  - be terse\n---\n\nExtra note.",
+        );
+        let source = MarkdownPromptSource::with_mode(
+            "base",
+            vec![dir.path().join("identity.md")],
+            PromptSourceMode::ExplicitList,
+        );
+
+        let prompt = source.load().unwrap();
+        assert!(prompt.contains("- Summary: Alice on-call owner"));
+        assert!(prompt.contains("- Owned systems: prod-api"));
+        assert!(prompt.contains("- Standing preferences: be terse"));
+        assert!(prompt.contains("### Notes\nExtra note."));
+        let report = source.describe().unwrap().unwrap();
+        assert!(matches!(
+            report.entries[0].parse_mode,
+            PromptParseMode::Structured
+        ));
+    }
+
+    #[test]
+    fn malformed_front_matter_falls_back_to_legacy() {
+        let parsed = parse_persona_layer("---\nsummary\n---\nBody text");
+        match parsed {
+            super::ParsedPersonaLayer::Legacy(body) => {
+                assert!(body.contains("Body text"));
+            }
+            _ => panic!("expected legacy fallback"),
+        }
+    }
+
+    #[test]
+    fn merge_rules_override_structured_fields_and_keep_notes() {
+        let dir = tempdir().unwrap();
+        let base_dir = dir.path().join("base");
+        let override_dir = dir.path().join("override");
+        fs::create_dir_all(&base_dir).unwrap();
+        fs::create_dir_all(&override_dir).unwrap();
+        write_persona_file(
+            &base_dir,
+            "identity.md",
+            "---\nsummary: Base summary\nowned_systems:\n  - prod-api\n---\n\nBase note.",
+        );
+        write_persona_file(
+            &override_dir,
+            "identity.md",
+            "---\nsummary: Override summary\nhard_constraints:\n  - never touch prod without approval\n---\n\nOverride note.",
+        );
+        let source = MarkdownPromptSource::with_mode(
+            "base",
+            vec![
+                base_dir.join("identity.md"),
+                override_dir.join("identity.md"),
+            ],
+            PromptSourceMode::ExplicitList,
+        );
+
+        let prompt = source.load().unwrap();
+        assert!(prompt.contains("- Summary: Override summary"));
+        assert!(prompt.contains("- Hard constraints: never touch prod without approval"));
+        assert!(prompt.contains("Base note."));
+        assert!(prompt.contains("Override note."));
+        assert!(!prompt.contains("Base summary"));
+    }
+
+    #[test]
+    fn operational_extensions_render_in_stable_order() {
+        let dir = tempdir().unwrap();
+        let base_dir = dir.path().join("base");
+        let override_dir = dir.path().join("override");
+        fs::create_dir_all(&base_dir).unwrap();
+        fs::create_dir_all(&override_dir).unwrap();
+        write_persona_file(&base_dir, "agents.md", "Agent policy");
+        write_persona_file(&override_dir, "AGENTS.md", "Repo-local agent override");
+        write_persona_file(&override_dir, "tools.md", "Tool policy");
+        write_persona_file(&override_dir, "skills.md", "Skill hints");
+        let source = MarkdownPromptSource::with_mode(
+            "base",
+            vec![
+                base_dir.join("agents.md"),
+                override_dir.join("AGENTS.md"),
+                override_dir.join("tools.md"),
+                override_dir.join("skills.md"),
+            ],
+            PromptSourceMode::ExplicitList,
+        );
+
+        let prompt = source.load().unwrap();
+        let agent_policy = prompt.find("Agent policy").unwrap();
+        let repo_override = prompt.find("Repo-local agent override").unwrap();
+        let tool_policy = prompt.find("Tool policy").unwrap();
+        let skill_hints = prompt.find("Skill hints").unwrap();
+        assert!(agent_policy < repo_override);
+        assert!(repo_override < tool_policy);
+        assert!(tool_policy < skill_hints);
+    }
+
+    #[test]
+    fn heartbeat_is_reported_but_excluded_from_prompt() {
+        let dir = tempdir().unwrap();
+        write_persona_file(dir.path(), "heartbeat.md", "enabled: false");
+        let source = MarkdownPromptSource::with_mode(
+            "base",
+            vec![dir.path().join("heartbeat.md")],
+            PromptSourceMode::ExplicitList,
+        );
+
+        let prompt = source.load().unwrap();
+        assert_eq!(prompt, "base");
+        let report = source.describe().unwrap().unwrap();
+        assert_eq!(report.entries.len(), 1);
+        assert!(!report.entries[0].included);
+        assert!(matches!(
+            report.entries[0].parse_mode,
+            PromptParseMode::RuntimeOnly
+        ));
+    }
+
+    #[test]
+    fn describe_marks_missing_and_empty_files() {
+        let dir = tempdir().unwrap();
+        write_persona_file(dir.path(), "soul.md", "   \n\n");
+        let source = MarkdownPromptSource::with_mode(
+            "base",
+            vec![dir.path().join("identity.md"), dir.path().join("soul.md")],
+            PromptSourceMode::ExplicitList,
+        );
+
+        let report = source.describe().unwrap().unwrap();
+        assert!(matches!(
+            report.entries[0].parse_mode,
+            PromptParseMode::Missing
+        ));
+        assert!(matches!(
+            report.entries[1].parse_mode,
+            PromptParseMode::Empty
+        ));
+    }
+
+    #[tokio::test]
+    async fn persona_list_renders_effective_view() {
+        let dir = tempdir().unwrap();
+        write_persona_file(dir.path(), "identity.md", "identity body");
+        let runtime = build_test_runtime_with_persona_dir(
+            Arc::new(StaticBackend::new("fallback")),
+            Arc::new(MarkdownPromptSource::with_mode(
+                "base",
+                vec![dir.path().join("identity.md")],
+                PromptSourceMode::ExplicitList,
+            )),
+            dir.path().to_path_buf(),
+        );
+
+        let list = runtime.persona_list().await.unwrap();
+        assert!(list.contains("persona effective view"));
+        assert!(list.contains("[identity layer]"));
+        assert!(list.contains("identity.md"));
+        assert!(list.contains("runtime-only"));
+    }
+
+    #[tokio::test]
+    async fn single_agent_keeps_request_time_prompt_loading() -> Result<()> {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let runtime = build_test_runtime(
+            Arc::new(StaticBackend::new("done")),
+            Arc::new(CountingPromptSource::new(loads.clone(), "prompt")),
+        );
+        let reply = runtime
+            .ask_with_provider_and_preference("hello", None, None, MultiAgentPreference::ForceOff)
+            .await?;
+        assert_eq!(reply, "done");
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multi_agent_keeps_request_time_prompt_loading() -> Result<()> {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let runtime = build_test_runtime(
+            Arc::new(StaticBackend::new("WORKER 1: first\nWORKER 2: second")),
+            Arc::new(CountingPromptSource::new(loads.clone(), "prompt")),
+        );
+        let _reply = runtime
+            .ask_with_provider_and_preference(
+                "use 2 agents for this",
+                None,
+                None,
+                MultiAgentPreference::ForceOn,
+            )
+            .await?;
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
         Ok(())
     }
 
