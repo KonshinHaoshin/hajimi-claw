@@ -14,6 +14,8 @@ Single-user Telegram/Feishu-first ops agent in Rust.
 - Windows-safe execution mode with allowlist checks and Job Object cleanup
 - Channel-aware onboarding for Telegram or Feishu plus provider/model setup
 - Configurable multi-agent orchestration with coordinator/worker/integrator flow
+- Executable skills registered as first-class tools with shared approval, audit, and persistence
+- Capability inventory and MCP server status surfaced in chat via `/capabilities`, `/skills`, and `/mcp`
 
 ## Running
 
@@ -171,6 +173,55 @@ Current Feishu limitations:
 `hajimi ask` now records task state and tool invocations in SQLite. If a guarded command blocks on
 approval, `hajimi approve <request-id>` resumes the blocked task instead of asking you to rerun it.
 
+## Skills and MCP
+
+Hajimi now treats native tools, executable skills, and MCP-discovered tools as one capability
+surface.
+
+- Native tools keep their existing names such as `read_file` or `exec_once`
+- Executable skills are configured in `[skills]` and are registered as tool names like
+  `skill.deploy`
+- MCP tools will be exposed as namespaced tool names like `mcp.<server>.<tool>`
+- All three flow through the same runtime path for approval, audit logging, task persistence, and
+  model tool-calling
+
+`skills.md` remains prompt guidance only. Use it for playbooks, habits, and routing hints. It is
+not the executable source of truth for runnable skills.
+
+### Config
+
+`config.example.toml` now includes these sections:
+
+```toml
+[skills]
+enabled = true
+directory = "./skills"
+manifest_paths = []
+entries = []
+
+[mcp]
+enabled = true
+servers = []
+```
+
+Skill manifests and inline entries deserialize into `ExecutableSkillConfig`, including `name`,
+`description`, `command`, `args`, `cwd`, `env_allowlist`, `requires_approval`, `timeout_secs`,
+`max_output_bytes`, and `input_schema`.
+
+Relative paths in skill manifests, `skills.directory`, `skills.manifest_paths`, and MCP server
+`cwd` values resolve relative to the config file.
+
+### Telegram capability commands
+
+- `/capabilities` — list the effective native tools, executable skills, and MCP tools
+- `/skills` — list executable skills only
+- `/skill run <name> <json-or-text>` — explicitly invoke one configured skill through the runtime
+- `/mcp` — show configured MCP server status
+- `/mcp tools [server]` — list discovered MCP tools, optionally filtered by server
+
+Natural-language requests stay primary. Once a skill or MCP tool is registered in the runtime, the
+model can choose it during normal `/ask` or plain-text requests just like built-in tools.
+
 ## Multi-Agent
 
 `hajimi` can split one natural-language request into multiple sub-agents. This is configured in
@@ -245,7 +296,7 @@ Use these files for:
 - `soul.md`: Hajimi's stable role, tone, style, and behavioral stance
 - `agents.md` or `AGENTS.md`: repo or operator instructions
 - `tools.md`: tool-use policy and operational preferences
-- `skills.md`: extra habits, playbooks, and skill-selection hints
+- `skills.md`: extra habits, playbooks, and skill-selection hints for the prompt layer only
 - `heartbeat.md`: daemon heartbeat runtime config
 
 ## Telegram commands
@@ -268,6 +319,11 @@ Use these files for:
 - `/persona write <file> <content>`
 - `/persona append <file> <content>`
 - `/ask <text>`
+- `/capabilities`
+- `/skills`
+- `/skill run <name> <json-or-text>`
+- `/mcp`
+- `/mcp tools [server]`
 - `/shell open [name]`
 - `/shell exec <cmd>`
 - `/shell close`

@@ -1,3 +1,5 @@
+mod mcp;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -21,6 +23,8 @@ use tokio::net::{TcpStream, lookup_host};
 use tokio::time::{Duration, timeout};
 use tokio_rustls::TlsConnector;
 use url::Url;
+
+pub use mcp::{McpBootstrapResult, bootstrap_mcp_servers};
 
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
@@ -83,16 +87,24 @@ impl ToolRegistry {
         Self::new(tools).with_mcp_servers(mcp_servers)
     }
 
+    pub fn tools_with_skill_configs(
+        executor: Arc<dyn Executor>,
+        policy: Arc<PolicyEngine>,
+        skills: Vec<ExecutableSkillConfig>,
+    ) -> Vec<Arc<dyn Tool>> {
+        let mut tools = Self::builtin_tools(executor.clone(), policy);
+        tools.extend(skills.into_iter().map(|skill| {
+            Arc::new(ExecutableSkillTool::new(executor.clone(), skill)) as Arc<dyn Tool>
+        }));
+        tools
+    }
+
     pub fn with_skill_configs(
         executor: Arc<dyn Executor>,
         policy: Arc<PolicyEngine>,
         skills: Vec<ExecutableSkillConfig>,
     ) -> Self {
-        let mut tools = Self::builtin_tools(executor.clone(), policy);
-        tools.extend(skills.into_iter().map(|skill| {
-            Arc::new(ExecutableSkillTool::new(executor.clone(), skill)) as Arc<dyn Tool>
-        }));
-        Self::new(tools)
+        Self::new(Self::tools_with_skill_configs(executor, policy, skills))
     }
 
     pub fn specs(&self) -> Vec<ToolSpec> {
@@ -1858,8 +1870,9 @@ mod tests {
     use hajimi_claw_exec::{LocalExecutor, PlatformMode};
     use hajimi_claw_policy::{PolicyConfig, PolicyEngine};
     use hajimi_claw_types::{
-        ClawError, ConversationId, ExecRequest, ExecResult, ExecutableSkillConfig, Executor,
-        SessionHandle, SessionId, SessionOpenRequest, ToolContext,
+        CapabilityId, CapabilityKind, ClawError, ClawResult, ConversationId, ExecRequest,
+        ExecResult, ExecutableSkillConfig, Executor, McpServerStatus, SessionHandle, SessionId,
+        SessionOpenRequest, Tool, ToolContext, ToolOutput, ToolSpec,
     };
     use serde_json::json;
     use tempfile::tempdir;
@@ -1868,6 +1881,33 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::ToolRegistry;
+
+    struct StubTool {
+        spec: ToolSpec,
+        capability_id: CapabilityId,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for StubTool {
+        fn spec(&self) -> ToolSpec {
+            self.spec.clone()
+        }
+
+        fn capability_id(&self) -> CapabilityId {
+            self.capability_id.clone()
+        }
+
+        async fn call(
+            &self,
+            _ctx: ToolContext,
+            _input: serde_json::Value,
+        ) -> ClawResult<ToolOutput> {
+            Ok(ToolOutput {
+                content: self.spec.name.clone(),
+                structured: None,
+            })
+        }
+    }
 
     #[tokio::test]
     async fn read_file_respects_policy() -> Result<()> {
@@ -2249,5 +2289,96 @@ mod tests {
 
         assert!(matches!(err, ClawError::InvalidRequest(_)));
         Ok(())
+    }
+
+    #[test]
+    fn capability_summaries_sort_native_skill_and_mcp_entries() {
+        let tools = ToolRegistry::from_parts(
+            vec![
+                Arc::new(StubTool {
+                    spec: ToolSpec {
+                        name: "mcp.deploy.run".into(),
+                        description: "Remote deploy".into(),
+                        requires_approval: true,
+                        input_schema: json!({"type": "object"}),
+                    },
+                    capability_id: CapabilityId {
+                        kind: CapabilityKind::McpTool,
+                        name: "mcp.deploy.run".into(),
+                        source: Some("deploy".into()),
+                    },
+                }) as Arc<dyn Tool>,
+                Arc::new(StubTool {
+                    spec: ToolSpec {
+                        name: "read_file".into(),
+                        description: "Read a file".into(),
+                        requires_approval: false,
+                        input_schema: json!({"type": "object"}),
+                    },
+                    capability_id: CapabilityId {
+                        kind: CapabilityKind::NativeTool,
+                        name: "read_file".into(),
+                        source: None,
+                    },
+                }) as Arc<dyn Tool>,
+                Arc::new(StubTool {
+                    spec: ToolSpec {
+                        name: "skill.deploy".into(),
+                        description: "Deploy helper".into(),
+                        requires_approval: true,
+                        input_schema: json!({"type": "object"}),
+                    },
+                    capability_id: CapabilityId {
+                        kind: CapabilityKind::Skill,
+                        name: "skill.deploy".into(),
+                        source: Some("deploy".into()),
+                    },
+                }) as Arc<dyn Tool>,
+                Arc::new(StubTool {
+                    spec: ToolSpec {
+                        name: "tail_file".into(),
+                        description: "Tail a file".into(),
+                        requires_approval: false,
+                        input_schema: json!({"type": "object"}),
+                    },
+                    capability_id: CapabilityId {
+                        kind: CapabilityKind::NativeTool,
+                        name: "tail_file".into(),
+                        source: None,
+                    },
+                }) as Arc<dyn Tool>,
+            ],
+            vec![],
+        );
+
+        let summaries = tools.capability_summaries();
+        assert_eq!(summaries.len(), 4);
+        assert_eq!(summaries[0].id.name, "read_file");
+        assert_eq!(summaries[1].id.name, "tail_file");
+        assert_eq!(summaries[2].id.name, "skill.deploy");
+        assert_eq!(summaries[2].id.kind, CapabilityKind::Skill);
+        assert!(summaries[2].requires_approval);
+        assert_eq!(summaries[3].id.name, "mcp.deploy.run");
+        assert_eq!(summaries[3].id.kind, CapabilityKind::McpTool);
+    }
+
+    #[test]
+    fn with_mcp_servers_keeps_status_inventory() {
+        let statuses = vec![
+            McpServerStatus {
+                name: "deploy".into(),
+                connected: true,
+                tool_count: 2,
+                message: "connected".into(),
+            },
+            McpServerStatus {
+                name: "broken".into(),
+                connected: false,
+                tool_count: 0,
+                message: "startup failed".into(),
+            },
+        ];
+        let registry = ToolRegistry::from_parts(vec![], statuses.clone());
+        assert_eq!(registry.mcp_server_statuses(), statuses.as_slice());
     }
 }

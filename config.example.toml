@@ -56,6 +56,21 @@ directory = "~/.hajimi"
 # config only and is never appended into the prompt.
 prompt_files = []
 
+[skills]
+# Executable skills are registered as tools named `skill.<name>`.
+enabled = true
+# Optional directory of TOML manifests. Relative paths resolve from this config file.
+directory = "./skills"
+# Optional extra manifest files.
+manifest_paths = []
+# Optional inline entries.
+entries = []
+
+[mcp]
+# MCP servers currently surface inventory/status in the runtime. Tool transport wiring is next.
+enabled = true
+servers = []
+
 [policy]
 admin_user_id = 123456789
 admin_chat_id = 123456789

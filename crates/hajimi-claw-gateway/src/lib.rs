@@ -1481,12 +1481,40 @@ mod tests {
     use hajimi_claw_policy::PolicyEngine;
     use hajimi_claw_store::Store;
     use hajimi_claw_tools::ToolRegistry;
+    use hajimi_claw_types::{
+        CapabilityId, CapabilityKind, ClawResult, Tool, ToolContext, ToolOutput, ToolSpec,
+    };
     use tempfile::tempdir;
 
     use super::{
         Gateway, GatewayCommand, GatewayRequest, InProcessGateway, SessionDirective,
         parse_gateway_command,
     };
+
+    struct StubSkillTool {
+        spec: ToolSpec,
+        capability_id: CapabilityId,
+        output: ToolOutput,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for StubSkillTool {
+        fn spec(&self) -> ToolSpec {
+            self.spec.clone()
+        }
+
+        fn capability_id(&self) -> CapabilityId {
+            self.capability_id.clone()
+        }
+
+        async fn call(
+            &self,
+            _ctx: ToolContext,
+            _input: serde_json::Value,
+        ) -> ClawResult<ToolOutput> {
+            Ok(self.output.clone())
+        }
+    }
 
     #[test]
     fn parses_provider_test_command() {
@@ -1600,6 +1628,40 @@ mod tests {
         assert!(help.contains("/skill run <name> <json-or-text>"));
         assert!(help.contains("/mcp"));
         assert!(help.contains("/mcp tools [server]"));
+    }
+
+    #[test]
+    fn parse_skill_input_supports_json_text_and_empty() {
+        assert_eq!(
+            super::parse_skill_input("{\"service\":\"api\"}").unwrap(),
+            serde_json::json!({ "service": "api" })
+        );
+        assert_eq!(
+            super::parse_skill_input(" deploy api ").unwrap(),
+            serde_json::json!({ "input": "deploy api" })
+        );
+        assert_eq!(
+            super::parse_skill_input("   ").unwrap(),
+            serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn capability_keyboards_link_related_views() {
+        let capabilities = super::capabilities_keyboard();
+        assert_eq!(capabilities.rows[0][0].data, "/skills");
+        assert_eq!(capabilities.rows[0][1].data, "/mcp");
+        assert_eq!(capabilities.rows[1][0].data, "/menu");
+
+        let skills = super::skills_keyboard();
+        assert_eq!(skills.rows[0][0].data, "/capabilities");
+        assert_eq!(skills.rows[0][1].data, "/mcp tools");
+        assert_eq!(skills.rows[1][0].data, "/menu");
+
+        let mcp = super::mcp_keyboard();
+        assert_eq!(mcp.rows[0][0].data, "/mcp tools");
+        assert_eq!(mcp.rows[0][1].data, "/capabilities");
+        assert_eq!(mcp.rows[1][0].data, "/menu");
     }
 
     #[test]
@@ -1834,6 +1896,163 @@ mod tests {
             .expect("preview should exist");
         assert!(preview.text.contains("agents"));
         assert!(preview.keyboard.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn capability_views_return_expected_keyboards() -> Result<()> {
+        let dir = tempdir()?;
+        let mut config = hajimi_claw_policy::PolicyConfig::default();
+        config.allowed_workdirs = vec![dir.path().to_path_buf(), std::env::current_dir()?];
+        config.admin_user_id = 1;
+        config.admin_chat_id = 2;
+        let policy = Arc::new(PolicyEngine::new(config));
+        let executor = Arc::new(LocalExecutor::new(
+            policy.clone(),
+            PlatformMode::WindowsSafe,
+        ));
+        let _ = executor;
+        let tools = Arc::new(ToolRegistry::from_parts(
+            vec![],
+            vec![
+                hajimi_claw_types::McpServerStatus {
+                    name: "deploy".into(),
+                    connected: true,
+                    tool_count: 1,
+                    message: "connected".into(),
+                },
+                hajimi_claw_types::McpServerStatus {
+                    name: "broken".into(),
+                    connected: false,
+                    tool_count: 0,
+                    message: "initialize failed".into(),
+                },
+            ],
+        ));
+        let store = Arc::new(Store::open_in_memory()?);
+        let runtime = Arc::new(AgentRuntime::for_tests(
+            tools,
+            store.clone(),
+            policy.clone(),
+        ));
+        let gateway = InProcessGateway::new(runtime, policy, store);
+
+        let capabilities = gateway
+            .handle(GatewayRequest {
+                actor_user_id: 1,
+                actor_chat_id: 2,
+                raw_text: "/capabilities".into(),
+                command: GatewayCommand::Capabilities,
+                current_session_id: None,
+                current_conversation_id: None,
+            })
+            .await?;
+        assert!(capabilities.text.contains("capability inventory"));
+        assert_eq!(capabilities.keyboard, Some(super::capabilities_keyboard()));
+
+        let skills = gateway
+            .handle(GatewayRequest {
+                actor_user_id: 1,
+                actor_chat_id: 2,
+                raw_text: "/skills".into(),
+                command: GatewayCommand::Skills,
+                current_session_id: None,
+                current_conversation_id: None,
+            })
+            .await?;
+        assert!(skills.text.contains("skills"));
+        assert_eq!(skills.keyboard, Some(super::skills_keyboard()));
+
+        let mcp = gateway
+            .handle(GatewayRequest {
+                actor_user_id: 1,
+                actor_chat_id: 2,
+                raw_text: "/mcp".into(),
+                command: GatewayCommand::Mcp,
+                current_session_id: None,
+                current_conversation_id: None,
+            })
+            .await?;
+        assert!(mcp.text.contains("mcp servers"));
+        assert!(mcp.text.contains("deploy [connected] tools=1 connected"));
+        assert!(
+            mcp.text
+                .contains("broken [disconnected] tools=0 initialize failed")
+        );
+        assert_eq!(mcp.keyboard, Some(super::mcp_keyboard()));
+
+        let mcp_tools = gateway
+            .handle(GatewayRequest {
+                actor_user_id: 1,
+                actor_chat_id: 2,
+                raw_text: "/mcp tools deploy".into(),
+                command: GatewayCommand::McpTools(Some("deploy".into())),
+                current_session_id: None,
+                current_conversation_id: None,
+            })
+            .await?;
+        assert!(mcp_tools.text.contains("mcp tools for `deploy`"));
+        assert!(mcp_tools.text.contains("(no mcp tools available)"));
+        assert_eq!(mcp_tools.keyboard, Some(super::mcp_keyboard()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skill_run_invokes_runtime_and_sets_conversation() -> Result<()> {
+        let dir = tempdir()?;
+        let mut config = hajimi_claw_policy::PolicyConfig::default();
+        config.allowed_workdirs = vec![dir.path().to_path_buf(), std::env::current_dir()?];
+        config.admin_user_id = 1;
+        config.admin_chat_id = 2;
+        let policy = Arc::new(PolicyEngine::new(config));
+        let tools = Arc::new(ToolRegistry::from_parts(
+            vec![Arc::new(StubSkillTool {
+                spec: ToolSpec {
+                    name: "skill.deploy".into(),
+                    description: "Deploy app".into(),
+                    requires_approval: false,
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+                capability_id: CapabilityId {
+                    kind: CapabilityKind::Skill,
+                    name: "skill.deploy".into(),
+                    source: Some("deploy".into()),
+                },
+                output: ToolOutput {
+                    content: "deploy ok".into(),
+                    structured: None,
+                },
+            }) as Arc<dyn Tool>],
+            vec![],
+        ));
+        let store = Arc::new(Store::open_in_memory()?);
+        let runtime = Arc::new(AgentRuntime::for_tests(
+            tools,
+            store.clone(),
+            policy.clone(),
+        ));
+        let gateway = InProcessGateway::new(runtime, policy, store);
+
+        let response = gateway
+            .handle(GatewayRequest {
+                actor_user_id: 1,
+                actor_chat_id: 2,
+                raw_text: "/skill run skill.deploy deploy api".into(),
+                command: GatewayCommand::SkillRun {
+                    name: "skill.deploy".into(),
+                    input: "deploy api".into(),
+                },
+                current_session_id: None,
+                current_conversation_id: None,
+            })
+            .await?;
+        assert_eq!(response.text, "deploy ok");
+        assert!(matches!(response.session, SessionDirective::Keep));
+        assert!(matches!(
+            response.conversation,
+            super::ConversationDirective::Set(_)
+        ));
+        assert!(response.keyboard.is_none());
         Ok(())
     }
 }

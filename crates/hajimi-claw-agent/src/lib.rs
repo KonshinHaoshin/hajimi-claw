@@ -2609,8 +2609,10 @@ mod tests {
     use hajimi_claw_store::Store;
     use hajimi_claw_tools::ToolRegistry;
     use hajimi_claw_types::{
-        AgentEvent, AgentRequest, AgentStream, ClawResult, LlmBackend, ProviderCapabilities,
-        ProviderConfig, ProviderKind, ProviderRecord,
+        AgentEvent, AgentRequest, AgentStream, CapabilityId, CapabilityKind, ClawError, ClawResult,
+        LlmBackend, McpServerStatus, MessageRole, ProviderCapabilities, ProviderConfig,
+        ProviderKind, ProviderRecord, TaskKind, TaskRunState, Tool, ToolContext,
+        ToolInvocationStatus, ToolOutput, ToolSpec,
     };
     use tempfile::tempdir;
     use tokio::sync::Mutex;
@@ -2621,6 +2623,39 @@ mod tests {
         parse_persona_layer, parse_worker_briefs, requested_worker_count, resolve_worker_count,
         should_delegate_multi_agent,
     };
+
+    struct StubCapabilityTool {
+        spec: ToolSpec,
+        capability_id: CapabilityId,
+        output: Option<ToolOutput>,
+        approval_error: Option<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for StubCapabilityTool {
+        fn spec(&self) -> ToolSpec {
+            self.spec.clone()
+        }
+
+        fn capability_id(&self) -> CapabilityId {
+            self.capability_id.clone()
+        }
+
+        async fn call(
+            &self,
+            _ctx: ToolContext,
+            _input: serde_json::Value,
+        ) -> ClawResult<ToolOutput> {
+            match (&self.output, &self.approval_error) {
+                (_, Some(err)) => Err(ClawError::ApprovalRequired(err.clone())),
+                (Some(output), None) => Ok(output.clone()),
+                (None, None) => Ok(ToolOutput {
+                    content: String::new(),
+                    structured: None,
+                }),
+            }
+        }
+    }
 
     #[tokio::test]
     async fn routes_file_read_without_llm() -> Result<()> {
@@ -2784,12 +2819,29 @@ mod tests {
         prompt_source: Arc<dyn SystemPromptSource>,
         persona_dir: PathBuf,
     ) -> AgentRuntime {
-        let policy = Arc::new(PolicyEngine::new(PolicyConfig::default()));
-        let executor = Arc::new(LocalExecutor::new(
-            policy.clone(),
-            PlatformMode::WindowsSafe,
-        ));
-        let tools = Arc::new(ToolRegistry::default(executor, policy.clone()));
+        build_test_runtime_with_registry(
+            llm,
+            prompt_source,
+            persona_dir,
+            Arc::new(PolicyEngine::new(PolicyConfig::default())),
+            None,
+        )
+    }
+
+    fn build_test_runtime_with_registry(
+        llm: Arc<dyn LlmBackend>,
+        prompt_source: Arc<dyn SystemPromptSource>,
+        persona_dir: PathBuf,
+        policy: Arc<PolicyEngine>,
+        tools: Option<Arc<ToolRegistry>>,
+    ) -> AgentRuntime {
+        let tools = tools.unwrap_or_else(|| {
+            let executor = Arc::new(LocalExecutor::new(
+                policy.clone(),
+                PlatformMode::WindowsSafe,
+            ));
+            Arc::new(ToolRegistry::default(executor, policy.clone()))
+        });
         let store = Arc::new(Store::open_in_memory().unwrap());
         store
             .upsert_provider(&ProviderRecord {
@@ -3024,6 +3076,279 @@ mod tests {
         assert!(inventory.contains("mcp tools:"));
         assert!(inventory.contains("`read_file`"));
         assert!(inventory.contains("- (none)"));
+    }
+
+    #[tokio::test]
+    async fn capability_inventory_renders_skill_and_mcp_entries() {
+        let policy = Arc::new(PolicyEngine::new(PolicyConfig::default()));
+        let tools = Arc::new(ToolRegistry::from_parts(
+            vec![
+                Arc::new(StubCapabilityTool {
+                    spec: ToolSpec {
+                        name: "read_file".into(),
+                        description: "Read a file".into(),
+                        requires_approval: false,
+                        input_schema: serde_json::json!({"type": "object"}),
+                    },
+                    capability_id: CapabilityId {
+                        kind: CapabilityKind::NativeTool,
+                        name: "read_file".into(),
+                        source: None,
+                    },
+                    output: Some(ToolOutput {
+                        content: "ok".into(),
+                        structured: None,
+                    }),
+                    approval_error: None,
+                }) as Arc<dyn Tool>,
+                Arc::new(StubCapabilityTool {
+                    spec: ToolSpec {
+                        name: "skill.deploy".into(),
+                        description: "Deploy app".into(),
+                        requires_approval: true,
+                        input_schema: serde_json::json!({"type": "object"}),
+                    },
+                    capability_id: CapabilityId {
+                        kind: CapabilityKind::Skill,
+                        name: "skill.deploy".into(),
+                        source: Some("deploy".into()),
+                    },
+                    output: Some(ToolOutput {
+                        content: "deployed".into(),
+                        structured: None,
+                    }),
+                    approval_error: None,
+                }) as Arc<dyn Tool>,
+                Arc::new(StubCapabilityTool {
+                    spec: ToolSpec {
+                        name: "mcp.deploy.run".into(),
+                        description: "Remote deploy".into(),
+                        requires_approval: false,
+                        input_schema: serde_json::json!({"type": "object"}),
+                    },
+                    capability_id: CapabilityId {
+                        kind: CapabilityKind::McpTool,
+                        name: "mcp.deploy.run".into(),
+                        source: Some("deploy".into()),
+                    },
+                    output: Some(ToolOutput {
+                        content: "remote ok".into(),
+                        structured: None,
+                    }),
+                    approval_error: None,
+                }) as Arc<dyn Tool>,
+            ],
+            vec![
+                McpServerStatus {
+                    name: "deploy".into(),
+                    connected: true,
+                    tool_count: 1,
+                    message: "connected".into(),
+                },
+                McpServerStatus {
+                    name: "broken".into(),
+                    connected: false,
+                    tool_count: 0,
+                    message: "initialize failed".into(),
+                },
+            ],
+        ));
+        let runtime = build_test_runtime_with_registry(
+            Arc::new(StaticBackend::new("fallback")),
+            Arc::new(StaticSystemPrompt::new("base")),
+            std::env::temp_dir(),
+            policy,
+            Some(tools),
+        );
+
+        let capabilities = runtime.render_capability_inventory();
+        assert!(
+            capabilities.contains("`skill.deploy` source=deploy approval=required — Deploy app")
+        );
+        assert!(capabilities.contains("`mcp.deploy.run` source=deploy — Remote deploy"));
+
+        let skills = runtime.render_skill_inventory();
+        assert!(skills.contains("skills"));
+        assert!(skills.contains("`skill.deploy` source=deploy approval=required — Deploy app"));
+
+        let mcp = runtime.render_mcp_inventory();
+        assert!(mcp.contains("mcp servers"));
+        assert!(mcp.contains("deploy [connected] tools=1 connected"));
+        assert!(mcp.contains("broken [disconnected] tools=0 initialize failed"));
+
+        let mcp_tools = runtime.render_mcp_tool_inventory(Some("deploy"));
+        assert!(mcp_tools.contains("mcp tools for `deploy`"));
+        assert!(mcp_tools.contains("`mcp.deploy.run` source=deploy — Remote deploy"));
+    }
+
+    #[tokio::test]
+    async fn invoke_capability_persists_direct_tool_task_and_message() -> Result<()> {
+        let policy = Arc::new(PolicyEngine::new(PolicyConfig::default()));
+        let tools = Arc::new(ToolRegistry::from_parts(
+            vec![Arc::new(StubCapabilityTool {
+                spec: ToolSpec {
+                    name: "mcp.deploy.run".into(),
+                    description: "Remote deploy".into(),
+                    requires_approval: false,
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+                capability_id: CapabilityId {
+                    kind: CapabilityKind::McpTool,
+                    name: "mcp.deploy.run".into(),
+                    source: Some("deploy".into()),
+                },
+                output: Some(ToolOutput {
+                    content: "deploy ok".into(),
+                    structured: Some(serde_json::json!({"ok": true})),
+                }),
+                approval_error: None,
+            }) as Arc<dyn Tool>],
+            vec![McpServerStatus {
+                name: "deploy".into(),
+                connected: true,
+                tool_count: 1,
+                message: "connected".into(),
+            }],
+        ));
+        let runtime = build_test_runtime_with_registry(
+            Arc::new(StaticBackend::new("fallback")),
+            Arc::new(StaticSystemPrompt::new("base")),
+            std::env::temp_dir(),
+            policy,
+            Some(tools),
+        );
+
+        let reply = runtime
+            .invoke_capability(
+                "mcp.deploy.run",
+                serde_json::json!({ "service": "api" }),
+                Some(PathBuf::from("/workspace")),
+                None,
+                Some("session-1".into()),
+            )
+            .await?;
+        assert_eq!(reply.message, "{\"ok\":true}");
+
+        let tasks = runtime.list_tasks()?;
+        assert_eq!(tasks.len(), 1);
+        let task = &tasks[0];
+        assert!(matches!(task.kind, TaskKind::DirectToolTask));
+        assert!(matches!(task.state, TaskRunState::Completed));
+        assert_eq!(task.current_session_id.as_deref(), Some("session-1"));
+        assert_eq!(task.cwd, Some(PathBuf::from("/workspace")));
+        assert_eq!(task.result_preview.as_deref(), Some("{\"ok\":true}"));
+
+        let messages = runtime.store.list_messages(reply.conversation_id, 10)?;
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(messages[0].role, MessageRole::Assistant));
+        assert_eq!(messages[0].content, "{\"ok\":true}");
+
+        let invocations = runtime.store.list_tool_invocations(task.id)?;
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].tool_name, "mcp.deploy.run");
+        assert!(matches!(
+            invocations[0].status,
+            ToolInvocationStatus::Completed
+        ));
+        assert_eq!(
+            invocations[0].arguments,
+            serde_json::json!({ "service": "api" })
+        );
+        assert_eq!(
+            invocations[0].output_content.as_deref(),
+            Some("{\"ok\":true}")
+        );
+        assert_eq!(
+            invocations[0].output_structured,
+            Some(serde_json::json!({"ok": true}))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invoke_capability_marks_blocked_approval_state() {
+        let policy = Arc::new(PolicyEngine::new(PolicyConfig::default()));
+        let approval = policy.request_elevation(10, "approve deploy".into());
+        let tools = Arc::new(ToolRegistry::from_parts(
+            vec![Arc::new(StubCapabilityTool {
+                spec: ToolSpec {
+                    name: "mcp.deploy.run".into(),
+                    description: "Remote deploy".into(),
+                    requires_approval: true,
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+                capability_id: CapabilityId {
+                    kind: CapabilityKind::McpTool,
+                    name: "mcp.deploy.run".into(),
+                    source: Some("deploy".into()),
+                },
+                output: None,
+                approval_error: Some(format!(
+                    "approval required: blocked [{}]",
+                    approval.request_id
+                )),
+            }) as Arc<dyn Tool>],
+            vec![McpServerStatus {
+                name: "deploy".into(),
+                connected: true,
+                tool_count: 1,
+                message: "connected".into(),
+            }],
+        ));
+        let runtime = build_test_runtime_with_registry(
+            Arc::new(StaticBackend::new("fallback")),
+            Arc::new(StaticSystemPrompt::new("base")),
+            std::env::temp_dir(),
+            policy,
+            Some(tools),
+        );
+
+        let err = runtime
+            .invoke_capability(
+                "mcp.deploy.run",
+                serde_json::json!({ "service": "api" }),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("skill invocation should block on approval");
+        assert!(matches!(err, ClawError::ApprovalRequired(_)));
+
+        let tasks = runtime.list_tasks().expect("list tasks");
+        assert_eq!(tasks.len(), 1);
+        let task = &tasks[0];
+        assert!(matches!(task.kind, TaskKind::DirectToolTask));
+        assert!(matches!(task.state, TaskRunState::BlockedApproval));
+        assert_eq!(task.blocked_approval_id, Some(approval.request_id));
+        assert!(!task.running);
+
+        let invocations = runtime
+            .store
+            .list_tool_invocations(task.id)
+            .expect("list tool invocations");
+        assert_eq!(invocations.len(), 1);
+        assert!(matches!(
+            invocations[0].status,
+            ToolInvocationStatus::BlockedApproval
+        ));
+        assert_eq!(invocations[0].approval_id, Some(approval.request_id));
+        assert_eq!(invocations[0].tool_name, "mcp.deploy.run");
+
+        let stored_approval = runtime
+            .store
+            .get_approval_record(&approval.request_id.to_string())
+            .expect("approval lookup")
+            .expect("approval record");
+        assert_eq!(stored_approval.task_id, Some(task.id));
+        assert_eq!(stored_approval.tool_name.as_deref(), Some("mcp.deploy.run"));
+        assert!(
+            runtime
+                .store
+                .list_messages(task.conversation_id, 10)
+                .expect("list messages")
+                .is_empty()
+        );
     }
 
     #[tokio::test]

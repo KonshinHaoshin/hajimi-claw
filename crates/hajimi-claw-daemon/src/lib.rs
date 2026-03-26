@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, Write};
@@ -18,10 +19,10 @@ use hajimi_claw_gateway::InProcessGateway;
 use hajimi_claw_llm::{StaticBackend, StoreBackedBackend, list_models, test_provider};
 use hajimi_claw_policy::{PolicyConfig, PolicyEngine};
 use hajimi_claw_store::{SecretCipher, Store};
-use hajimi_claw_tools::ToolRegistry;
+use hajimi_claw_tools::{McpBootstrapResult, ToolRegistry, bootstrap_mcp_servers};
 use hajimi_claw_types::{
-    ExecutionProfile, HeartbeatStatus, ProviderCapabilities, ProviderConfig, ProviderKind,
-    ProviderRecord,
+    ExecutableSkillConfig, ExecutionProfile, HeartbeatStatus, McpServerConfig,
+    ProviderCapabilities, ProviderConfig, ProviderKind, ProviderRecord,
 };
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
@@ -45,6 +46,10 @@ pub struct AppConfig {
     pub multi_agent: MultiAgentSection,
     #[serde(default)]
     pub persona: PersonaSection,
+    #[serde(default)]
+    pub skills: SkillsSection,
+    #[serde(default)]
+    pub mcp: McpSection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,6 +136,49 @@ pub struct PersonaSection {
     pub directory: Option<PathBuf>,
     #[serde(default)]
     pub prompt_files: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillsSection {
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    pub directory: Option<PathBuf>,
+    #[serde(default)]
+    pub manifest_paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub entries: Vec<ExecutableSkillConfig>,
+}
+
+impl Default for SkillsSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            directory: None,
+            manifest_paths: vec![],
+            entries: vec![],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpSection {
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub servers: Vec<McpServerConfig>,
+}
+
+impl Default for McpSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            servers: vec![],
+        }
+    }
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Clone)]
@@ -303,7 +351,15 @@ async fn build_runtime_components(
             .await
             .map_err(|err| anyhow::anyhow!(err.to_string()))?;
     }
-    let tools = Arc::new(ToolRegistry::default(executor.clone(), policy.clone()));
+    let skill_configs = load_skill_configs(config)?;
+    let mut tools =
+        ToolRegistry::tools_with_skill_configs(executor.clone(), policy.clone(), skill_configs);
+    let McpBootstrapResult {
+        tools: mcp_tools,
+        statuses: mcp_servers,
+    } = bootstrap_mcp_servers_for_config(config).await;
+    tools.extend(mcp_tools);
+    let tools = Arc::new(ToolRegistry::from_parts(tools, mcp_servers));
     let fallback = Arc::new(StaticBackend::new(
         config
             .llm
@@ -410,61 +466,59 @@ fn select_platform_mode(mode: Option<&str>) -> PlatformMode {
 
 fn relativize_config(config: &mut AppConfig, config_path: &Path) {
     let base = config_path.parent().unwrap_or_else(|| Path::new("."));
-    config.storage.sqlite_path = expand_home(&config.storage.sqlite_path);
-    if config.storage.sqlite_path.is_relative() {
-        config.storage.sqlite_path = base.join(&config.storage.sqlite_path);
-    }
+    config.storage.sqlite_path = resolve_path_from_base(&config.storage.sqlite_path, base);
     if let Some(path) = config.security.master_key_file.as_mut() {
-        *path = expand_home(path);
-        if path.is_relative() {
-            *path = base.join(&*path);
-        }
+        *path = resolve_path_from_base(path, base);
     }
     if let Some(path) = config.persona.directory.as_mut() {
-        *path = expand_home(path);
-        if path.is_relative() {
-            *path = base.join(&*path);
-        }
+        *path = resolve_path_from_base(path, base);
     }
     config.persona.prompt_files = config
         .persona
         .prompt_files
         .iter()
-        .map(|path| {
-            let path = expand_home(path);
-            if path.is_relative() {
-                base.join(path)
-            } else {
-                path
-            }
-        })
+        .map(|path| resolve_path_from_base(path, base))
         .collect();
+    if let Some(path) = config.skills.directory.as_mut() {
+        *path = resolve_path_from_base(path, base);
+    }
+    config.skills.manifest_paths = config
+        .skills
+        .manifest_paths
+        .iter()
+        .map(|path| resolve_path_from_base(path, base))
+        .collect();
+    for skill in &mut config.skills.entries {
+        if let Some(path) = skill.cwd.as_mut() {
+            *path = resolve_path_from_base(path, base);
+        }
+    }
+    for server in &mut config.mcp.servers {
+        if let Some(path) = server.cwd.as_mut() {
+            *path = resolve_path_from_base(path, base);
+        }
+    }
     config.policy.allowed_workdirs = config
         .policy
         .allowed_workdirs
         .iter()
-        .map(|path| {
-            let path = expand_home(path);
-            if path.is_relative() {
-                base.join(path)
-            } else {
-                path
-            }
-        })
+        .map(|path| resolve_path_from_base(path, base))
         .collect();
     config.policy.writable_workdirs = config
         .policy
         .writable_workdirs
         .iter()
-        .map(|path| {
-            let path = expand_home(path);
-            if path.is_relative() {
-                base.join(path)
-            } else {
-                path
-            }
-        })
+        .map(|path| resolve_path_from_base(path, base))
         .collect();
+}
+
+fn resolve_path_from_base(path: &Path, base: &Path) -> PathBuf {
+    let path = expand_home(path);
+    if path.is_relative() {
+        base.join(path)
+    } else {
+        path
+    }
 }
 
 fn open_store(config: &AppConfig) -> Result<Arc<Store>> {
@@ -1617,6 +1671,84 @@ fn stop_process(pid: u32) -> Result<()> {
     Ok(())
 }
 
+fn load_skill_configs(config: &AppConfig) -> Result<Vec<ExecutableSkillConfig>> {
+    if !config.skills.enabled {
+        return Ok(vec![]);
+    }
+
+    let mut skills = Vec::new();
+    let mut seen = BTreeSet::new();
+    for skill in &config.skills.entries {
+        register_skill_entry(&mut skills, &mut seen, skill.clone())?;
+    }
+
+    if let Some(directory) = &config.skills.directory {
+        if directory.exists() {
+            let mut manifests = fs::read_dir(directory)
+                .with_context(|| format!("read skills directory {}", directory.display()))?
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .with_context(|| {
+                    format!("read skills directory entries in {}", directory.display())
+                })?;
+            manifests.sort();
+            for path in manifests {
+                if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
+                    continue;
+                }
+                register_skill_file(&mut skills, &mut seen, &path)?;
+            }
+        }
+    }
+
+    for path in &config.skills.manifest_paths {
+        register_skill_file(&mut skills, &mut seen, path)?;
+    }
+
+    Ok(skills)
+}
+
+fn register_skill_file(
+    skills: &mut Vec<ExecutableSkillConfig>,
+    seen: &mut BTreeSet<String>,
+    path: &Path,
+) -> Result<()> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("read skill manifest {}", path.display()))?;
+    let mut skill: ExecutableSkillConfig =
+        toml::from_str(&raw).with_context(|| format!("parse skill manifest {}", path.display()))?;
+    let manifest_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    skill.cwd = match skill.cwd {
+        Some(cwd) if cwd.is_relative() => Some(manifest_dir.join(cwd)),
+        Some(cwd) => Some(cwd),
+        None => Some(manifest_dir.to_path_buf()),
+    };
+    register_skill_entry(skills, seen, skill)
+}
+
+fn register_skill_entry(
+    skills: &mut Vec<ExecutableSkillConfig>,
+    seen: &mut BTreeSet<String>,
+    skill: ExecutableSkillConfig,
+) -> Result<()> {
+    let tool_name = format!("skill.{}", skill.name);
+    if !seen.insert(tool_name.clone()) {
+        anyhow::bail!("duplicate skill capability configured: {tool_name}");
+    }
+    skills.push(skill);
+    Ok(())
+}
+
+async fn bootstrap_mcp_servers_for_config(config: &AppConfig) -> McpBootstrapResult {
+    if !config.mcp.enabled {
+        return McpBootstrapResult {
+            tools: vec![],
+            statuses: vec![],
+        };
+    }
+    bootstrap_mcp_servers(&config.mcp.servers).await
+}
+
 fn default_app_config(config_path: &Path) -> AppConfig {
     let storage = default_storage_path(config_path);
     let workdirs = default_workdirs(config_path);
@@ -1669,6 +1801,8 @@ fn default_app_config(config_path: &Path) -> AppConfig {
             directory: Some(default_persona_dir()),
             prompt_files: vec![],
         },
+        skills: SkillsSection::default(),
+        mcp: McpSection::default(),
     }
 }
 
@@ -1695,6 +1829,25 @@ fn make_config_relative(config: &mut AppConfig, config_path: &Path) {
         .iter()
         .map(|path| make_relative(path, base))
         .collect();
+    if let Some(path) = config.skills.directory.as_mut() {
+        *path = make_relative(path, base);
+    }
+    config.skills.manifest_paths = config
+        .skills
+        .manifest_paths
+        .iter()
+        .map(|path| make_relative(path, base))
+        .collect();
+    for skill in &mut config.skills.entries {
+        if let Some(path) = skill.cwd.as_mut() {
+            *path = make_relative(path, base);
+        }
+    }
+    for server in &mut config.mcp.servers {
+        if let Some(path) = server.cwd.as_mut() {
+            *path = make_relative(path, base);
+        }
+    }
     config.policy.allowed_workdirs = config
         .policy
         .allowed_workdirs
@@ -2109,12 +2262,15 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        PersonaSection, default_config_path, ensure_persona_files, expand_home,
-        load_heartbeat_file_config, log_file_path, open_store, pairing_text_matches, pid_file_path,
-        resolve_model_choice, resolve_persona_paths, select_platform_mode, slugify,
+        AppConfig, McpSection, PersonaSection, SkillsSection, bootstrap_mcp_servers_for_config,
+        default_config_path, default_enabled, ensure_persona_files, expand_home, load_config,
+        load_heartbeat_file_config, load_skill_configs, log_file_path, make_config_relative,
+        open_store, pairing_text_matches, pid_file_path, relativize_config, resolve_model_choice,
+        resolve_persona_paths, select_platform_mode, slugify,
     };
     use hajimi_claw_agent::PromptSourceMode;
     use hajimi_claw_exec::PlatformMode;
+    use serde_json::json;
     use tempfile::tempdir;
 
     #[test]
@@ -2251,7 +2407,7 @@ mod tests {
         let key_path = dir.path().join("master.key");
         fs::write(&key_path, "test-master-key").unwrap();
 
-        let config = super::AppConfig {
+        let config = AppConfig {
             channel: super::ChannelSection::default(),
             telegram: super::TelegramSection {
                 bot_token: "token".into(),
@@ -2284,10 +2440,402 @@ mod tests {
             },
             multi_agent: super::MultiAgentSection::default(),
             persona: super::PersonaSection::default(),
+            skills: SkillsSection::default(),
+            mcp: McpSection::default(),
         };
 
         open_store(&config).unwrap();
         assert!(config.storage.sqlite_path.exists());
+    }
+
+    #[test]
+    fn relativize_config_expands_skill_and_mcp_paths() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let mut config = AppConfig {
+            channel: super::ChannelSection::default(),
+            telegram: super::TelegramSection::default(),
+            feishu: super::FeishuSection::default(),
+            llm: super::LlmSection {
+                base_url: None,
+                api_key: None,
+                model: None,
+                static_fallback_response: None,
+            },
+            storage: super::StorageSection {
+                sqlite_path: Path::new("./data/db.sqlite3").to_path_buf(),
+            },
+            security: super::SecuritySection {
+                master_key_env: Some("KEY".into()),
+                master_key_file: None,
+            },
+            policy: hajimi_claw_policy::PolicyConfig::default(),
+            execution: super::ExecutionSection {
+                mode: None,
+                profile: None,
+                browser_enabled: None,
+                computer_enabled: None,
+            },
+            multi_agent: super::MultiAgentSection::default(),
+            persona: PersonaSection::default(),
+            skills: SkillsSection {
+                enabled: default_enabled(),
+                directory: Some(Path::new("skills").to_path_buf()),
+                manifest_paths: vec![Path::new("skill-manifests/deploy.toml").to_path_buf()],
+                entries: vec![hajimi_claw_types::ExecutableSkillConfig {
+                    name: "deploy".into(),
+                    description: "Deploy service".into(),
+                    command: "deploy-skill".into(),
+                    args: vec![],
+                    cwd: Some(Path::new("skill-cwd").to_path_buf()),
+                    env_allowlist: vec![],
+                    requires_approval: true,
+                    timeout_secs: Some(60),
+                    max_output_bytes: Some(4096),
+                    input_schema: json!({"type": "object"}),
+                }],
+            },
+            mcp: McpSection {
+                enabled: default_enabled(),
+                servers: vec![hajimi_claw_types::McpServerConfig {
+                    name: "demo".into(),
+                    command: "mcp-demo".into(),
+                    args: vec![],
+                    cwd: Some(Path::new("mcp-cwd").to_path_buf()),
+                    env_allowlist: vec![],
+                    startup_timeout_secs: Some(10),
+                    enabled: true,
+                    requires_approval: false,
+                }],
+            },
+        };
+
+        relativize_config(&mut config, &config_path);
+
+        assert_eq!(config.skills.directory, Some(dir.path().join("skills")));
+        assert_eq!(
+            config.skills.manifest_paths,
+            vec![dir.path().join("skill-manifests").join("deploy.toml")]
+        );
+        assert_eq!(
+            config.skills.entries[0].cwd,
+            Some(dir.path().join("skill-cwd"))
+        );
+        assert_eq!(config.mcp.servers[0].cwd, Some(dir.path().join("mcp-cwd")));
+    }
+
+    #[test]
+    fn make_config_relative_round_trips_skill_and_mcp_paths() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let mut config = AppConfig {
+            channel: super::ChannelSection::default(),
+            telegram: super::TelegramSection::default(),
+            feishu: super::FeishuSection::default(),
+            llm: super::LlmSection {
+                base_url: None,
+                api_key: None,
+                model: None,
+                static_fallback_response: None,
+            },
+            storage: super::StorageSection {
+                sqlite_path: dir.path().join("data").join("db.sqlite3"),
+            },
+            security: super::SecuritySection {
+                master_key_env: Some("KEY".into()),
+                master_key_file: None,
+            },
+            policy: hajimi_claw_policy::PolicyConfig::default(),
+            execution: super::ExecutionSection {
+                mode: None,
+                profile: None,
+                browser_enabled: None,
+                computer_enabled: None,
+            },
+            multi_agent: super::MultiAgentSection::default(),
+            persona: PersonaSection::default(),
+            skills: SkillsSection {
+                enabled: default_enabled(),
+                directory: Some(dir.path().join("skills")),
+                manifest_paths: vec![dir.path().join("skill-manifests").join("deploy.toml")],
+                entries: vec![hajimi_claw_types::ExecutableSkillConfig {
+                    name: "deploy".into(),
+                    description: "Deploy service".into(),
+                    command: "deploy-skill".into(),
+                    args: vec![],
+                    cwd: Some(dir.path().join("skill-cwd")),
+                    env_allowlist: vec![],
+                    requires_approval: true,
+                    timeout_secs: Some(60),
+                    max_output_bytes: Some(4096),
+                    input_schema: json!({"type": "object"}),
+                }],
+            },
+            mcp: McpSection {
+                enabled: default_enabled(),
+                servers: vec![hajimi_claw_types::McpServerConfig {
+                    name: "demo".into(),
+                    command: "mcp-demo".into(),
+                    args: vec![],
+                    cwd: Some(dir.path().join("mcp-cwd")),
+                    env_allowlist: vec![],
+                    startup_timeout_secs: Some(10),
+                    enabled: true,
+                    requires_approval: false,
+                }],
+            },
+        };
+
+        make_config_relative(&mut config, &config_path);
+
+        assert_eq!(
+            config.skills.directory,
+            Some(Path::new("skills").to_path_buf())
+        );
+        assert_eq!(
+            config.skills.manifest_paths,
+            vec![Path::new("skill-manifests").join("deploy.toml")]
+        );
+        assert_eq!(
+            config.skills.entries[0].cwd,
+            Some(Path::new("skill-cwd").to_path_buf())
+        );
+        assert_eq!(
+            config.mcp.servers[0].cwd,
+            Some(Path::new("mcp-cwd").to_path_buf())
+        );
+    }
+
+    #[test]
+    fn load_skill_configs_reads_directory_manifests_and_rejects_duplicates() {
+        let dir = tempdir().unwrap();
+        let skills_dir = dir.path().join("skills");
+        fs::create_dir_all(&skills_dir).unwrap();
+        fs::write(
+            skills_dir.join("deploy.toml"),
+            r#"
+name = "deploy"
+description = "Deploy service"
+command = "deploy-skill"
+requires_approval = true
+input_schema = { type = "object" }
+"#,
+        )
+        .unwrap();
+
+        let config = AppConfig {
+            channel: super::ChannelSection::default(),
+            telegram: super::TelegramSection::default(),
+            feishu: super::FeishuSection::default(),
+            llm: super::LlmSection {
+                base_url: None,
+                api_key: None,
+                model: None,
+                static_fallback_response: None,
+            },
+            storage: super::StorageSection {
+                sqlite_path: dir.path().join("data.sqlite3"),
+            },
+            security: super::SecuritySection {
+                master_key_env: Some("KEY".into()),
+                master_key_file: None,
+            },
+            policy: hajimi_claw_policy::PolicyConfig::default(),
+            execution: super::ExecutionSection {
+                mode: None,
+                profile: None,
+                browser_enabled: None,
+                computer_enabled: None,
+            },
+            multi_agent: super::MultiAgentSection::default(),
+            persona: PersonaSection::default(),
+            skills: SkillsSection {
+                enabled: default_enabled(),
+                directory: Some(skills_dir.clone()),
+                manifest_paths: vec![],
+                entries: vec![],
+            },
+            mcp: McpSection::default(),
+        };
+
+        let skills = load_skill_configs(&config).unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "deploy");
+        assert_eq!(skills[0].cwd, Some(skills_dir));
+
+        let duplicate = AppConfig {
+            skills: SkillsSection {
+                entries: vec![hajimi_claw_types::ExecutableSkillConfig {
+                    name: "deploy".into(),
+                    description: "Duplicate".into(),
+                    command: "duplicate-skill".into(),
+                    args: vec![],
+                    cwd: None,
+                    env_allowlist: vec![],
+                    requires_approval: false,
+                    timeout_secs: None,
+                    max_output_bytes: None,
+                    input_schema: json!({"type": "object"}),
+                }],
+                ..config.skills.clone()
+            },
+            ..config.clone()
+        };
+        let err = load_skill_configs(&duplicate).unwrap_err().to_string();
+        assert!(err.contains("duplicate skill capability configured: skill.deploy"));
+    }
+
+    #[test]
+    fn load_config_parses_skills_and_mcp_sections() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[channel]
+kind = "telegram"
+
+[telegram]
+bot_token = "token"
+
+[feishu]
+app_id = ""
+app_secret = ""
+
+[llm]
+static_fallback_response = "fallback"
+
+[storage]
+sqlite_path = "./data/hajimi.sqlite3"
+
+[security]
+master_key_env = "KEY"
+
+[policy]
+admin_user_id = 1
+admin_chat_id = 1
+allowed_workdirs = ["./"]
+writable_workdirs = ["./"]
+windows_safe_allowlist = []
+guarded_patterns = []
+dangerous_patterns = []
+max_timeout_secs = 120
+max_output_bytes = 32768
+session_idle_timeout_secs = 1800
+
+[execution]
+mode = "auto"
+profile = "ops-safe"
+
+[multi_agent]
+enabled = true
+auto_delegate = false
+default_workers = 3
+max_workers = 8
+worker_timeout_secs = 90
+max_context_chars_per_worker = 24000
+
+[persona]
+prompt_files = []
+
+[skills]
+enabled = true
+directory = "./skills"
+manifest_paths = ["./manifests/deploy.toml"]
+
+[[skills.entries]]
+name = "deploy"
+description = "Deploy service"
+command = "deploy-skill"
+requires_approval = true
+input_schema = { type = "object" }
+
+[mcp]
+enabled = true
+
+[[mcp.servers]]
+name = "demo"
+command = "mcp-demo"
+startup_timeout_secs = 5
+enabled = true
+requires_approval = false
+"#,
+        )
+        .unwrap();
+
+        let config = load_config(config_path.clone()).unwrap();
+        assert_eq!(config.skills.directory, Some(dir.path().join("skills")));
+        assert_eq!(
+            config.skills.manifest_paths,
+            vec![dir.path().join("manifests").join("deploy.toml")]
+        );
+        assert_eq!(config.skills.entries.len(), 1);
+        assert_eq!(config.mcp.servers.len(), 1);
+        assert_eq!(config.mcp.servers[0].name, "demo");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_mcp_servers_for_config_returns_disabled_server_status_and_handles_global_disable()
+     {
+        let enabled_config = AppConfig {
+            channel: super::ChannelSection::default(),
+            telegram: super::TelegramSection::default(),
+            feishu: super::FeishuSection::default(),
+            llm: super::LlmSection {
+                base_url: None,
+                api_key: None,
+                model: None,
+                static_fallback_response: None,
+            },
+            storage: super::StorageSection {
+                sqlite_path: Path::new("./data.sqlite3").to_path_buf(),
+            },
+            security: super::SecuritySection {
+                master_key_env: Some("KEY".into()),
+                master_key_file: None,
+            },
+            policy: hajimi_claw_policy::PolicyConfig::default(),
+            execution: super::ExecutionSection {
+                mode: None,
+                profile: None,
+                browser_enabled: None,
+                computer_enabled: None,
+            },
+            multi_agent: super::MultiAgentSection::default(),
+            persona: PersonaSection::default(),
+            skills: SkillsSection::default(),
+            mcp: McpSection {
+                enabled: true,
+                servers: vec![hajimi_claw_types::McpServerConfig {
+                    name: "off".into(),
+                    command: "mcp-off".into(),
+                    args: vec![],
+                    cwd: None,
+                    env_allowlist: vec![],
+                    startup_timeout_secs: None,
+                    enabled: false,
+                    requires_approval: false,
+                }],
+            },
+        };
+
+        let enabled = bootstrap_mcp_servers_for_config(&enabled_config).await;
+        assert!(enabled.tools.is_empty());
+        assert_eq!(enabled.statuses.len(), 1);
+        assert_eq!(enabled.statuses[0].name, "off");
+        assert!(!enabled.statuses[0].connected);
+        assert_eq!(enabled.statuses[0].message, "disabled in config");
+
+        let disabled = bootstrap_mcp_servers_for_config(&AppConfig {
+            mcp: McpSection {
+                enabled: false,
+                servers: enabled_config.mcp.servers.clone(),
+            },
+            ..enabled_config
+        })
+        .await;
+        assert!(disabled.tools.is_empty());
+        assert!(disabled.statuses.is_empty());
     }
 
     #[test]
